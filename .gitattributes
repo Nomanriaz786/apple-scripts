@@ -1,0 +1,10 @@
+* text=auto eol=lf
+
+*.py    text eol=lf
+*.json  text eol=lf
+*.md    text eol=lf
+*.txt   text eol=lf
+
+run.command text eol=lf
+*.command   text eol=lf
+*.sh        text eol=lf
