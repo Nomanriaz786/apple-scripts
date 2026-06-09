@@ -1,0 +1,8 @@
+{
+  "repeat": 1,
+  "vpn": false,
+  "tabs": [
+    { "tab": 1, "videos": [1] }
+  ],
+  "cleanup": false
+}
