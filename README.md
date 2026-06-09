@@ -26,16 +26,20 @@ apple-scripts/
 
 ## Setup on a fresh Mac (one-time)
 
-### 1. Install Python 3
+### 1. Install Python 3.10 or newer
+
+**Important:** the Python that ships with macOS Command Line Tools (`/Library/Developer/CommandLineTools/usr/bin/python3`) is usually Python 3.9, which is **too old** for PyXA. You need 3.10+.
 
 Easiest way — Homebrew:
 
 ```bash
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-brew install python
+brew install python@3.11
 ```
 
-Or download the official installer: <https://www.python.org/downloads/macos/>
+After the Homebrew install finishes, follow its instructions to add `/opt/homebrew/bin` to your PATH (it prints the exact commands). Open a fresh Terminal window after.
+
+Or download the official installer: <https://www.python.org/downloads/macos/> (pick 3.11 or 3.12).
 
 Verify:
 
@@ -43,18 +47,19 @@ Verify:
 python3 --version
 ```
 
-You should see `Python 3.10` or newer.
+You should see `Python 3.10` or newer. If it still says 3.9, your PATH is pointing at the Apple CLT Python — open a fresh Terminal or re-check the Homebrew PATH setup.
 
-### 2. Install Python dependencies
+### 2. Dependencies (handled automatically)
 
-From the project folder:
+You do **not** install Python packages globally. The first run of `run.command` creates a project-local `.venv/` folder and installs `PyXA` + `PyObjC` into it. This sidesteps macOS's "externally-managed environment" protection and keeps your system Python clean.
+
+If you prefer to do it manually instead of relying on the launcher:
 
 ```bash
 cd /path/to/apple-scripts
-python3 -m pip install --user -r requirements.txt
+python3 -m venv .venv
+.venv/bin/python3 -m pip install -r requirements.txt
 ```
-
-This installs PyXA (macOS app control) and the PyObjC frameworks. The `run.command` launcher also runs this automatically if PyXA is missing.
 
 ### 3. Grant Accessibility and Automation permission
 
@@ -146,7 +151,7 @@ python3 scripts/podcast_downloader.py --execute
 Validates your `input/tasks.json` and prints the planned flow without touching Chrome or Podcasts:
 
 ```bash
-python3 scripts/podcast_downloader.py --dry-run
+.venv/bin/python3 scripts/podcast_downloader.py --dry-run
 ```
 
 ---
@@ -190,8 +195,14 @@ Per-video statuses:
 
 ## Common failures
 
-**`PyXA not installed`**
-Run `python3 -m pip install --user -r requirements.txt` from the project folder.
+**`PyXA not installed`** (or `Found Python 3.9 ... requires 3.10+`)
+Your Python is too old or not the one the venv was built against. Install Homebrew Python 3.11 (see step 1), delete the `.venv/` folder, and double-click `run.command` again.
+
+```bash
+brew install python@3.11
+rm -rf .venv
+./run.command
+```
 
 **`See All button not found`**
 The Podcasts page is an individual episode page (URL contains `?i=`) or didn't finish loading. Open the same URL in Podcasts manually to confirm it shows the full episode list, then re-run.
