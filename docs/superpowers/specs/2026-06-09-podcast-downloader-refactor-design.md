@@ -185,11 +185,10 @@ Resume on next run reads `completed_cycles` and skips them.
 
 ## Testing Plan
 
-1. Windows dry-run for config + flow validation.
-2. macOS: VPN off, one tab, `videos: [1]`.
-3. macOS: `videos: [1, 2]`.
-4. macOS: scroll case `videos: [8]`.
-5. macOS: multiple tabs.
-6. macOS: cleanup off then on.
-7. macOS: VPN on, single cycle.
-8. macOS: `repeat: 2` with VPN to verify IP rotation.
+1. macOS: VPN off, one tab, `videos: [1]`.
+2. macOS: `videos: [1, 2]`.
+3. macOS: scroll case `videos: [8]`.
+4. macOS: multiple tabs.
+5. macOS: cleanup off then on.
+6. macOS: VPN on, single cycle.
+7. macOS: `repeat: 2` with VPN to verify IP rotation.
