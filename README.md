@@ -143,15 +143,7 @@ If macOS blocks it with "cannot be opened because it is from an unidentified dev
 
 ```bash
 cd /path/to/apple-scripts
-python3 scripts/podcast_downloader.py --execute
-```
-
-### Dry-run (no UI control, works on any OS)
-
-Validates your `input/tasks.json` and prints the planned flow without touching Chrome or Podcasts:
-
-```bash
-.venv/bin/python3 scripts/podcast_downloader.py --dry-run
+.venv/bin/python3 scripts/podcast_downloader.py
 ```
 
 ---

@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
 """Apple Podcasts automation — state-driven, minimal-input.
 
-Single-file orchestrator. On macOS:
-    python3 scripts/podcast_downloader.py --execute
-
-Dry-run validation on Windows (no UI control):
-    python3 scripts/podcast_downloader.py --dry-run
+Single-file orchestrator. Runs real macOS UI automation:
+    python3 scripts/podcast_downloader.py
 
 Input lives in input/tasks.json (only 4 keys). Working memory lives in
 state/runtime_state.json. Both state/ and logs/ are auto-created.
@@ -204,9 +201,8 @@ class RunLogger:
         event.update(fields)
         self.events.append(event)
 
-    def save_report(self, dry_run: bool, state: dict[str, Any]) -> None:
+    def save_report(self, state: dict[str, Any]) -> None:
         payload = {
-            "dry_run": dry_run,
             "finished_at": datetime.now().astimezone().isoformat(timespec="seconds"),
             "final_state": state,
             "events": self.events,
@@ -221,13 +217,10 @@ class RunLogger:
 def run_osascript(
     script: str,
     timeout: int = DEFAULT_OSASCRIPT_TIMEOUT,
-    dry_run: bool = False,
     label: str = "",
 ) -> str:
-    if dry_run:
-        return ""
     if platform.system() != "Darwin":
-        raise AutomationError("Real execution requires macOS")
+        raise AutomationError("This script must run on macOS")
     try:
         proc = subprocess.run(
             ["osascript", "-e", script],
@@ -367,11 +360,10 @@ class NetworkState:
 # VPN Controller
 # -----------------------------------------------------------------------------
 class VPNController:
-    def __init__(self, logger: RunLogger, net: NetworkState, state: StateManager, dry_run: bool):
+    def __init__(self, logger: RunLogger, net: NetworkState, state: StateManager):
         self.logger = logger
         self.net = net
         self.state = state
-        self.dry_run = dry_run
 
     @staticmethod
     def _is_connected_to(ip_info: dict[str, Any] | None, target_cc: str, require_proton: bool) -> bool:
@@ -402,10 +394,6 @@ class VPNController:
             )
             self._record_ip(baseline_ip)
             return "already_connected_verified"
-
-        if self.dry_run:
-            self.logger.log("DRY RUN: would connect Proton VPN", step="06")
-            return "dry_run"
 
         opened = self._open_proton_app()
         if not opened:
@@ -545,14 +533,11 @@ class VPNController:
 # Chrome Controller
 # -----------------------------------------------------------------------------
 class ChromeController:
-    def __init__(self, logger: RunLogger, state: StateManager, dry_run: bool):
+    def __init__(self, logger: RunLogger, state: StateManager):
         self.logger = logger
         self.state = state
-        self.dry_run = dry_run
 
     def activate(self) -> None:
-        if self.dry_run:
-            return
         if HAS_PYXA:
             try:
                 PyXA.Application("Google Chrome").activate()
@@ -562,17 +547,6 @@ class ChromeController:
         run_osascript('tell application "Google Chrome" to activate', label="activate Chrome")
 
     def enumerate_tabs(self) -> dict[str, dict[str, str]]:
-        if self.dry_run:
-            cache = {
-                "1": {
-                    "title": "Sample Podcast",
-                    "url": "https://podcasts.apple.com/example",
-                    "detected_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-                }
-            }
-            self.state.update(chrome_tabs_cache=cache)
-            return cache
-
         script = """
         tell application "Google Chrome"
             activate
@@ -604,8 +578,6 @@ class ChromeController:
         return cache
 
     def switch_tab(self, tab_no: int) -> tuple[str, str]:
-        if self.dry_run:
-            return "Sample Podcast", "https://podcasts.apple.com/example"
         script = """
         tell application "Google Chrome"
             activate
@@ -631,19 +603,14 @@ class ChromeController:
 # Podcasts Controller
 # -----------------------------------------------------------------------------
 class PodcastsController:
-    def __init__(self, logger: RunLogger, state: StateManager, dry_run: bool):
+    def __init__(self, logger: RunLogger, state: StateManager):
         self.logger = logger
         self.state = state
-        self.dry_run = dry_run
 
     def open_url(self, url: str) -> None:
-        if self.dry_run:
-            return
         subprocess.run(["open", "-a", "Podcasts", url], check=True)
 
     def activate(self) -> None:
-        if self.dry_run:
-            return
         if HAS_PYXA:
             try:
                 PyXA.Application("Podcasts").activate()
@@ -653,8 +620,6 @@ class PodcastsController:
         run_osascript('tell application "Podcasts" to activate', label="activate Podcasts")
 
     def wait_for_window(self, timeout_sec: int = 20) -> None:
-        if self.dry_run:
-            return
         script = """
         tell application "Podcasts" to activate
         tell application "System Events"
@@ -674,8 +639,6 @@ class PodcastsController:
 
     def click_see_all(self, time_budget_sec: int = DEFAULT_SEE_ALL_BUDGET_SEC) -> str:
         """Return 'clicked', 'list_already_expanded', or 'see_all_not_found'."""
-        if self.dry_run:
-            return "clicked"
         script = _BOUNDED_HELPERS + """
         tell application "Podcasts" to activate
         tell application "System Events"
@@ -696,8 +659,6 @@ class PodcastsController:
         return run_osascript(script, timeout=time_budget_sec + 8, label="click See All")
 
     def scroll_to_top(self) -> None:
-        if self.dry_run:
-            return
         script = """
         tell application "System Events"
             tell process "Podcasts"
@@ -710,8 +671,6 @@ class PodcastsController:
         run_osascript(script, timeout=5, label="scroll to top")
 
     def download_episode_row(self, video_no: int) -> str:
-        if self.dry_run:
-            return "dry_run"
         script = _BOUNDED_HELPERS + """
         on collectRows(rootElem, maxDepth)
             tell application "System Events"
@@ -828,8 +787,6 @@ class PodcastsController:
         return run_osascript(script, timeout=90, label=f"download row {video_no}")
 
     def open_downloaded_sidebar(self) -> str:
-        if self.dry_run:
-            return "dry_run"
         script = """
         tell application "Podcasts" to activate
         tell application "System Events"
@@ -847,8 +804,6 @@ class PodcastsController:
         return run_osascript(script, timeout=10, label="open Downloaded sidebar")
 
     def cleanup_all_downloaded(self) -> list[dict[str, Any]]:
-        if self.dry_run:
-            return [{"action": "dry_run"}]
         results: list[dict[str, Any]] = []
         terminal_states = (
             "more_button_not_found",
@@ -916,8 +871,6 @@ class PodcastsController:
             return f"error: {exc}"
 
     def quit_app(self) -> None:
-        if self.dry_run:
-            return
         if HAS_PYXA:
             try:
                 PyXA.Application("Podcasts").quit()
@@ -931,18 +884,17 @@ class PodcastsController:
 # Orchestrator
 # -----------------------------------------------------------------------------
 class Orchestrator:
-    def __init__(self, config: Config, dry_run: bool, log_dir: Path, state_path: Path):
+    def __init__(self, config: Config, log_dir: Path, state_path: Path):
         self.config = config
-        self.dry_run = dry_run
         self.logger = RunLogger(log_dir)
         self.state = StateManager(state_path)
         self.net = NetworkState(self.logger)
-        self.vpn = VPNController(self.logger, self.net, self.state, dry_run)
-        self.chrome = ChromeController(self.logger, self.state, dry_run)
-        self.podcasts = PodcastsController(self.logger, self.state, dry_run)
+        self.vpn = VPNController(self.logger, self.net, self.state)
+        self.chrome = ChromeController(self.logger, self.state)
+        self.podcasts = PodcastsController(self.logger, self.state)
 
     def run(self) -> int:
-        self.logger.log(f"Started podcast automation (dry_run={self.dry_run})", step="01")
+        self.logger.log("Started podcast automation", step="01")
         try:
             self.logger.log(
                 f"Loaded minimal input: repeat={self.config.repeat} vpn={self.config.vpn} "
@@ -1003,18 +955,17 @@ class Orchestrator:
             self.logger.log(f"Automation failed at step {step}: {exc}", step="ERROR", error=str(exc))
             return 1
         finally:
-            self.logger.save_report(dry_run=self.dry_run, state=self.state.data)
+            self.logger.save_report(state=self.state.data)
 
     def _validate_environment(self) -> None:
         env = {"platform": platform.system(), "has_pyxa": HAS_PYXA}
         self.logger.log(f"Environment: {env}", step="03", **env)
-        if not self.dry_run:
-            if platform.system() != "Darwin":
-                raise AutomationError("--execute requires macOS")
-            if not HAS_PYXA:
-                raise AutomationError(
-                    "PyXA not installed. Run: python3 -m pip install -r requirements.txt"
-                )
+        if platform.system() != "Darwin":
+            raise AutomationError("This script must run on macOS")
+        if not HAS_PYXA:
+            raise AutomationError(
+                "PyXA not installed. Run: python3 -m pip install -r requirements.txt"
+            )
 
     def _process_tab(self, tab_task: TabTask, cycle: int) -> None:
         self.state.update(current_tab=tab_task.tab, current_video=None)
@@ -1091,16 +1042,10 @@ def main(argv: list[str]) -> int:
                         help="Runtime state file (auto-created)")
     parser.add_argument("--output-dir", type=Path, default=Path("logs"),
                         help="Logs and reports directory")
-    mode = parser.add_mutually_exclusive_group(required=True)
-    mode.add_argument("--dry-run", action="store_true",
-                      help="Validate input/flow, no UI actions (works on any OS)")
-    mode.add_argument("--execute", action="store_true",
-                      help="Run real macOS UI automation")
     args = parser.parse_args(argv)
 
     config = load_config(args.input)
-    orch = Orchestrator(config, dry_run=args.dry_run,
-                        log_dir=args.output_dir, state_path=args.state)
+    orch = Orchestrator(config, log_dir=args.output_dir, state_path=args.state)
     return orch.run()
 
 

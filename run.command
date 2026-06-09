@@ -2,7 +2,7 @@
 # Double-click launcher for macOS.
 # 1. Verifies python3 (3.10+).
 # 2. Creates a project-local .venv on first run and installs deps into it.
-# 3. Runs scripts/podcast_downloader.py --execute.
+# 3. Runs scripts/podcast_downloader.py.
 
 set -u
 
@@ -110,8 +110,7 @@ echo
 "$VENV_PY" "$PY_SCRIPT" \
   --input "$INPUT_FILE" \
   --state "$STATE_FILE" \
-  --output-dir "$OUTPUT_DIR" \
-  --execute
+  --output-dir "$OUTPUT_DIR"
 STATUS=$?
 
 echo
