@@ -1,6 +1,7 @@
 {
-  "repeat": 1,
-  "vpn": false,
+  "repeat": 2,
+  "vpn": true,
+  "vpn_servers": ["US-AZ#81", "US-AZ#82"],
   "tabs": [
     { "tab": 1, "videos": [1] }
   ],
