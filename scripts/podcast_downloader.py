@@ -35,8 +35,8 @@ except ImportError:
 # Constants
 # -----------------------------------------------------------------------------
 DEFAULT_VERIFY_TIMEOUT_SEC = 30
-DEFAULT_SEE_ALL_BUDGET_SEC = 5
-DEFAULT_ACCESSIBILITY_DEPTH = 4
+DEFAULT_SEE_ALL_BUDGET_SEC = 12
+DEFAULT_ACCESSIBILITY_DEPTH = 10
 DEFAULT_OSASCRIPT_TIMEOUT = 30
 PROTON_APP_CANDIDATES = ("Proton VPN", "ProtonVPN")
 APPLE_PODCASTS_HOST = "podcasts.apple.com"
@@ -841,25 +841,119 @@ class PodcastsController:
         run_osascript(script, timeout=timeout_sec + 5, label="wait for Podcasts window")
 
     def click_see_all(self, time_budget_sec: int = DEFAULT_SEE_ALL_BUDGET_SEC) -> str:
-        """Return 'clicked', 'list_already_expanded', or 'see_all_not_found'."""
+        """Return 'clicked', 'list_already_expanded', or 'see_all_not_found'.
+
+        Walks the whole accessibility tree (bounded depth) looking for ANY
+        element whose name, description, or value matches a "See All" variant,
+        then tries multiple click methods (direct click and AXPress) because
+        Apple Podcasts implements the control as a styled link/static-text,
+        not always as a true AXButton.
+        """
         script = _BOUNDED_HELPERS + """
+        on matchesSeeAll(s)
+            if s is missing value then return false
+            try
+                set t to s as text
+            on error
+                return false
+            end try
+            if t is "" then return false
+            if t is "See All" then return true
+            if t is "Show All" then return true
+            if t is "See all" then return true
+            if t contains "See All" then return true
+            if t contains "Show All" then return true
+            return false
+        end matchesSeeAll
+
+        on findSeeAllElement(rootElem, maxDepth)
+            tell application "System Events"
+                set stack to {{rootElem, 0}}
+                repeat while (count of stack) > 0
+                    set lastPair to item -1 of stack
+                    if (count of stack) > 1 then
+                        set stack to items 1 thru -2 of stack
+                    else
+                        set stack to {}
+                    end if
+                    set elem to item 1 of lastPair
+                    set d to item 2 of lastPair
+
+                    set nn to ""
+                    try
+                        set nn to name of elem
+                    end try
+                    set dd to ""
+                    try
+                        set dd to description of elem
+                    end try
+                    set vv to ""
+                    try
+                        set vv to (value of elem) as text
+                    end try
+
+                    if (my matchesSeeAll(nn)) or (my matchesSeeAll(dd)) or (my matchesSeeAll(vv)) then
+                        return elem
+                    end if
+
+                    if d < maxDepth then
+                        try
+                            repeat with child in UI elements of elem
+                                set end of stack to {child, d + 1}
+                            end repeat
+                        end try
+                    end if
+                end repeat
+            end tell
+            return missing value
+        end findSeeAllElement
+
+        on attemptClick(elem)
+            tell application "System Events"
+                try
+                    click elem
+                    return "click_ok"
+                end try
+                try
+                    perform action "AXPress" of elem
+                    return "axpress_ok"
+                end try
+                try
+                    set p to value of attribute "AXParent" of elem
+                    if p is not missing value then
+                        try
+                            click p
+                            return "parent_click_ok"
+                        end try
+                        try
+                            perform action "AXPress" of p
+                            return "parent_axpress_ok"
+                        end try
+                    end if
+                end try
+            end tell
+            return "click_failed"
+        end attemptClick
+
         tell application "Podcasts" to activate
+        delay 1.5
         tell application "System Events"
             tell process "Podcasts"
                 set frontmost to true
-                delay 0.4
+                delay 0.6
                 if not (exists window 1) then return "no_window"
-                set btn to my findButtonByName(window 1, "See All", __DEPTH__)
-                if btn is not missing value then
-                    click btn
-                    delay 0.8
-                    return "clicked"
-                end if
+
+                set elem to my findSeeAllElement(window 1, __DEPTH__)
+                if elem is missing value then return "see_all_not_found"
+
+                set clickResult to my attemptClick(elem)
+                if clickResult is "click_failed" then return "see_all_click_failed"
+                delay 0.9
+                return "clicked"
             end tell
         end tell
-        return "see_all_not_found"
         """.replace("__DEPTH__", str(DEFAULT_ACCESSIBILITY_DEPTH))
-        return run_osascript(script, timeout=time_budget_sec + 8, label="click See All")
+        return run_osascript(script, timeout=time_budget_sec + 15, label="click See All")
 
     def scroll_to_top(self) -> None:
         script = """
