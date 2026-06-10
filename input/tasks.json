@@ -1,9 +1,12 @@
 {
   "repeat": 2,
-  "vpn": true,
-  "vpn_servers": ["US-AZ#81", "US-AZ#82"],
+  "vpn": {
+    "enabled": true,
+    "app": "ProtonVPN",
+    "location": "United States"
+  },
   "tabs": [
     { "tab": 1, "videos": [1] }
   ],
-  "cleanup": false
+  "cleanup": true
 }
