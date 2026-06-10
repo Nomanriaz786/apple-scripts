@@ -70,6 +70,7 @@ class Config:
     vpn: bool
     cleanup: bool
     tabs: list[TabTask]
+    vpn_servers: tuple[str, ...] = ()
     vpn_country_code: str = "US"
     vpn_require_proton: bool = True
     vpn_verify_timeout: int = DEFAULT_VERIFY_TIMEOUT_SEC
@@ -106,11 +107,17 @@ def load_config(path: Path) -> Config:
     country_raw = str(raw.get("vpn_country_code") or raw.get("vpn_country") or "US").strip()
     country_code = _COUNTRY_CODE_FALLBACK.get(country_raw.lower(), country_raw.upper()[:2] or "US")
 
+    servers_raw = raw.get("vpn_servers", [])
+    if not isinstance(servers_raw, list):
+        raise ValueError("'vpn_servers' must be a list of strings (e.g. [\"US-AZ#81\", \"US-AZ#82\"])")
+    vpn_servers = tuple(str(s).strip() for s in servers_raw if str(s).strip())
+
     return Config(
         repeat=repeat,
         vpn=vpn,
         cleanup=cleanup,
         tabs=tabs,
+        vpn_servers=vpn_servers,
         vpn_country_code=country_code,
         vpn_require_proton=bool(raw.get("vpn_require_proton", True)),
         vpn_verify_timeout=int(raw.get("vpn_verify_timeout", DEFAULT_VERIFY_TIMEOUT_SEC)),
@@ -139,7 +146,9 @@ class StateManager:
             "current_tab": None,
             "current_video": None,
             "used_public_ips": [],
+            "used_vpn_servers": [],
             "last_public_ip": None,
+            "last_vpn_server": None,
             "chrome_tabs_cache": {},
             "podcast_task_results": [],
             "cleanup_results": [],
@@ -375,7 +384,14 @@ class VPNController:
         org_ok = "proton" in (ip_info.get("org") or "").lower()
         return country_ok and org_ok
 
-    def connect(self, cycle: int, target_cc: str, require_proton: bool, verify_timeout: int) -> str:
+    def connect(
+        self,
+        cycle: int,
+        target_cc: str,
+        require_proton: bool,
+        verify_timeout: int,
+        server_list: tuple[str, ...] = (),
+    ) -> str:
         baseline = self.net.public_ip_info()
         baseline_ip = (baseline or {}).get("ip")
         self.logger.log(
@@ -383,6 +399,18 @@ class VPNController:
             step="06", baseline_ip=baseline_ip,
         )
 
+        # Deterministic server rotation path: cycle N → server_list[(N-1) % len].
+        if server_list:
+            target_server = server_list[(cycle - 1) % len(server_list)]
+            self.logger.log(
+                f"Cycle {cycle} target Proton server: {target_server}",
+                step="06", cycle=cycle, target_server=target_server,
+            )
+            return self._connect_to_named_server(
+                target_server, cycle, target_cc, require_proton, verify_timeout, baseline_ip,
+            )
+
+        # Default path: Quick Connect with IP-based rotation.
         already_ok = self._is_connected_to(baseline, target_cc, require_proton)
         already_unused = bool(baseline_ip) and baseline_ip not in self.state.data["used_public_ips"]
 
@@ -414,6 +442,181 @@ class VPNController:
             raise AutomationError(f"Proton VPN action failed: {ui_status}")
 
         return self._poll_verify(target_cc, require_proton, verify_timeout)
+
+    def _connect_to_named_server(
+        self,
+        server: str,
+        cycle: int,
+        target_cc: str,
+        require_proton: bool,
+        verify_timeout: int,
+        baseline_ip: str | None,
+    ) -> str:
+        opened = self._open_proton_app()
+        if not opened:
+            raise AutomationError("Proton VPN app not found. Install and sign in first.")
+        self.logger.log(f"Proton VPN opened: {opened}", step="06", app_name=opened)
+
+        # Disconnect any existing connection to guarantee a fresh tunnel to the
+        # requested server.
+        disc = self._click_disconnect()
+        self.logger.log(f"Pre-connect disconnect: {disc}", step="06", status=disc)
+        if disc == "disconnect_clicked":
+            time.sleep(2.5)
+
+        ui_status = self._click_server_by_name(server)
+        self.logger.log(
+            f"Proton server '{server}': {ui_status}",
+            step="06", status=ui_status, server=server,
+        )
+        if ui_status not in ("server_clicked", "row_clicked", "connect_button_clicked"):
+            raise AutomationError(
+                f"Could not click Proton server '{server}': {ui_status}. "
+                "Verify the name matches exactly what Proton displays."
+            )
+
+        result = self._poll_verify(target_cc, require_proton, verify_timeout)
+        if result == "connected_verified":
+            self._record_server(server)
+        return result
+
+    def _record_server(self, server: str) -> None:
+        self.state.data["last_vpn_server"] = server
+        used = list(self.state.data.get("used_vpn_servers", []))
+        used.append(server)
+        self.state.data["used_vpn_servers"] = used
+        self.state.save()
+
+    def _click_server_by_name(self, server: str) -> str:
+        """Search Proton for the server name, click its row. Returns a status string."""
+        # Escape any double quotes in the server name for AppleScript.
+        server_esc = server.replace('"', '\\"')
+        script = _BOUNDED_HELPERS + """
+        on findFirstTextField(rootElem, maxDepth)
+            tell application "System Events"
+                set stack to {{rootElem, 0}}
+                repeat while (count of stack) > 0
+                    set lastPair to item -1 of stack
+                    if (count of stack) > 1 then
+                        set stack to items 1 thru -2 of stack
+                    else
+                        set stack to {}
+                    end if
+                    set elem to item 1 of lastPair
+                    set d to item 2 of lastPair
+                    try
+                        if (class of elem) is text field then return elem
+                    end try
+                    if d < maxDepth then
+                        try
+                            repeat with child in UI elements of elem
+                                set end of stack to {child, d + 1}
+                            end repeat
+                        end try
+                    end if
+                end repeat
+            end tell
+            return missing value
+        end findFirstTextField
+
+        on findElemByText(rootElem, targetText, maxDepth)
+            tell application "System Events"
+                set stack to {{rootElem, 0}}
+                repeat while (count of stack) > 0
+                    set lastPair to item -1 of stack
+                    if (count of stack) > 1 then
+                        set stack to items 1 thru -2 of stack
+                    else
+                        set stack to {}
+                    end if
+                    set elem to item 1 of lastPair
+                    set d to item 2 of lastPair
+                    set elemText to ""
+                    try
+                        set elemText to (value of static texts of elem) as text
+                    end try
+                    set elemName to ""
+                    try
+                        set elemName to name of elem
+                    end try
+                    if (elemText contains targetText) or (elemName contains targetText) then return elem
+                    if d < maxDepth then
+                        try
+                            repeat with child in UI elements of elem
+                                set end of stack to {child, d + 1}
+                            end repeat
+                        end try
+                    end if
+                end repeat
+            end tell
+            return missing value
+        end findElemByText
+
+        tell application "System Events"
+            set procName to ""
+            repeat with candidate in {"Proton VPN", "ProtonVPN"}
+                if exists process (candidate as text) then
+                    set procName to candidate as text
+                    exit repeat
+                end if
+            end repeat
+            if procName is "" then return "vpn_process_not_found"
+
+            tell process procName
+                set frontmost to true
+                delay 0.5
+                if not (exists window 1) then return "no_window"
+
+                -- Make sure the Countries tab is showing (Profiles tab might be active).
+                try
+                    set ctab to my findButtonByName(window 1, "Countries", 5)
+                    if ctab is not missing value then
+                        click ctab
+                        delay 0.3
+                    end if
+                end try
+
+                -- Focus the search field and type the server name.
+                set sf to my findFirstTextField(window 1, 8)
+                if sf is missing value then return "search_field_not_found"
+                try
+                    set focused of sf to true
+                    delay 0.2
+                end try
+                try
+                    set value of sf to ""
+                end try
+                delay 0.2
+                keystroke "__SERVER__"
+                delay 1.0
+
+                -- Find the element whose text/name matches the server.
+                set targetElem to my findElemByText(window 1, "__SERVER__", 10)
+                if targetElem is missing value then return "server_not_found"
+
+                -- Prefer clicking a Connect button inside the row, fall back to the row itself.
+                try
+                    set cbtn to my findButtonByName(targetElem, "Connect", 4)
+                    if cbtn is not missing value then
+                        click cbtn
+                        return "connect_button_clicked"
+                    end if
+                end try
+                try
+                    click targetElem
+                    return "row_clicked"
+                end try
+                try
+                    repeat with b in buttons of targetElem
+                        click b
+                        return "server_clicked"
+                    end repeat
+                end try
+                return "click_failed"
+            end tell
+        end tell
+        """.replace("__SERVER__", server_esc)
+        return run_osascript(script, timeout=25, label=f"click server {server}")
 
     def _record_ip(self, ip: str | None) -> None:
         if not ip:
@@ -918,11 +1121,21 @@ class Orchestrator:
                 self.logger.log(f"Starting cycle {cycle}", step="05", cycle=cycle)
 
                 if self.config.vpn:
+                    server_list = self.config.vpn_servers
+                    if server_list:
+                        target = server_list[(cycle - 1) % len(server_list)]
+                        self.logger.log(
+                            f"VPN rotation: cycle {cycle} → server {target} "
+                            f"(server {((cycle - 1) % len(server_list)) + 1} of {len(server_list)})",
+                            step="06", cycle=cycle, target_server=target,
+                            server_count=len(server_list),
+                        )
                     self.vpn.connect(
                         cycle=cycle,
                         target_cc=self.config.vpn_country_code,
                         require_proton=self.config.vpn_require_proton,
                         verify_timeout=self.config.vpn_verify_timeout,
+                        server_list=server_list,
                     )
                 else:
                     self.logger.log("VPN disabled", step="06", status="vpn_disabled")

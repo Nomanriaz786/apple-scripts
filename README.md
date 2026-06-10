@@ -107,6 +107,7 @@ The whole config:
 | --- | --- |
 | `repeat` | Number of full cycles to run. Each cycle re-opens every tab and downloads the listed videos. |
 | `vpn` | `true` to require Proton VPN to be connected to the US before each cycle. `false` to skip. |
+| `vpn_servers` | Optional. List of exact Proton server names (e.g. `"US-AZ#81"`). When present, cycle N connects to server `[(N-1) % len]`. When omitted, Quick Connect is used with IP-based de-duplication. |
 | `tabs[].tab` | Chrome tab number (1 = leftmost). |
 | `tabs[].videos` | Episode row numbers to download, counted from top after `See All`. |
 | `cleanup` | `true` to remove the downloaded items from the Library at the end of each cycle. |
@@ -128,6 +129,22 @@ Examples:
   "cleanup": true
 }
 ```
+
+Deterministic per-server VPN rotation:
+
+```json
+{
+  "repeat": 5,
+  "vpn": true,
+  "vpn_servers": ["US-AZ#81", "US-AZ#82", "US-AZ#83", "US-AZ#84", "US-AZ#85"],
+  "tabs": [
+    { "tab": 1, "videos": [1] }
+  ],
+  "cleanup": true
+}
+```
+
+How to populate `vpn_servers`: open Proton VPN, type `united` in the country search, click the chevron next to **United States** to expand the server list, and copy the names you want (e.g. `US-AZ#81`). Use them verbatim — the script clicks rows whose visible name contains that string. Cycles wrap around the list (`repeat: 7` with 3 servers reuses `[0, 1, 2, 0, 1, 2, 0]`).
 
 ---
 
