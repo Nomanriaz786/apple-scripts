@@ -38,7 +38,6 @@ DEFAULT_VERIFY_TIMEOUT_SEC = 30
 DEFAULT_SEE_ALL_BUDGET_SEC = 12
 DEFAULT_ACCESSIBILITY_DEPTH = 10
 DEFAULT_OSASCRIPT_TIMEOUT = 30
-PROTON_APP_CANDIDATES = ("Proton VPN", "ProtonVPN")
 APPLE_PODCASTS_HOST = "podcasts.apple.com"
 
 _COUNTRY_CODE_FALLBACK = {
@@ -65,15 +64,54 @@ class TabTask:
 
 
 @dataclass(frozen=True)
+class VPNConfig:
+    enabled: bool
+    app: str = "Proton VPN"
+    location: str = "United States"
+    location_code: str = "US"
+    servers: tuple[str, ...] = ()
+    require_provider_in_org: bool = True
+    verify_timeout: int = DEFAULT_VERIFY_TIMEOUT_SEC
+
+
+@dataclass(frozen=True)
 class Config:
     repeat: int
-    vpn: bool
+    vpn: VPNConfig
     cleanup: bool
     tabs: list[TabTask]
-    vpn_servers: tuple[str, ...] = ()
-    vpn_country_code: str = "US"
-    vpn_require_proton: bool = True
-    vpn_verify_timeout: int = DEFAULT_VERIFY_TIMEOUT_SEC
+
+
+def _parse_vpn(raw_vpn: Any) -> VPNConfig:
+    if raw_vpn is None or raw_vpn is False:
+        return VPNConfig(enabled=False)
+    if raw_vpn is True:
+        return VPNConfig(enabled=True)
+    if not isinstance(raw_vpn, dict):
+        raise ValueError("'vpn' must be a boolean or an object {enabled, app, location}")
+
+    enabled = bool(raw_vpn.get("enabled", True))
+    app = str(raw_vpn.get("app", "Proton VPN")).strip() or "Proton VPN"
+    location = str(raw_vpn.get("location", "United States")).strip() or "United States"
+    location_code = _COUNTRY_CODE_FALLBACK.get(location.lower(), location.upper()[:2] or "US")
+
+    servers_raw = raw_vpn.get("servers", [])
+    if not isinstance(servers_raw, list):
+        raise ValueError("'vpn.servers' must be a list of strings (optional explicit override)")
+    servers = tuple(str(s).strip() for s in servers_raw if str(s).strip())
+
+    require_default = "proton" in app.lower()
+    require = bool(raw_vpn.get("require_provider_in_org", require_default))
+
+    return VPNConfig(
+        enabled=enabled,
+        app=app,
+        location=location,
+        location_code=location_code,
+        servers=servers,
+        require_provider_in_org=require,
+        verify_timeout=int(raw_vpn.get("verify_timeout", DEFAULT_VERIFY_TIMEOUT_SEC)),
+    )
 
 
 def load_config(path: Path) -> Config:
@@ -83,8 +121,8 @@ def load_config(path: Path) -> Config:
     if repeat < 1:
         raise ValueError("repeat must be >= 1")
 
-    vpn = bool(raw.get("vpn", False))
     cleanup = bool(raw.get("cleanup", False))
+    vpn = _parse_vpn(raw.get("vpn", False))
 
     tabs_raw = raw.get("tabs")
     if not isinstance(tabs_raw, list) or not tabs_raw:
@@ -104,24 +142,7 @@ def load_config(path: Path) -> Config:
             raise ValueError(f"tabs[{i}].videos must contain integers >= 1")
         tabs.append(TabTask(tab=tab, videos=sorted(set(videos))))
 
-    country_raw = str(raw.get("vpn_country_code") or raw.get("vpn_country") or "US").strip()
-    country_code = _COUNTRY_CODE_FALLBACK.get(country_raw.lower(), country_raw.upper()[:2] or "US")
-
-    servers_raw = raw.get("vpn_servers", [])
-    if not isinstance(servers_raw, list):
-        raise ValueError("'vpn_servers' must be a list of strings (e.g. [\"US-AZ#81\", \"US-AZ#82\"])")
-    vpn_servers = tuple(str(s).strip() for s in servers_raw if str(s).strip())
-
-    return Config(
-        repeat=repeat,
-        vpn=vpn,
-        cleanup=cleanup,
-        tabs=tabs,
-        vpn_servers=vpn_servers,
-        vpn_country_code=country_code,
-        vpn_require_proton=bool(raw.get("vpn_require_proton", True)),
-        vpn_verify_timeout=int(raw.get("vpn_verify_timeout", DEFAULT_VERIFY_TIMEOUT_SEC)),
-    )
+    return Config(repeat=repeat, vpn=vpn, cleanup=cleanup, tabs=tabs)
 
 
 # -----------------------------------------------------------------------------
@@ -147,6 +168,7 @@ class StateManager:
             "current_video": None,
             "used_public_ips": [],
             "used_vpn_servers": [],
+            "discovered_servers_by_location": {},
             "last_public_ip": None,
             "last_vpn_server": None,
             "chrome_tabs_cache": {},
@@ -375,110 +397,126 @@ class VPNController:
         self.state = state
 
     @staticmethod
-    def _is_connected_to(ip_info: dict[str, Any] | None, target_cc: str, require_proton: bool) -> bool:
+    def _is_connected_to(
+        ip_info: dict[str, Any] | None,
+        target_cc: str,
+        require_provider_in_org: bool,
+        provider_name: str = "proton",
+    ) -> bool:
         if not ip_info:
             return False
         country_ok = (ip_info.get("country") or "").upper() == target_cc.upper()
-        if not require_proton:
+        if not require_provider_in_org:
             return country_ok
-        org_ok = "proton" in (ip_info.get("org") or "").lower()
+        org_ok = provider_name.lower() in (ip_info.get("org") or "").lower()
         return country_ok and org_ok
 
-    def connect(
-        self,
-        cycle: int,
-        target_cc: str,
-        require_proton: bool,
-        verify_timeout: int,
-        server_list: tuple[str, ...] = (),
-    ) -> str:
+    def connect_with_config(self, cycle: int, vpn_cfg: VPNConfig) -> str:
+        """Top-level entry point. Handles cache lookup, discovery, rotation, and verification."""
+        provider_token = self._provider_token(vpn_cfg.app)
+
+        # Pick the server list: explicit override > cached discovery > fresh discovery.
+        servers = list(vpn_cfg.servers)
+        if not servers:
+            discovered = self.state.data.setdefault("discovered_servers_by_location", {})
+            cached = discovered.get(vpn_cfg.location, [])
+            if cached:
+                servers = list(cached)
+                self.logger.log(
+                    f"Using cached server list for {vpn_cfg.location} ({len(servers)} servers)",
+                    step="06", location=vpn_cfg.location, source="cache",
+                )
+            else:
+                self.logger.log(
+                    f"No cached servers for {vpn_cfg.location}; running discovery in {vpn_cfg.app}",
+                    step="06", location=vpn_cfg.location, app=vpn_cfg.app,
+                )
+                if not self._open_provider_app(vpn_cfg.app):
+                    raise AutomationError(
+                        f"{vpn_cfg.app} app not found. Install and sign in first."
+                    )
+                servers = self._discover_servers(vpn_cfg.location, vpn_cfg.location_code)
+                if not servers:
+                    raise AutomationError(
+                        f"No servers discovered for {vpn_cfg.location} in {vpn_cfg.app}. "
+                        f"Open {vpn_cfg.app}, search '{vpn_cfg.location}', expand the country, "
+                        f"and try again — OR set vpn.servers explicitly in input/tasks.json."
+                    )
+                discovered[vpn_cfg.location] = servers
+                self.state.save()
+                self.logger.log(
+                    f"Discovered {len(servers)} servers for {vpn_cfg.location}: {servers[:5]}"
+                    + ("..." if len(servers) > 5 else ""),
+                    step="06", location=vpn_cfg.location, server_count=len(servers),
+                )
+
+        # Pick this cycle's server via deterministic rotation.
+        target_server = servers[(cycle - 1) % len(servers)]
+        self.logger.log(
+            f"Cycle {cycle} target {vpn_cfg.app} server: {target_server} "
+            f"(server {((cycle - 1) % len(servers)) + 1} of {len(servers)})",
+            step="06", cycle=cycle, target_server=target_server,
+        )
+
+        # Ensure app is open.
+        if not self._open_provider_app(vpn_cfg.app):
+            raise AutomationError(f"{vpn_cfg.app} app not found.")
+
+        # Baseline IP.
         baseline = self.net.public_ip_info()
         baseline_ip = (baseline or {}).get("ip")
         self.logger.log(
-            f"Baseline public IP: {baseline_ip} country={(baseline or {}).get('country')}",
+            f"Baseline IP: {baseline_ip} country={(baseline or {}).get('country')}",
             step="06", baseline_ip=baseline_ip,
         )
 
-        # Deterministic server rotation path: cycle N → server_list[(N-1) % len].
-        if server_list:
-            target_server = server_list[(cycle - 1) % len(server_list)]
-            self.logger.log(
-                f"Cycle {cycle} target Proton server: {target_server}",
-                step="06", cycle=cycle, target_server=target_server,
-            )
-            return self._connect_to_named_server(
-                target_server, cycle, target_cc, require_proton, verify_timeout, baseline_ip,
-            )
-
-        # Default path: Quick Connect with IP-based rotation.
-        already_ok = self._is_connected_to(baseline, target_cc, require_proton)
-        already_unused = bool(baseline_ip) and baseline_ip not in self.state.data["used_public_ips"]
-
-        if already_ok and (cycle == 1 or already_unused):
-            self.logger.log(
-                f"VPN already connected: ip={baseline_ip} country={baseline.get('country')} org={baseline.get('org')}",
-                step="06", status="already_connected_verified",
-                ip=baseline_ip,
-            )
-            self._record_ip(baseline_ip)
-            return "already_connected_verified"
-
-        opened = self._open_proton_app()
-        if not opened:
-            raise AutomationError("Proton VPN app not found. Install and sign in first.")
-        self.logger.log(f"Proton VPN opened: {opened}", step="06", app_name=opened)
-
-        ui_status = self._press_action_button()
-        self.logger.log(f"Proton VPN UI: {ui_status}", step="06", status=ui_status)
-
-        if ui_status == "button_disconnect_visible" and cycle > 1:
-            disc = self._click_disconnect()
-            self.logger.log(f"Disconnect for IP rotation: {disc}", step="06", status=disc)
-            time.sleep(2)
-            ui_status = self._press_action_button()
-            self.logger.log(f"Reconnect attempt: {ui_status}", step="06", status=ui_status)
-
-        if ui_status not in ("quick_connect_clicked", "connect_clicked", "button_disconnect_visible"):
-            raise AutomationError(f"Proton VPN action failed: {ui_status}")
-
-        return self._poll_verify(target_cc, require_proton, verify_timeout)
-
-    def _connect_to_named_server(
-        self,
-        server: str,
-        cycle: int,
-        target_cc: str,
-        require_proton: bool,
-        verify_timeout: int,
-        baseline_ip: str | None,
-    ) -> str:
-        opened = self._open_proton_app()
-        if not opened:
-            raise AutomationError("Proton VPN app not found. Install and sign in first.")
-        self.logger.log(f"Proton VPN opened: {opened}", step="06", app_name=opened)
-
-        # Disconnect any existing connection to guarantee a fresh tunnel to the
-        # requested server.
-        disc = self._click_disconnect()
+        # Disconnect any current tunnel so we connect to the requested server fresh.
+        disc = self._click_disconnect(vpn_cfg.app)
         self.logger.log(f"Pre-connect disconnect: {disc}", step="06", status=disc)
         if disc == "disconnect_clicked":
             time.sleep(2.5)
 
-        ui_status = self._click_server_by_name(server)
+        ui_status = self._click_server_by_name(vpn_cfg.app, target_server)
         self.logger.log(
-            f"Proton server '{server}': {ui_status}",
-            step="06", status=ui_status, server=server,
+            f"{vpn_cfg.app} server '{target_server}': {ui_status}",
+            step="06", status=ui_status, server=target_server,
         )
         if ui_status not in ("server_clicked", "row_clicked", "connect_button_clicked"):
             raise AutomationError(
-                f"Could not click Proton server '{server}': {ui_status}. "
-                "Verify the name matches exactly what Proton displays."
+                f"Could not click server '{target_server}' in {vpn_cfg.app}: {ui_status}"
             )
 
-        result = self._poll_verify(target_cc, require_proton, verify_timeout)
+        result = self._poll_verify(
+            target_cc=vpn_cfg.location_code,
+            provider_token=provider_token,
+            require_provider_in_org=vpn_cfg.require_provider_in_org,
+            verify_timeout=vpn_cfg.verify_timeout,
+        )
         if result == "connected_verified":
-            self._record_server(server)
+            self._record_server(target_server)
         return result
+
+    @staticmethod
+    def _provider_token(app_name: str) -> str:
+        """Substring expected to appear in ipinfo.org for the provider."""
+        n = app_name.lower()
+        if "proton" in n:
+            return "proton"
+        if "mullvad" in n:
+            return "mullvad"
+        if "nordvpn" in n or "nord vpn" in n:
+            return "nordvpn"
+        if "expressvpn" in n or "express vpn" in n:
+            return "expressvpn"
+        return n.split()[0]
+
+    def _open_provider_app(self, app_name: str) -> str:
+        candidates = [app_name, app_name.replace(" ", "")]
+        for name in candidates:
+            proc = subprocess.run(["open", "-a", name], capture_output=True, text=True)
+            if proc.returncode == 0:
+                return name
+        return ""
 
     def _record_server(self, server: str) -> None:
         self.state.data["last_vpn_server"] = server
@@ -487,10 +525,240 @@ class VPNController:
         self.state.data["used_vpn_servers"] = used
         self.state.save()
 
-    def _click_server_by_name(self, server: str) -> str:
-        """Search Proton for the server name, click its row. Returns a status string."""
-        # Escape any double quotes in the server name for AppleScript.
+    def _process_name_candidates(self, app_name: str) -> str:
+        """AppleScript list literal of process name candidates for this app."""
+        names = [app_name, app_name.replace(" ", "")]
+        # dedupe while preserving order
+        seen: list[str] = []
+        for n in names:
+            if n not in seen:
+                seen.append(n)
+        return ", ".join('"' + n.replace('"', '\\"') + '"' for n in seen)
+
+    def _discover_servers(self, location: str, location_code: str) -> list[str]:
+        """Open VPN, search location, expand, and return visible server names."""
+        loc_esc = location.replace('"', '\\"')
+        prefix = location_code.upper() + "-"
+        process_list = self._process_name_candidates("Proton VPN")
+        script = _BOUNDED_HELPERS + """
+        on findFirstTextField(rootElem, maxDepth)
+            tell application "System Events"
+                set stack to {{rootElem, 0}}
+                repeat while (count of stack) > 0
+                    set lastPair to item -1 of stack
+                    if (count of stack) > 1 then
+                        set stack to items 1 thru -2 of stack
+                    else
+                        set stack to {}
+                    end if
+                    set elem to item 1 of lastPair
+                    set d to item 2 of lastPair
+                    try
+                        if (class of elem) is text field then return elem
+                    end try
+                    if d < maxDepth then
+                        try
+                            repeat with child in UI elements of elem
+                                set end of stack to {child, d + 1}
+                            end repeat
+                        end try
+                    end if
+                end repeat
+            end tell
+            return missing value
+        end findFirstTextField
+
+        on findElemByText(rootElem, txt, maxDepth)
+            tell application "System Events"
+                set stack to {{rootElem, 0}}
+                repeat while (count of stack) > 0
+                    set lastPair to item -1 of stack
+                    if (count of stack) > 1 then
+                        set stack to items 1 thru -2 of stack
+                    else
+                        set stack to {}
+                    end if
+                    set elem to item 1 of lastPair
+                    set d to item 2 of lastPair
+                    set nn to ""
+                    try
+                        set nn to name of elem
+                    end try
+                    set vv to ""
+                    try
+                        set vv to (value of elem) as text
+                    end try
+                    if (nn contains txt) or (vv contains txt) then return elem
+                    if d < maxDepth then
+                        try
+                            repeat with child in UI elements of elem
+                                set end of stack to {child, d + 1}
+                            end repeat
+                        end try
+                    end if
+                end repeat
+            end tell
+            return missing value
+        end findElemByText
+
+        on collectServerNames(rootElem, prefix, maxDepth)
+            tell application "System Events"
+                set found to {}
+                set stack to {{rootElem, 0}}
+                repeat while (count of stack) > 0
+                    set lastPair to item -1 of stack
+                    if (count of stack) > 1 then
+                        set stack to items 1 thru -2 of stack
+                    else
+                        set stack to {}
+                    end if
+                    set elem to item 1 of lastPair
+                    set d to item 2 of lastPair
+                    set nn to ""
+                    try
+                        set nn to name of elem
+                    end try
+                    set vv to ""
+                    try
+                        set vv to (value of elem) as text
+                    end try
+                    set candidate to ""
+                    if (nn starts with prefix) and (nn contains "#") then
+                        set candidate to nn
+                    else if (vv starts with prefix) and (vv contains "#") then
+                        set candidate to vv
+                    end if
+                    if candidate is not "" then
+                        -- strip trailing city/whitespace after the server token (e.g. "US-AZ#81  Phoenix")
+                        set trimmed to candidate
+                        try
+                            set AppleScript's text item delimiters to " "
+                            set parts to text items of trimmed
+                            set trimmed to item 1 of parts
+                            set AppleScript's text item delimiters to ""
+                        end try
+                        if (count of found) is 0 or not (found contains trimmed) then
+                            set end of found to trimmed
+                        end if
+                    end if
+                    if d < maxDepth then
+                        try
+                            repeat with child in UI elements of elem
+                                set end of stack to {child, d + 1}
+                            end repeat
+                        end try
+                    end if
+                end repeat
+                return found
+            end tell
+        end collectServerNames
+
+        tell application "System Events"
+            set procName to ""
+            repeat with candidate in {__PROCS__}
+                if exists process (candidate as text) then
+                    set procName to candidate as text
+                    exit repeat
+                end if
+            end repeat
+            if procName is "" then return "ERROR:vpn_process_not_found"
+
+            tell process procName
+                set frontmost to true
+                delay 0.6
+                if not (exists window 1) then return "ERROR:no_window"
+
+                -- Click Countries tab if present.
+                try
+                    set ctab to my findButtonByName(window 1, "Countries", 6)
+                    if ctab is not missing value then
+                        click ctab
+                        delay 0.4
+                    end if
+                end try
+
+                -- Type the location name in the search field.
+                set sf to my findFirstTextField(window 1, 8)
+                if sf is missing value then return "ERROR:no_search_field"
+                try
+                    set focused of sf to true
+                    delay 0.2
+                end try
+                try
+                    set value of sf to ""
+                end try
+                delay 0.2
+                keystroke "__LOCATION__"
+                delay 1.2
+
+                -- Find the matching country row and expand it.
+                set locRow to my findElemByText(window 1, "__LOCATION__", 10)
+                if locRow is missing value then return "ERROR:location_not_found"
+
+                set expanded to false
+                try
+                    repeat with b in buttons of locRow
+                        set dd to ""
+                        try
+                            set dd to description of b
+                        end try
+                        set bn to ""
+                        try
+                            set bn to name of b
+                        end try
+                        if (dd contains "more") or (dd contains "Show") or (dd contains "Expand") or (dd contains "disclos") or (bn contains "disclos") then
+                            click b
+                            delay 1.0
+                            set expanded to true
+                            exit repeat
+                        end if
+                    end repeat
+                end try
+
+                if not expanded then
+                    -- Some lists expand on row click.
+                    try
+                        click locRow
+                        delay 1.0
+                    end try
+                end if
+
+                -- Walk the whole window for entries whose name matches "<prefix>...#"
+                set servers to my collectServerNames(window 1, "__PREFIX__", 14)
+                if (count of servers) is 0 then return "ERROR:no_servers_visible"
+
+                set result to ""
+                repeat with s in servers
+                    if result is "" then
+                        set result to (s as text)
+                    else
+                        set result to result & "|" & (s as text)
+                    end if
+                end repeat
+                return result
+            end tell
+        end tell
+        """.replace("__LOCATION__", loc_esc).replace("__PREFIX__", prefix).replace("__PROCS__", process_list)
+        try:
+            out = run_osascript(script, timeout=30, label=f"discover {location} servers")
+        except AutomationError as exc:
+            self.logger.log(
+                f"Server discovery failed: {exc}",
+                step="06", status="discovery_failed", error=str(exc),
+            )
+            return []
+        if out.startswith("ERROR:"):
+            self.logger.log(
+                f"Server discovery: {out}",
+                step="06", status=out,
+            )
+            return []
+        return [s.strip() for s in out.split("|") if s.strip()]
+
+    def _click_server_by_name(self, app_name: str, server: str) -> str:
+        """Search VPN app for the server name, click its row. Returns a status string."""
         server_esc = server.replace('"', '\\"')
+        process_list = self._process_name_candidates(app_name)
         script = _BOUNDED_HELPERS + """
         on findFirstTextField(rootElem, maxDepth)
             tell application "System Events"
@@ -554,7 +822,7 @@ class VPNController:
 
         tell application "System Events"
             set procName to ""
-            repeat with candidate in {"Proton VPN", "ProtonVPN"}
+            repeat with candidate in {__PROCS__}
                 if exists process (candidate as text) then
                     set procName to candidate as text
                     exit repeat
@@ -615,7 +883,7 @@ class VPNController:
                 return "click_failed"
             end tell
         end tell
-        """.replace("__SERVER__", server_esc)
+        """.replace("__SERVER__", server_esc).replace("__PROCS__", process_list)
         return run_osascript(script, timeout=25, label=f"click server {server}")
 
     def _record_ip(self, ip: str | None) -> None:
@@ -626,56 +894,12 @@ class VPNController:
             self.state.data["used_public_ips"].append(ip)
         self.state.save()
 
-    def _open_proton_app(self) -> str:
-        for name in PROTON_APP_CANDIDATES:
-            proc = subprocess.run(["open", "-a", name], capture_output=True, text=True)
-            if proc.returncode == 0:
-                return name
-        return ""
-
-    def _press_action_button(self) -> str:
+    def _click_disconnect(self, app_name: str) -> str:
+        process_list = self._process_name_candidates(app_name)
         script = _BOUNDED_HELPERS + """
         tell application "System Events"
             set procName to ""
-            repeat with candidate in {"Proton VPN", "ProtonVPN"}
-                if exists process (candidate as text) then
-                    set procName to candidate as text
-                    exit repeat
-                end if
-            end repeat
-            if procName is "" then return "vpn_process_not_found"
-
-            tell process procName
-                set frontmost to true
-                delay 0.6
-                if not (exists window 1) then return "vpn_window_not_found"
-
-                set disc to my findButtonByName(window 1, "Disconnect", 5)
-                if disc is not missing value then return "button_disconnect_visible"
-
-                set qc to my findButtonByName(window 1, "Quick Connect", 5)
-                if qc is not missing value then
-                    click qc
-                    return "quick_connect_clicked"
-                end if
-
-                set c to my findButtonByName(window 1, "Connect", 5)
-                if c is not missing value then
-                    click c
-                    return "connect_clicked"
-                end if
-
-                return "no_action_button_found"
-            end tell
-        end tell
-        """
-        return run_osascript(script, timeout=20, label="Proton VPN action")
-
-    def _click_disconnect(self) -> str:
-        script = _BOUNDED_HELPERS + """
-        tell application "System Events"
-            set procName to ""
-            repeat with candidate in {"Proton VPN", "ProtonVPN"}
+            repeat with candidate in {__PROCS__}
                 if exists process (candidate as text) then
                     set procName to candidate as text
                     exit repeat
@@ -694,10 +918,16 @@ class VPNController:
                 return "no_disconnect_button"
             end tell
         end tell
-        """
-        return run_osascript(script, timeout=10, label="Proton VPN disconnect")
+        """.replace("__PROCS__", process_list)
+        return run_osascript(script, timeout=10, label=f"{app_name} disconnect")
 
-    def _poll_verify(self, target_cc: str, require_proton: bool, verify_timeout: int) -> str:
+    def _poll_verify(
+        self,
+        target_cc: str,
+        provider_token: str,
+        require_provider_in_org: bool,
+        verify_timeout: int,
+    ) -> str:
         deadline = time.monotonic() + verify_timeout
         attempts = 0
         last_info: dict[str, Any] | None = None
@@ -710,7 +940,9 @@ class VPNController:
             last_info = info
             if not info:
                 continue
-            if not self._is_connected_to(info, target_cc, require_proton):
+            if not self._is_connected_to(
+                info, target_cc, require_provider_in_org, provider_token,
+            ):
                 continue
             ip = info.get("ip")
             if ip in used_ips:
@@ -728,7 +960,7 @@ class VPNController:
         raise AutomationError(
             f"VPN verification failed after {verify_timeout}s. "
             f"ip={seen.get('ip')} country={seen.get('country')} "
-            f"wanted={target_cc} require_proton={require_proton}"
+            f"wanted={target_cc} provider_token={provider_token}"
         )
 
 
@@ -1214,23 +1446,8 @@ class Orchestrator:
                 self.state.update(current_cycle=cycle)
                 self.logger.log(f"Starting cycle {cycle}", step="05", cycle=cycle)
 
-                if self.config.vpn:
-                    server_list = self.config.vpn_servers
-                    if server_list:
-                        target = server_list[(cycle - 1) % len(server_list)]
-                        self.logger.log(
-                            f"VPN rotation: cycle {cycle} → server {target} "
-                            f"(server {((cycle - 1) % len(server_list)) + 1} of {len(server_list)})",
-                            step="06", cycle=cycle, target_server=target,
-                            server_count=len(server_list),
-                        )
-                    self.vpn.connect(
-                        cycle=cycle,
-                        target_cc=self.config.vpn_country_code,
-                        require_proton=self.config.vpn_require_proton,
-                        verify_timeout=self.config.vpn_verify_timeout,
-                        server_list=server_list,
-                    )
+                if self.config.vpn.enabled:
+                    self.vpn.connect_with_config(cycle=cycle, vpn_cfg=self.config.vpn)
                 else:
                     self.logger.log("VPN disabled", step="06", status="vpn_disabled")
 

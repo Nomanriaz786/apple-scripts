@@ -106,8 +106,10 @@ The whole config:
 | Key | Meaning |
 | --- | --- |
 | `repeat` | Number of full cycles to run. Each cycle re-opens every tab and downloads the listed videos. |
-| `vpn` | `true` to require Proton VPN to be connected to the US before each cycle. `false` to skip. |
-| `vpn_servers` | Optional. List of exact Proton server names (e.g. `"US-AZ#81"`). When present, cycle N connects to server `[(N-1) % len]`. When omitted, Quick Connect is used with IP-based de-duplication. |
+| `vpn` | `false` to skip VPN. Or a `{enabled, app, location}` object — see below. Or just `true` (defaults to Proton VPN + United States). |
+| `vpn.app` | VPN app name as it appears in Applications (e.g. `"Proton VPN"`). Used to open and script the app. |
+| `vpn.location` | Country to filter on inside the VPN app's country list (e.g. `"United States"`, `"United Kingdom"`, `"Germany"`). The script searches for this string, expands it, and discovers the visible server list. |
+| `vpn.servers` | Optional explicit list of server names to override auto-discovery (e.g. `["US-AZ#81"]`). |
 | `tabs[].tab` | Chrome tab number (1 = leftmost). |
 | `tabs[].videos` | Episode row numbers to download, counted from top after `See All`. |
 | `cleanup` | `true` to remove the downloaded items from the Library at the end of each cycle. |
@@ -118,33 +120,39 @@ Examples:
 { "repeat": 1, "vpn": false, "tabs": [{ "tab": 1, "videos": [1, 2, 3] }], "cleanup": false }
 ```
 
-```json
-{
-  "repeat": 2,
-  "vpn": true,
-  "tabs": [
-    { "tab": 1, "videos": [1, 4] },
-    { "tab": 3, "videos": [8] }
-  ],
-  "cleanup": true
-}
-```
-
-Deterministic per-server VPN rotation:
+VPN-on with auto-discovery (recommended):
 
 ```json
 {
   "repeat": 5,
-  "vpn": true,
-  "vpn_servers": ["US-AZ#81", "US-AZ#82", "US-AZ#83", "US-AZ#84", "US-AZ#85"],
+  "vpn": {
+    "enabled": true,
+    "app": "Proton VPN",
+    "location": "United States"
+  },
   "tabs": [
-    { "tab": 1, "videos": [1] }
+    { "tab": 1, "videos": [1, 4] }
   ],
   "cleanup": true
 }
 ```
 
-How to populate `vpn_servers`: open Proton VPN, type `united` in the country search, click the chevron next to **United States** to expand the server list, and copy the names you want (e.g. `US-AZ#81`). Use them verbatim — the script clicks rows whose visible name contains that string. Cycles wrap around the list (`repeat: 7` with 3 servers reuses `[0, 1, 2, 0, 1, 2, 0]`).
+On the first cycle the script opens the VPN app, switches to the Countries tab, searches for the `location` string, expands the matching country, and discovers the visible server list (`US-AZ#81`, `US-AZ#82`, …). It caches that list in `state/runtime_state.json` under `discovered_servers_by_location`, then rotates through it: cycle N → server index `(N-1) % len(servers)`. The IP is verified each cycle against `ipinfo.io` (country + provider org match).
+
+Override discovery with an explicit list if you want pinned servers:
+
+```json
+{
+  "vpn": {
+    "enabled": true,
+    "app": "Proton VPN",
+    "location": "United States",
+    "servers": ["US-AZ#81", "US-AZ#82"]
+  }
+}
+```
+
+To re-discover after Proton adds/removes servers, delete `state/runtime_state.json`.
 
 ---
 
