@@ -1192,15 +1192,19 @@ class Orchestrator:
                                       current_tab=tab_task.tab)
             raise AutomationError(f"Tab {tab_task.tab} is not an Apple Podcasts URL: {url}")
 
-        if "?i=" in url:
+        # Normalize episode URLs (?i=...) to the show URL so Podcasts opens
+        # the full episode list (which has a 'See All') instead of a single
+        # episode page (which doesn't).
+        podcast_url = url.split("?i=")[0] if "?i=" in url else url
+        if podcast_url != url:
             self.logger.log(
-                "URL looks like an individual episode (?i= present). "
-                "Continuing; will fail clearly if list does not appear.",
-                step="08", status="individual_episode_warning",
+                f"Episode URL detected; opening show page instead: {podcast_url}",
+                step="08", status="url_normalized",
+                original_url=url, opened_url=podcast_url,
             )
 
-        self.logger.log(f"Opening URL in Podcasts app: {url}", step="09")
-        self.podcasts.open_url(url)
+        self.logger.log(f"Opening URL in Podcasts app: {podcast_url}", step="09")
+        self.podcasts.open_url(podcast_url)
         self.podcasts.activate()
         self.podcasts.wait_for_window()
         self.logger.log("Podcasts page loaded", step="10")
