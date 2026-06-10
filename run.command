@@ -18,37 +18,56 @@ echo "Apple Podcasts automation launcher"
 echo "Project folder: $SCRIPT_DIR"
 echo
 
-# 1. Locate python3 (prefer Homebrew if installed; fall back to anything on PATH).
+# 1. Locate a Python >= 3.10. Probe versioned binaries first because
+#    python.org and Homebrew installs leave `python3` pointing at the
+#    Apple Command Line Tools (3.9) on Monterey.
 PYTHON_BIN=""
-for candidate in /opt/homebrew/bin/python3 /usr/local/bin/python3 python3; do
+PYVER=""
+CANDIDATES="
+  /opt/homebrew/bin/python3.12
+  /opt/homebrew/bin/python3.11
+  /opt/homebrew/bin/python3.10
+  /opt/homebrew/bin/python3
+  /usr/local/bin/python3.12
+  /usr/local/bin/python3.11
+  /usr/local/bin/python3.10
+  /usr/local/bin/python3
+  /Library/Frameworks/Python.framework/Versions/3.12/bin/python3
+  /Library/Frameworks/Python.framework/Versions/3.11/bin/python3
+  /Library/Frameworks/Python.framework/Versions/3.10/bin/python3
+  python3.12
+  python3.11
+  python3.10
+  python3
+"
+
+for candidate in $CANDIDATES; do
   if command -v "$candidate" >/dev/null 2>&1; then
-    PYTHON_BIN="$candidate"
-    break
+    ver_ok=$("$candidate" -c "import sys; print(1 if sys.version_info >= (3,10) else 0)" 2>/dev/null)
+    if [ "$ver_ok" = "1" ]; then
+      PYTHON_BIN="$candidate"
+      PYVER=$("$candidate" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}')")
+      break
+    fi
   fi
 done
 
 if [ -z "$PYTHON_BIN" ]; then
-  echo "ERROR: python3 was not found."
-  echo "Install Python 3.10 or newer. Easiest path:"
-  echo "  /bin/bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\""
-  echo "  brew install python@3.11"
+  echo "ERROR: no Python 3.10+ found on this Mac."
   echo
-  read -r -p "Press Enter to close..."
-  exit 1
-fi
-
-# 2. Verify Python version >= 3.10 (PyXA requirement).
-PYVER=$("$PYTHON_BIN" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
-PYVER_OK=$("$PYTHON_BIN" -c "import sys; print(1 if sys.version_info >= (3,10) else 0)")
-if [ "$PYVER_OK" != "1" ]; then
-  echo "ERROR: Found Python $PYVER at $PYTHON_BIN."
-  echo "PyXA requires Python 3.10 or newer."
+  echo "Searched these paths:"
+  for candidate in $CANDIDATES; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+      v=$("$candidate" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null)
+      echo "  - $candidate (Python $v - too old)"
+    fi
+  done
   echo
-  echo "Install a newer Python (Homebrew is easiest):"
-  echo "  /bin/bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\""
-  echo "  brew install python@3.11"
+  echo "Install Python 3.11 (any of these works):"
+  echo "  - GUI installer:  https://www.python.org/downloads/macos/"
+  echo "  - Homebrew:       brew install python@3.11"
   echo
-  echo "After installing, open a fresh Terminal and double-click this file again."
+  echo "After installing, double-click this file again."
   echo
   read -r -p "Press Enter to close..."
   exit 1
