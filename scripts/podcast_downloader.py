@@ -601,9 +601,19 @@ class VPNController:
             return missing value
         end findElemByText
 
+        on stripAfterSpace(s)
+            try
+                set spIdx to offset of " " in s
+                if spIdx > 1 then
+                    return text 1 thru (spIdx - 1) of s
+                end if
+            end try
+            return s
+        end stripAfterSpace
+
         on collectServerNames(rootElem, prefix, maxDepth)
             tell application "System Events"
-                set found to {}
+                set foundList to {}
                 set stack to {{rootElem, 0}}
                 repeat while (count of stack) > 0
                     set lastPair to item -1 of stack
@@ -622,23 +632,16 @@ class VPNController:
                     try
                         set vv to (value of elem) as text
                     end try
-                    set candidate to ""
+                    set hit to ""
                     if (nn starts with prefix) and (nn contains "#") then
-                        set candidate to nn
+                        set hit to nn
                     else if (vv starts with prefix) and (vv contains "#") then
-                        set candidate to vv
+                        set hit to vv
                     end if
-                    if candidate is not "" then
-                        -- strip trailing city/whitespace after the server token (e.g. "US-AZ#81  Phoenix")
-                        set trimmed to candidate
-                        try
-                            set AppleScript's text item delimiters to " "
-                            set parts to text items of trimmed
-                            set trimmed to item 1 of parts
-                            set AppleScript's text item delimiters to ""
-                        end try
-                        if (count of found) is 0 or not (found contains trimmed) then
-                            set end of found to trimmed
+                    if hit is not "" then
+                        set trimmed to my stripAfterSpace(hit)
+                        if (count of foundList) is 0 or not (foundList contains trimmed) then
+                            set end of foundList to trimmed
                         end if
                     end if
                     if d < maxDepth then
@@ -649,15 +652,15 @@ class VPNController:
                         end try
                     end if
                 end repeat
-                return found
+                return foundList
             end tell
         end collectServerNames
 
         tell application "System Events"
             set procName to ""
-            repeat with candidate in {__PROCS__}
-                if exists process (candidate as text) then
-                    set procName to candidate as text
+            repeat with procCandidate in {__PROCS__}
+                if exists process (procCandidate as text) then
+                    set procName to procCandidate as text
                     exit repeat
                 end if
             end repeat
@@ -689,13 +692,18 @@ class VPNController:
                 end try
                 delay 0.2
                 keystroke "__LOCATION__"
-                delay 1.2
+                delay 1.0
+                -- Some search boxes only filter once Return is pressed; harmless otherwise.
+                try
+                    key code 36
+                end try
+                delay 0.6
 
                 -- Find the matching country row and expand it.
                 set locRow to my findElemByText(window 1, "__LOCATION__", 10)
                 if locRow is missing value then return "ERROR:location_not_found"
 
-                set expanded to false
+                set didExpand to false
                 try
                     repeat with b in buttons of locRow
                         set dd to ""
@@ -706,17 +714,39 @@ class VPNController:
                         try
                             set bn to name of b
                         end try
-                        if (dd contains "more") or (dd contains "Show") or (dd contains "Expand") or (dd contains "disclos") or (bn contains "disclos") then
-                            click b
-                            delay 1.0
-                            set expanded to true
-                            exit repeat
+                        if (dd contains "more") or (dd contains "Show") or (dd contains "Expand") or (dd contains "disclos") or (bn contains "disclos") or (bn is "") then
+                            try
+                                click b
+                                delay 1.0
+                                set didExpand to true
+                                exit repeat
+                            end try
                         end if
                     end repeat
                 end try
 
-                if not expanded then
-                    -- Some lists expand on row click.
+                if not didExpand then
+                    -- Try clicking any disclosure-style child of the row.
+                    try
+                        repeat with child in UI elements of locRow
+                            try
+                                set cdesc to ""
+                                try
+                                    set cdesc to description of child
+                                end try
+                                if cdesc contains "disclos" then
+                                    click child
+                                    delay 1.0
+                                    set didExpand to true
+                                    exit repeat
+                                end if
+                            end try
+                        end repeat
+                    end try
+                end if
+
+                if not didExpand then
+                    -- Last resort: click the row itself (some lists expand on row click).
                     try
                         click locRow
                         delay 1.0
@@ -724,33 +754,54 @@ class VPNController:
                 end if
 
                 -- Walk the whole window for entries whose name matches "<prefix>...#"
-                set servers to my collectServerNames(window 1, "__PREFIX__", 14)
-                if (count of servers) is 0 then return "ERROR:no_servers_visible"
+                set serverList to my collectServerNames(window 1, "__PREFIX__", 14)
+                if (count of serverList) is 0 then return "ERROR:no_matching_servers"
 
-                set result to ""
-                repeat with s in servers
-                    if result is "" then
-                        set result to (s as text)
+                set joined to ""
+                repeat with s in serverList
+                    if joined is "" then
+                        set joined to (s as text)
                     else
-                        set result to result & "|" & (s as text)
+                        set joined to joined & "|" & (s as text)
                     end if
                 end repeat
-                return result
+                return joined
             end tell
         end tell
         """.replace("__LOCATION__", loc_esc).replace("__PREFIX__", prefix).replace("__PROCS__", process_list)
         try:
-            out = run_osascript(script, timeout=30, label=f"discover {location} servers")
+            out = run_osascript(script, timeout=45, label=f"discover {location} servers")
         except AutomationError as exc:
             self.logger.log(
-                f"Server discovery failed: {exc}",
+                f"Server discovery raised: {exc}",
                 step="06", status="discovery_failed", error=str(exc),
+            )
+            self.logger.log(
+                "Workaround: set vpn.servers in input/tasks.json to skip auto-discovery, "
+                "e.g. \"servers\": [\"US-AZ#81\", \"US-AZ#82\"]",
+                step="06", status="discovery_fallback_hint",
             )
             return []
         if out.startswith("ERROR:"):
+            # Map machine codes to human-readable hints.
+            hints = {
+                "ERROR:vpn_process_not_found": "VPN app is not running. Open it once manually and sign in.",
+                "ERROR:no_window": "VPN app process exists but has no visible window.",
+                "ERROR:no_search_field": "Could not locate the search text field in the country list.",
+                "ERROR:location_not_found": f"No row whose name/value contains '{location}'. Try a shorter prefix like 'United'.",
+                "ERROR:no_matching_servers": (
+                    f"Search and expand worked, but no element name started with '{location_code}-' and contained '#'. "
+                    "Either the country didn't expand, the server-name pattern differs from US-XX#NN, or scrolling is required."
+                ),
+            }
             self.logger.log(
-                f"Server discovery: {out}",
-                step="06", status=out,
+                f"Server discovery returned {out} — {hints.get(out, 'no specific hint')}",
+                step="06", status=out, hint=hints.get(out, ""),
+            )
+            self.logger.log(
+                "To unblock: set vpn.servers explicitly in input/tasks.json "
+                "(e.g. \"servers\": [\"US-AZ#81\", \"US-AZ#82\"]) — discovery will be skipped.",
+                step="06", status="discovery_fallback_hint",
             )
             return []
         return [s.strip() for s in out.split("|") if s.strip()]
