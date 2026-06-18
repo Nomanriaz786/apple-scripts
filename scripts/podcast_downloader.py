@@ -2327,6 +2327,91 @@ class PodcastsController:
         self.logger.log(f"Clicked Downloaded sidebar at ({cx},{cy})", step="14")
         return "navigated"
 
+    def _dump_ax_tree(self, label: str, max_depth: int = 6, max_elements: int = 500) -> str:
+        """Dump the Podcasts AX tree to a text file in logs/.
+
+        Called automatically whenever an AX selector returns no result.
+        Format per line: role | title | description | value_snippet | frame | children_count
+        Returns the dump file path (or '' on failure).
+        """
+        script = f"""
+        tell application "System Events"
+            tell process "Podcasts"
+                if not (exists window 1) then return "ERROR:no_window"
+                set output to ""
+                set q to {{{{window 1, 0}}}}
+                set elemCount to 0
+                repeat {max_elements + 10} times
+                    if (count of q) = 0 then exit repeat
+                    set item_ to item 1 of q
+                    if (count of q) > 1 then
+                        set q to items 2 thru -1 of q
+                    else
+                        set q to {{}}
+                    end if
+                    set elem to item 1 of item_
+                    set depth to item 2 of item_
+                    if depth > {max_depth} then
+                    else if elemCount < {max_elements} then
+                        set elemCount to elemCount + 1
+                        set eRole to "" & depth & " "
+                        set eTitle to ""
+                        set eDesc to ""
+                        set eVal to ""
+                        set eFrame to ""
+                        set eCnt to 0
+                        try
+                            set eRole to eRole & (role of elem as string)
+                        end try
+                        try
+                            set eTitle to title of elem as string
+                        end try
+                        try
+                            set eDesc to description of elem as string
+                        end try
+                        try
+                            set v to value of elem as string
+                            if (length of v) > 80 then set v to (text 1 thru 80 of v) & "…"
+                            set eVal to v
+                        end try
+                        try
+                            set ePos to position of elem
+                            set eSz to size of elem
+                            set eFrame to (item 1 of ePos as integer) & "," & (item 2 of ePos as integer) & "," & (item 1 of eSz as integer) & "," & (item 2 of eSz as integer)
+                        end try
+                        try
+                            set eCnt to count of UI elements of elem
+                        end try
+                        set output to output & eRole & "|" & eTitle & "|" & eDesc & "|" & eVal & "|" & eFrame & "|" & eCnt & linefeed
+                        try
+                            repeat with ch in UI elements of elem
+                                set end of q to {{ch, depth + 1}}
+                            end repeat
+                        end try
+                    end if
+                end repeat
+                return output
+            end tell
+        end tell
+        """
+        dump_dir = self.logger.log_path.parent
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        safe_label = label.replace("/", "_").replace(" ", "_")[:60]
+        dump_path = dump_dir / f"ax-dump-{safe_label}-{stamp}.txt"
+        try:
+            raw = run_osascript(script, timeout=30, label=f"ax_dump_{safe_label}")
+            header = (
+                f"# AX dump: {label}\n"
+                f"# Generated: {datetime.now().astimezone().isoformat()}\n"
+                f"# Format: depth+role | title | description | value | frame(x,y,w,h) | children\n\n"
+            )
+            dump_path.write_text(header + raw, encoding="utf-8")
+            self.logger.log(f"AX dump saved: {dump_path}", step="AX", label=label)
+            return str(dump_path)
+        except Exception as exc:
+            self.logger.log(f"AX dump failed ({label}): {exc}", step="AX")
+            return ""
+
     def _find_downloaded_card_frame(self) -> tuple[int, int, int, int] | None:
         """BFS for the first show card in the Downloaded tab content area.
 
@@ -3488,6 +3573,8 @@ def main(argv: list[str]) -> int:
                         help="Connect and verify the configured VPN only; do not use Chrome or Podcasts")
     parser.add_argument("--diagnose-live", action="store_true",
                         help="Inspect apps, Chrome tabs, VPN/network, and Podcasts UI without downloads")
+    parser.add_argument("--diagnose-ax", action="store_true",
+                        help="Dump Podcasts AX tree (Downloaded tab state) to logs/ without running automation")
     args = parser.parse_args(argv)
 
     config = load_config(args.input)
@@ -3532,6 +3619,24 @@ def main(argv: list[str]) -> int:
             logger.log(f"VPN connect test failed: {exc}", step="ERROR", error=str(exc))
             logger.save_report(state=state.data)
             return 1
+
+    if args.diagnose_ax:
+        logger = RunLogger(args.output_dir)
+        state = StateManager(args.state)
+        podcasts = PodcastsController(logger, state)
+        logger.log("AX diagnostic: activating Podcasts and navigating to Downloaded", step="01")
+        try:
+            podcasts.activate()
+            podcasts.wait_for_window(timeout_sec=10)
+            podcasts.navigate_to_downloaded_tab()
+            time.sleep(1.5)
+        except Exception as exc:
+            logger.log(f"AX diagnostic setup warning: {exc}", step="01")
+        dump_path = podcasts._dump_ax_tree("diagnose_ax_downloaded", max_depth=8, max_elements=1000)
+        logger.log(f"AX diagnostic complete: {dump_path}", step="01")
+        logger.save_report(state=state.data)
+        print(f"\nAX dump saved to: {dump_path}")
+        return 0
 
     if args.diagnose_live:
         orch = Orchestrator(config, log_dir=args.output_dir, state_path=args.state)
