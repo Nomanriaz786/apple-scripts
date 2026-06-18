@@ -489,6 +489,39 @@ class NetworkState:
                     interfaces.append(current)
         return interfaces
 
+    def default_route_gateway(self) -> str:
+        """Return the current default-route gateway IP, or '' on failure."""
+        try:
+            out = subprocess.run(
+                ["route", "get", "default"],
+                capture_output=True, text=True, timeout=5,
+            ).stdout
+            for line in out.splitlines():
+                stripped = line.strip()
+                if stripped.startswith("gateway:"):
+                    return stripped.split(":", 1)[1].strip()
+        except (subprocess.SubprocessError, OSError):
+            pass
+        return ""
+
+    def scutil_primary_interface(self) -> str:
+        """Return the primary network interface name from scutil --nwi, or ''."""
+        try:
+            out = subprocess.run(
+                ["scutil", "--nwi"],
+                capture_output=True, text=True, timeout=5,
+            ).stdout
+            for line in out.splitlines():
+                stripped = line.strip()
+                # Lines like: "   utun3 flags : ..."
+                if stripped and not stripped.startswith("Network") and not stripped.startswith("DNS"):
+                    iface = stripped.split()[0]
+                    if iface:
+                        return iface
+        except (subprocess.SubprocessError, OSError):
+            pass
+        return ""
+
 
 # -----------------------------------------------------------------------------
 # VPN Controller
@@ -557,15 +590,16 @@ class VPNController:
         if not self._open_provider_app(vpn_cfg.app):
             raise AutomationError(f"{vpn_cfg.app} app not found.")
 
-        # Baseline network state. This is intentionally network-level; UI text
-        # like "You are not connected" must never be treated as proof of VPN.
+        # Baseline network state — capture route before any disconnect/connect.
+        baseline_route = self.net.default_route_gateway()
         baseline = self.net.snapshot()
         baseline_ip = baseline.get("public_ip")
         self.state.data["vpn_baseline"] = baseline
+        self.state.data["vpn_baseline_route"] = baseline_route
         self.state.save()
         self.logger.log(
-            f"Baseline network: ip={baseline_ip} country={baseline.get('country')} "
-            f"org={baseline.get('org')} tunnels={baseline.get('tunnel_interfaces')}",
+            f"Baseline network: ip={baseline_ip} route={baseline_route} "
+            f"country={baseline.get('country')} tunnels={baseline.get('tunnel_interfaces')}",
             step="06", baseline=baseline,
         )
 
@@ -604,6 +638,7 @@ class VPNController:
                           for off in range(len(servers))]
         last_exc: AutomationError | None = None
         slot_baseline_ip = baseline_ip  # refreshed per attempt
+        slot_baseline_route = baseline_route  # refreshed per attempt
 
         for attempt_i, target_server in enumerate(servers_to_try):
             if attempt_i > 0:
@@ -611,18 +646,15 @@ class VPNController:
                     f"Slot {servers_to_try[attempt_i - 1]} failed; retrying with {target_server}",
                     step="06", server=target_server,
                 )
-                # Disconnect / cancel the failed connection before next attempt.
-                # Wait longer when disconnect was needed — ProtonVPN's kill-switch
-                # may keep DNS blocked for several seconds after cancellation.
                 disc2 = self._click_disconnect(vpn_cfg.app)
                 self.logger.log(f"Retry pre-disconnect: {disc2}", step="06", status=disc2)
                 wait_s = 5.0 if disc2 == "disconnect_clicked" else 2.0
                 time.sleep(wait_s)
-                # Re-capture baseline in case the failed attempt changed the IP.
                 snap2 = self.net.snapshot()
                 slot_baseline_ip = snap2.get("public_ip")
+                slot_baseline_route = self.net.default_route_gateway()
                 self.logger.log(
-                    f"Retry baseline: ip={slot_baseline_ip}", step="06",
+                    f"Retry baseline: ip={slot_baseline_ip} route={slot_baseline_route}", step="06",
                 )
 
             self.logger.log(
@@ -633,7 +665,7 @@ class VPNController:
 
             ui_status = self._click_server_by_name(
                 vpn_cfg.app, target_server, vpn_cfg.location,
-                force_retype=(attempt_i > 0),  # always retype on retry to clear stale filter
+                force_retype=(attempt_i > 0),
             )
             self.logger.log(
                 f"{vpn_cfg.app} server '{target_server}': {ui_status}",
@@ -658,6 +690,7 @@ class VPNController:
                     provider_token=provider_token,
                     require_provider_in_org=vpn_cfg.require_provider_in_org,
                     verify_timeout=vpn_cfg.verify_timeout,
+                    baseline_route=slot_baseline_route,
                 )
                 if result == "connected_verified":
                     self._record_server(target_server)
@@ -1254,93 +1287,122 @@ class VPNController:
         provider_token: str,
         require_provider_in_org: bool,
         verify_timeout: int,
+        baseline_route: str = "",
     ) -> str:
+        """Local-first VPN verification.
+
+        Levels (evaluated each poll):
+          L1 — utun interface active (ifconfig)
+          L2 — default route changed from baseline (route get default) — default success
+          L3 — public IP changed (optional, degrades gracefully on 429)
+          L4 — country + optional org match (optional, degrades gracefully on 429)
+
+        L2 is the minimum condition for "connected".
+        L3/L4 are attempted but never cause a failure if APIs are rate-limited.
+        """
         deadline = time.monotonic() + verify_timeout
         attempts = 0
-        last_snapshot: dict[str, Any] | None = None
-        tunnel_active_since: float = 0.0  # monotonic time when tunnel was first seen active
+        last_tunnels: list[str] = []
+        last_ip: str | None = None
+        country_check: str = "pending"  # pending | verified | rate_limited | wrong
 
         while time.monotonic() < deadline:
             attempts += 1
             time.sleep(1)
-            snapshot = self.net.snapshot()
-            last_snapshot = snapshot
-            ip = snapshot.get("public_ip")
-            has_tunnel = snapshot.get("has_tunnel_interface")
-            info = {
-                "ip": ip,
-                "country": snapshot.get("country"),
-                "org": snapshot.get("org"),
-            }
-            self.state.data["last_vpn_check"] = snapshot
-            self.state.save()
 
-            if not ip:
-                # IP check unavailable — both APIs rate-limited.
-                # If provider verification is not required, accept tunnel presence
-                # alone after 15 s of sustained tunnel activity.
-                if has_tunnel:
-                    if tunnel_active_since == 0.0:
-                        tunnel_active_since = time.monotonic()
-                        self.logger.log(
-                            "VPN tunnel active, IP lookup unavailable (rate-limited) — timing 15s",
-                            step="06", status="vpn_tunnel_waiting", attempt=attempts,
-                        )
-                    elif not require_provider_in_org:
-                        elapsed = time.monotonic() - tunnel_active_since
-                        if elapsed >= 15.0:
-                            self.logger.log(
-                                f"VPN accepted: tunnel active {elapsed:.0f}s, "
-                                f"IP lookup rate-limited — skipping IP verification",
-                                step="06", status="connected_tunnel_only",
-                                tunnels=snapshot.get("tunnel_interfaces"), attempts=attempts,
-                            )
-                            self._record_ip(None)
-                            return "connected_tunnel_only"
-                else:
-                    tunnel_active_since = 0.0
-                continue
+            # ── Level 1: tunnel interface ──────────────────────────────────────
+            tunnels = self.net.active_tunnel_interfaces()
+            has_tunnel = bool(tunnels)
 
-            tunnel_active_since = 0.0  # reset once we have an IP
             if not has_tunnel:
                 self.logger.log(
-                    f"VPN verification pending: no active utun interface "
-                    f"(ip={ip} country={snapshot.get('country')})",
+                    f"VPN L1 pending: no active utun (attempt {attempts})",
                     step="06", status="vpn_pending_no_tunnel", attempt=attempts,
                 )
+                last_tunnels = []
                 continue
-            if baseline_ip and ip == baseline_ip:
+
+            # ── Level 2: route changed ─────────────────────────────────────────
+            current_route = self.net.default_route_gateway()
+            route_changed = bool(current_route) and (current_route != baseline_route)
+
+            if not route_changed:
                 self.logger.log(
-                    f"VPN verification pending: public IP has not changed from baseline ({ip})",
-                    step="06", status="vpn_pending_ip_unchanged", attempt=attempts,
+                    f"VPN L2 pending: route unchanged (gw={current_route} baseline={baseline_route}) "
+                    f"tunnels={tunnels} attempt={attempts}",
+                    step="06", status="vpn_pending_route_unchanged", attempt=attempts,
                 )
+                last_tunnels = tunnels
                 continue
-            if not self._is_connected_to(
-                info, target_cc, require_provider_in_org, provider_token,
-            ):
+
+            # L1 + L2 satisfied — VPN is connected at minimum level
+            verify_level = "tunnel+route"
+
+            # ── Level 3: public IP changed (optional) ─────────────────────────
+            ip_info = self.net.public_ip_info()
+            ip = (ip_info or {}).get("ip")
+            if ip:
+                last_ip = ip
+                if baseline_ip and ip == baseline_ip:
+                    # IP hasn't changed yet — wait a bit more (up to half the budget)
+                    if attempts < verify_timeout // 2:
+                        self.logger.log(
+                            f"VPN L3 pending: IP unchanged from baseline ({ip}) attempt={attempts}",
+                            step="06", status="vpn_pending_ip_unchanged", attempt=attempts,
+                        )
+                        continue
+                    # Beyond halfway — accept L2 result
+                    self.logger.log(
+                        f"VPN L3 skipped: IP unchanged after {attempts}s — accepting L2 result",
+                        step="06", status="vpn_l3_skipped_ip_stale",
+                    )
+                else:
+                    verify_level = "tunnel+route+ip"
+
+                # ── Level 4: country (optional) ───────────────────────────────
+                info = {"ip": ip, "country": (ip_info or {}).get("country"), "org": (ip_info or {}).get("org")}
+                if self._is_connected_to(info, target_cc, require_provider_in_org, provider_token):
+                    verify_level = "tunnel+route+ip+country"
+                    country_check = "verified"
+                else:
+                    country_check = "wrong"
+                    if require_provider_in_org:
+                        self.logger.log(
+                            f"VPN L4 wrong: ip={ip} country={info.get('country')} org={info.get('org')} "
+                            f"wanted={target_cc} attempt={attempts}",
+                            step="06", status="vpn_pending_wrong_country", attempt=attempts,
+                        )
+                        continue
+                    # require_provider_in_org=False: country mismatch is tolerated at L2
+                    self.logger.log(
+                        f"VPN L4 country mismatch (tolerated): ip={ip} country={info.get('country')} "
+                        f"wanted={target_cc} — accepting L2 result",
+                        step="06", status="vpn_l4_country_mismatch_tolerated",
+                    )
+            else:
+                # Both APIs rate-limited — accept L2 result
+                country_check = "rate_limited"
                 self.logger.log(
-                    f"VPN verification pending: ip={ip} country={snapshot.get('country')} "
-                    f"org={snapshot.get('org')} tunnels={snapshot.get('tunnel_interfaces')}",
-                    step="06", status="vpn_pending_wrong_network", attempt=attempts,
+                    f"VPN L3/L4 skipped: both IP APIs rate-limited — accepted at {verify_level}",
+                    step="06", status="vpn_api_rate_limited_accept_l2",
                 )
-                continue
-            self._record_ip(ip)
+
+            # ── Accept ────────────────────────────────────────────────────────
+            self._record_ip(last_ip)
+            self.state.data["vpn_verify_level"] = verify_level
+            self.state.save()
             self.logger.log(
-                f"VPN connected verified: ip={ip} country={info.get('country')} org={info.get('org')} "
-                f"tunnels={snapshot.get('tunnel_interfaces')} (after {attempts}s)",
+                f"VPN connected: level={verify_level} tunnels={tunnels} route={current_route} "
+                f"ip={last_ip} country_check={country_check} after {attempts}s",
                 step="06", status="connected_verified",
-                ip=ip, country=info.get("country"), attempts=attempts,
-                tunnels=snapshot.get("tunnel_interfaces"),
+                verify_level=verify_level, tunnels=tunnels, ip=last_ip, attempts=attempts,
             )
             return "connected_verified"
 
-        seen = last_snapshot or {}
         raise AutomationError(
             f"VPN verification failed after {verify_timeout}s. "
-            f"ip={seen.get('public_ip')} baseline_ip={baseline_ip} "
-            f"country={seen.get('country')} org={seen.get('org')} "
-            f"tunnels={seen.get('tunnel_interfaces')} wanted={target_cc} "
-            f"provider_token={provider_token}"
+            f"tunnels={last_tunnels} baseline_route={baseline_route} ip={last_ip} "
+            f"wanted={target_cc}"
         )
 
     def diagnose_current_state(self, vpn_cfg: VPNConfig) -> dict[str, Any]:
