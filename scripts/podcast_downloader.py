@@ -2185,8 +2185,11 @@ class PodcastsController:
     def _find_downloaded_card_frame(self) -> tuple[int, int, int, int] | None:
         """BFS for the first show card in the Downloaded tab content area.
 
-        Returns (x, y, w, h) from the card's AXFrame, or a window-relative
-        fallback if AX cannot find a card-like element.
+        Returns (x, y, w, h) from the actual AXFrame of the card element.
+        No hardcoded window offsets — the position comes from the AX tree so it
+        works regardless of window size or position.
+        Accepts any element that is in the content area (right of sidebar),
+        roughly square (0.5 < W/H < 2), and between 80–450 px per side.
         """
         script = """
         tell application "System Events"
@@ -2197,11 +2200,12 @@ class PodcastsController:
                 set wX to (item 1 of wPos) as integer
                 set wY to (item 2 of wPos) as integer
                 set wW to (item 1 of wSz) as integer
-                -- Content area begins past the sidebar (~200px from window left)
-                set contentLeft to wX + 200
+                set wH to (item 2 of wSz) as integer
+                -- Content area begins past the sidebar (~180px from window left)
+                set contentLeft to wX + 180
                 set q to {window 1}
-                set deadline to (current date) + 12
-                repeat 600 times
+                set deadline to (current date) + 14
+                repeat 800 times
                     if (count of q) = 0 then exit repeat
                     if (current date) > deadline then exit repeat
                     set elem to item 1 of q
@@ -2211,6 +2215,7 @@ class PodcastsController:
                         set q to {}
                     end if
                     set eX to 0
+                    set eY to 0
                     set eW to 0
                     set eH to 0
                     try
@@ -2221,20 +2226,12 @@ class PodcastsController:
                         set eW to (item 1 of eSz) as integer
                         set eH to (item 2 of eSz) as integer
                     end try
-                    -- Card: in content area, large but not full-window
-                    if eX > contentLeft and eW > 100 and eH > 100 and eW < 350 and eH < 350 then
-                        set cl to class of elem as string
-                        if cl is "group" or cl is "UI element" then
-                            set hasContent to false
-                            try
-                                if (count of images of elem) > 0 then set hasContent to true
-                            end try
-                            try
-                                if (count of static texts of elem) > 0 then set hasContent to true
-                            end try
-                            if hasContent then
-                                return "CARD:" & eX & "," & eY & "," & eW & "," & eH & "|WIN:" & wX & "," & wY & "," & wW
-                            end if
+                    -- Card criteria: in content area, right size, roughly square aspect ratio.
+                    -- No class filter — Mac Catalyst exposes cards under various roles.
+                    if eX > contentLeft and eW >= 80 and eH >= 80 and eW <= 450 and eH <= 450 then
+                        -- Aspect ratio roughly square: W/H between 0.5 and 2
+                        if eW * 2 > eH and eW < eH * 2 then
+                            return "CARD:" & eX & "," & eY & "," & eW & "," & eH & "|WIN:" & wX & "," & wY & "," & wW & "," & wH
                         end if
                     end if
                     try
@@ -2243,16 +2240,16 @@ class PodcastsController:
                         end repeat
                     end try
                 end repeat
-                return "NOCARD|WIN:" & wX & "," & wY & "," & wW
+                return "NOCARD|WIN:" & wX & "," & wY & "," & wW & "," & wH
             end tell
         end tell
         """
-        out = run_osascript(script, timeout=20, label="find downloaded card frame")
+        out = run_osascript(script, timeout=22, label="find downloaded card frame")
         if out.startswith("ERROR:"):
             self.logger.log(f"_find_downloaded_card_frame: {out}", step="14")
             return None
 
-        win_x = win_y = win_w = 0
+        win_x = win_y = win_w = win_h = 0
         card_x = card_y = card_w = card_h = 0
         found_card = False
 
@@ -2269,11 +2266,16 @@ class PodcastsController:
                         pass
             elif chunk.startswith("WIN:"):
                 nums = chunk[4:].split(",")
-                if len(nums) >= 2:
+                if len(nums) >= 4:
+                    try:
+                        win_x, win_y, win_w, win_h = (
+                            int(nums[0]), int(nums[1]), int(nums[2]), int(nums[3])
+                        )
+                    except ValueError:
+                        pass
+                elif len(nums) >= 2:
                     try:
                         win_x, win_y = int(nums[0]), int(nums[1])
-                        if len(nums) >= 3:
-                            win_w = int(nums[2])
                     except ValueError:
                         pass
 
@@ -2284,14 +2286,10 @@ class PodcastsController:
             )
             return card_x, card_y, card_w, card_h
 
-        # Fallback: compute from window position using empirical layout offsets
-        if win_x > 0 or win_y > 0:
-            self.logger.log(
-                f"Card not found via AX; using window-relative fallback win=({win_x},{win_y})",
-                step="14",
-            )
-            return win_x + 230, win_y + 95, 192, 192
-
+        self.logger.log(
+            f"Card not found via AX (win={win_x},{win_y},{win_w},{win_h}) — no fallback",
+            step="14",
+        )
         return None
 
     def wait_for_download_complete(self, timeout: int = 180) -> str:
@@ -2355,6 +2353,16 @@ class PodcastsController:
             import Quartz  # type: ignore[import]
         except ImportError:
             return "quartz_unavailable"
+
+        # Bring Podcasts to front before Quartz events so they land on the right window.
+        try:
+            run_osascript(
+                'tell application "Podcasts" to activate',
+                timeout=5, label="activate Podcasts before three-dots click",
+            )
+            time.sleep(0.4)
+        except AutomationError:
+            pass
 
         def _mouse(kind, x, y):
             pt = Quartz.CGPointMake(x, y)
