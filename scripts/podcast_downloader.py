@@ -2825,11 +2825,13 @@ class PodcastsController:
         self.open_url(show_url)
         self.activate()
         self.wait_for_window()
-        time.sleep(8)
+        # 15s: ProtonVPN kill-switch leaves no default route; Podcasts needs extra
+        # time to load episode metadata through the VPN tunnel on cycle 2+.
+        time.sleep(15)
 
         see_all_status = self.click_see_all()
-        if see_all_status == "error":
-            return "see_all_failed"
+        if see_all_status in ("error", "see_all_not_found"):
+            return f"see_all_failed:{see_all_status}"
         self.scroll_to_top()
         time.sleep(1.0)
 
