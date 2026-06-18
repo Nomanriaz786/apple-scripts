@@ -2673,6 +2673,262 @@ class PodcastsController:
             count = 0
         return {"status": status, "count": count, "sample": sample}
 
+    # ── Show-name-targeted cleanup (primary) ─────────────────────────────────
+
+    def cleanup_by_show_names(self, show_names: list[str]) -> list[dict[str, Any]]:
+        """Remove each show by name from the Downloaded tab."""
+        results: list[dict[str, Any]] = []
+        for show_name in show_names:
+            result = self._cleanup_show(show_name)
+            results.append({"show_name": show_name, "result": result})
+            self.logger.log(f"Cleanup show {show_name!r}: {result}", step="14")
+            time.sleep(0.6)
+        return results
+
+    def _cleanup_show(self, show_name: str) -> str:
+        """Remove one show by title from the Downloaded tab.
+
+        Steps:
+          1. Navigate to Downloaded tab.
+          2. AX BFS: find element whose text contains show_name → climb to card parent.
+          3. Find ⋯ button inside card (AX description/title contains 'more').
+          4. Activate Podcasts → Quartz click ⋯.
+          5. AX menu item 'Remove' first; keyboard Down×3+Enter as logged fallback.
+          6. AX confirmation sheet → click Remove button.
+        """
+        nav = self.navigate_to_downloaded_tab()
+        if nav not in ("navigated",):
+            if nav == "quartz_unavailable":
+                return "quartz_unavailable"
+            return f"nav_failed:{nav}"
+        time.sleep(0.5)
+
+        # ── Find card by show name ────────────────────────────────────────────
+        frame = self._find_downloaded_card_by_show_name(show_name)
+        if frame is None:
+            self._dump_ax_tree(f"cleanup_card_not_found_{show_name[:30]}")
+            return "card_not_found"
+
+        card_x, card_y, card_w, card_h = frame
+
+        # ── Quartz click ⋯ at card bottom-right ──────────────────────────────
+        try:
+            import Quartz  # type: ignore[import]
+        except ImportError:
+            return "quartz_unavailable"
+
+        def _mouse(kind, x, y):
+            pt = Quartz.CGPointMake(x, y)
+            ev = Quartz.CGEventCreateMouseEvent(None, kind, pt, Quartz.kCGMouseButtonLeft)
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+            time.sleep(0.05)
+
+        def _key(vk, down):
+            ev = Quartz.CGEventCreateKeyboardEvent(None, vk, down)
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+            time.sleep(0.05)
+
+        # Activate Podcasts before any Quartz events
+        try:
+            run_osascript(
+                'tell application "Podcasts" to activate',
+                timeout=5, label="activate Podcasts before ⋯ click",
+            )
+            time.sleep(0.4)
+        except AutomationError:
+            pass
+
+        card_cx = card_x + card_w // 2
+        card_cy = card_y + card_h // 2
+        three_dots_x = card_x + card_w - 30
+        three_dots_y = card_y + card_h - 25
+
+        self.logger.log(
+            f"Card hover ({card_cx},{card_cy}) → ⋯ ({three_dots_x},{three_dots_y})",
+            step="14",
+        )
+        _mouse(Quartz.kCGEventMouseMoved, card_cx, card_cy)
+        time.sleep(0.8)
+        _mouse(Quartz.kCGEventMouseMoved, three_dots_x, three_dots_y)
+        time.sleep(0.4)
+        _mouse(Quartz.kCGEventLeftMouseDown, three_dots_x, three_dots_y)
+        time.sleep(0.1)
+        _mouse(Quartz.kCGEventLeftMouseUp, three_dots_x, three_dots_y)
+        time.sleep(1.5)
+
+        # ── AX menu item 'Remove' first ───────────────────────────────────────
+        remove_by_ax = self._click_remove_menu_item_ax()
+        self.logger.log(f"AX Remove menu result: {remove_by_ax}", step="14")
+
+        if not remove_by_ax:
+            # Keyboard fallback — menu order: Follow/Unfollow / Report / Remove…
+            self.logger.log(
+                "AX menu not found — keyboard Down×3+Enter fallback",
+                step="14", status="fallback_keyboard_remove_used",
+            )
+            self.state.data["cleanup_fallback_keyboard_used"] = True
+            self.state.save()
+            for _ in range(3):
+                _key(0x7D, True); _key(0x7D, False)
+                time.sleep(0.3)
+            _key(0x24, True); _key(0x24, False)
+            time.sleep(1.5)
+
+        # ── Confirmation sheet ────────────────────────────────────────────────
+        remove = self._click_confirmation_remove()
+        time.sleep(1.0)
+        self.logger.log(f"Confirmation sheet: {remove}", step="14")
+
+        if "clicked" in remove:
+            return "removed"
+        elif remove == "no_sheet":
+            return "no_confirm_dialog"
+        return f"remove_failed:{remove}"
+
+    def _find_downloaded_card_by_show_name(
+        self, show_name: str
+    ) -> tuple[int, int, int, int] | None:
+        """Find the card container in the Downloaded view that has show_name as text.
+
+        BFS: find a static text element whose value contains show_name (case-insensitive),
+        then climb up the parent chain until we reach a container that is large enough
+        (≥ 80 px per side) and lives in the content area (right of sidebar).
+        Returns (x, y, w, h) or None.
+        """
+        safe_name = show_name.replace('"', '\\"').replace("'", "\\'")
+        script = (
+            """
+        tell application "System Events"
+            tell process "Podcasts"
+                if not (exists window 1) then return "ERROR:no_window"
+                set wPos to position of window 1
+                set contentLeft to (item 1 of wPos) + 180
+                set needle to "__SHOW_NAME__"
+                set q to {window 1}
+                set deadline to (current date) + 14
+                repeat 800 times
+                    if (count of q) = 0 then exit repeat
+                    if (current date) > deadline then exit repeat
+                    set elem to item 1 of q
+                    if (count of q) > 1 then
+                        set q to items 2 thru -1 of q
+                    else
+                        set q to {}
+                    end if
+                    set eVal to ""
+                    try
+                        set eVal to value of elem as string
+                    end try
+                    if eVal is "" then
+                        try
+                            set eVal to name of elem as string
+                        end try
+                    end if
+                    -- Case-insensitive substring match via lowercasing (AppleScript workaround)
+                    set lVal to do shell script "echo " & quoted form of eVal & " | tr '[:upper:]' '[:lower:]'"
+                    set lNeedle to do shell script "echo " & quoted form of needle & " | tr '[:upper:]' '[:lower:]'"
+                    if lVal contains lNeedle then
+                        -- Found text match — climb up to card container
+                        set candidate to elem
+                        repeat 8 times
+                            try
+                                set cPos to position of candidate
+                                set cSz to size of candidate
+                                set cX to (item 1 of cPos) as integer
+                                set cY to (item 2 of cPos) as integer
+                                set cW to (item 1 of cSz) as integer
+                                set cH to (item 2 of cSz) as integer
+                                if cX > contentLeft and cW >= 80 and cH >= 80 then
+                                    return "CARD:" & cX & "," & cY & "," & cW & "," & cH
+                                end if
+                                set candidate to parent of candidate
+                            end try
+                        end repeat
+                    end if
+                    try
+                        repeat with ch in UI elements of elem
+                            set end of q to ch
+                        end repeat
+                    end try
+                end repeat
+                return "NOCARD"
+            end tell
+        end tell
+        """.replace("__SHOW_NAME__", safe_name)
+        )
+        try:
+            out = run_osascript(script, timeout=22, label=f"find card for {show_name!r}")
+        except AutomationError as exc:
+            self.logger.log(f"_find_downloaded_card_by_show_name error: {exc}", step="14")
+            return None
+
+        if out.startswith("CARD:"):
+            parts = out[5:].split(",")
+            if len(parts) == 4:
+                try:
+                    return (int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3]))
+                except ValueError:
+                    pass
+
+        self.logger.log(
+            f"Card not found for show {show_name!r} — AX result: {out[:80]}", step="14",
+        )
+        return None
+
+    def _click_remove_menu_item_ax(self) -> bool:
+        """Try to click a 'Remove' menu item via Accessibility. Returns True on success.
+
+        Looks in:
+          1. Any floating window whose role contains 'menu' or 'AXMenu'.
+          2. menus of window 1.
+        """
+        script = """
+        tell application "System Events"
+            tell process "Podcasts"
+                -- Check all windows for a floating context menu
+                repeat with w in windows
+                    set wRole to ""
+                    try
+                        set wRole to role of w as string
+                    end try
+                    if wRole contains "AXMenu" then
+                        repeat with mi in menu items of w
+                            set mName to ""
+                            try
+                                set mName to name of mi as string
+                            end try
+                            if mName contains "Remove" or mName contains "Delete" then
+                                click mi
+                                return "ax_clicked"
+                            end if
+                        end repeat
+                    end if
+                end repeat
+                -- Also check menus attached to window 1
+                repeat with m in menus of window 1
+                    repeat with mi in menu items of m
+                        set mName to ""
+                        try
+                            set mName to name of mi as string
+                        end try
+                        if mName contains "Remove" or mName contains "Delete" then
+                            click mi
+                            return "ax_clicked"
+                        end if
+                    end repeat
+                end repeat
+                return "menu_not_found"
+            end tell
+        end tell
+        """
+        try:
+            result = run_osascript(script, timeout=5, label="AX Remove menu item")
+            return result == "ax_clicked"
+        except AutomationError:
+            return False
+
+    # ── Generic card-based cleanup (fallback when show names not captured) ───
+
     def cleanup_all_downloaded(self) -> list[dict[str, Any]]:
         results: list[dict[str, Any]] = []
         terminal_states = (
@@ -2680,6 +2936,7 @@ class PodcastsController:
             "no_window",
             "no_confirm_dialog",
             "quartz_unavailable",
+            "card_not_found",
         )
         for i in range(50):
             res = self._cleanup_one_item()
@@ -2690,107 +2947,80 @@ class PodcastsController:
         return results
 
     def _cleanup_one_item(self) -> str:
-        """Remove a downloaded show via the Downloaded tab flow.
-
-        Steps:
-          1. Navigate to the Downloaded sidebar section.
-          2. Hover the show card → click its ⋯ button.
-          3. Keyboard: Down×3 → Enter (selects 'Remove...' in context menu).
-          4. Click 'Remove From Library' in the native confirmation sheet.
-        Screenshots are taken before/after each major action for validation.
-        """
-        # Screenshot: state before cleanup
-        ss = self._take_screenshot("cleanup_before")
-        self.logger.log(f"Cleanup start, screenshot: {ss}", step="14")
-
-        # Phase 1: navigate to Downloaded tab
+        """Generic fallback: remove first card visible in Downloaded tab."""
         nav = self.navigate_to_downloaded_tab()
-        if nav not in ("navigated", "quartz_unavailable"):
-            if nav == "quartz_unavailable":
-                return "quartz_unavailable"
+        if nav == "quartz_unavailable":
+            return "quartz_unavailable"
+        if nav not in ("navigated",):
             return f"nav_failed:{nav}"
-
-        ss = self._take_screenshot("downloaded_tab")
-        self.logger.log(f"Downloaded tab navigated ({nav}), screenshot: {ss}", step="14")
         time.sleep(0.5)
 
-        # Phase 2: click ⋯ on the show card
-        three = self._click_downloaded_card_three_dots()
-        if three != "three_dots_clicked":
-            if three == "quartz_unavailable":
-                return "quartz_unavailable"
-            if three == "no_window":
-                return "no_window"
-            return f"three_dots_failed:{three}"
+        frame = self._find_downloaded_card_frame()
+        if frame is None:
+            self._dump_ax_tree("cleanup_generic_card_not_found")
+            return "not_found"
 
-        ss = self._take_screenshot("context_menu")
-        self.logger.log(f"⋯ clicked ({three}), screenshot: {ss}", step="14")
-
-        # Phase 3: select Remove… in the context menu.
-        # Try AX menu item selection first (Mac Catalyst menus are usually not in AX,
-        # so this will fall through to keyboard navigation in practice).
+        # Delegate to _cleanup_show using a placeholder name, reusing ⋯ + Remove logic
+        card_x, card_y, card_w, card_h = frame
         try:
             import Quartz  # type: ignore[import]
         except ImportError:
             return "quartz_unavailable"
+
+        def _mouse(kind, x, y):
+            pt = Quartz.CGPointMake(x, y)
+            ev = Quartz.CGEventCreateMouseEvent(None, kind, pt, Quartz.kCGMouseButtonLeft)
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+            time.sleep(0.05)
 
         def _key(vk, down):
             ev = Quartz.CGEventCreateKeyboardEvent(None, vk, down)
             Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
             time.sleep(0.05)
 
-        remove_by_ax = False
         try:
-            ax_menu_script = """
-            tell application "System Events"
-                tell process "Podcasts"
-                    repeat with m in menus of window 1
-                        repeat with mi in menu items of m
-                            set mName to ""
-                            try
-                                set mName to name of mi as string
-                            end try
-                            if mName contains "Remove" then
-                                click mi
-                                return "menu_item_clicked"
-                            end if
-                        end repeat
-                    end repeat
-                    return "menu_not_in_ax"
-                end tell
-            end tell
-            """
-            ax_result = run_osascript(ax_menu_script, timeout=5, label="find Remove menu item via AX")
-            remove_by_ax = (ax_result == "menu_item_clicked")
-            self.logger.log(f"AX menu item result: {ax_result}", step="14")
-        except Exception as exc:
-            self.logger.log(f"AX menu check error: {exc}", step="14")
+            run_osascript(
+                'tell application "Podcasts" to activate',
+                timeout=5, label="activate Podcasts before generic ⋯ click",
+            )
+            time.sleep(0.4)
+        except AutomationError:
+            pass
 
+        card_cx = card_x + card_w // 2
+        card_cy = card_y + card_h // 2
+        three_dots_x = card_x + card_w - 30
+        three_dots_y = card_y + card_h - 25
+
+        _mouse(Quartz.kCGEventMouseMoved, card_cx, card_cy)
+        time.sleep(0.8)
+        _mouse(Quartz.kCGEventMouseMoved, three_dots_x, three_dots_y)
+        time.sleep(0.4)
+        _mouse(Quartz.kCGEventLeftMouseDown, three_dots_x, three_dots_y)
+        time.sleep(0.1)
+        _mouse(Quartz.kCGEventLeftMouseUp, three_dots_x, three_dots_y)
+        time.sleep(1.5)
+
+        remove_by_ax = self._click_remove_menu_item_ax()
         if not remove_by_ax:
-            # Keyboard fallback: Down×3 reaches 'Remove…' (3rd item in Downloaded ⋯ menu)
-            # Menu order: Follow/Unfollow Show / Report a Concern / Remove…
+            self.logger.log("Generic cleanup: keyboard fallback", step="14",
+                            status="fallback_keyboard_remove_used")
+            self.state.data["cleanup_fallback_keyboard_used"] = True
+            self.state.save()
             for _ in range(3):
-                _key(0x7D, True); _key(0x7D, False)  # Down arrow
+                _key(0x7D, True); _key(0x7D, False)
                 time.sleep(0.3)
-            _key(0x24, True); _key(0x24, False)       # Enter
+            _key(0x24, True); _key(0x24, False)
             time.sleep(1.5)
 
-        ss = self._take_screenshot("confirm_popup")
-        self.logger.log(f"Remove... activated, screenshot: {ss}", step="14")
-
-        # Phase 4: click Remove From Library in the native confirmation sheet
         remove = self._click_confirmation_remove()
         time.sleep(1.0)
-
-        ss = self._take_screenshot("after_remove")
-        self.logger.log(f"Confirmation sheet result: {remove}, screenshot: {ss}", step="14")
 
         if "clicked" in remove:
             return "removed"
         elif remove == "no_sheet":
             return "no_confirm_dialog"
-        else:
-            return f"remove_failed:{remove}"
+        return f"remove_failed:{remove}"
 
     def quit_app(self) -> None:
         if HAS_PYXA:
