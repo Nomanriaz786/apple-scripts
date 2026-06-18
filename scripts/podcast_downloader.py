@@ -3425,11 +3425,20 @@ class Orchestrator:
         # Primary: Chrome tab title (most reliable — e.g. "The Daily - Apple Podcasts").
         # Secondary: Podcasts AX window title / heading.
         chrome_title = title.strip()
-        for suffix in (" - Apple Podcasts", " – Apple Podcasts", " — Apple Podcasts",
-                       " | Apple Podcasts", " - Podcasts", " – Podcasts", " — Podcasts"):
-            if chrome_title.endswith(suffix):
-                chrome_title = chrome_title[: -len(suffix)].strip()
-                break
+        _podcast_suffixes = (
+            " - Apple Podcasts", " – Apple Podcasts", " — Apple Podcasts",
+            " | Apple Podcasts",
+            " - Podcast", " – Podcast", " — Podcast",
+            " - Podcasts", " – Podcasts", " — Podcasts",
+        )
+        _changed = True
+        while _changed:
+            _changed = False
+            for _sfx in _podcast_suffixes:
+                if chrome_title.endswith(_sfx):
+                    chrome_title = chrome_title[: -len(_sfx)].strip()
+                    _changed = True
+                    break
         if chrome_title and chrome_title.lower() not in ("", "podcasts", "apple podcasts"):
             show_name = chrome_title
         else:
