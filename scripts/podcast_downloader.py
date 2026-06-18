@@ -1946,6 +1946,33 @@ class PodcastsController:
 
         out = run_osascript(script, timeout=90, label=f"find episode {video_no} position")
 
+        # If episode wasn't visible, scroll down and retry once — the episode list
+        # lazy-loads rows as the viewport scrolls; the first BFS sees only visible rows.
+        if out.startswith("ERROR:episode_not_found"):
+            import re as _re
+            seen_m = _re.search(r"seen=(\d+)", out)
+            seen_n = int(seen_m.group(1)) if seen_m else 0
+            if seen_n > 0 and seen_n < video_no:
+                self.logger.log(
+                    f"Download episode {video_no}: seen={seen_n} rows — scrolling down",
+                    step="13",
+                )
+                try:
+                    import Quartz as _Q  # type: ignore[import]
+                    row_h_est = 120
+                    scroll_px = (video_no - seen_n + 2) * row_h_est
+                    ev = _Q.CGEventCreateScrollWheelEvent(
+                        None, _Q.kCGScrollEventUnitPixel, 1, -scroll_px
+                    )
+                    content_cx = 1060  # center of content area (stable across window sizes)
+                    content_cy = 450
+                    _Q.CGEventSetLocation(ev, _Q.CGPointMake(content_cx, content_cy))
+                    _Q.CGEventPost(_Q.kCGHIDEventTap, ev)
+                    time.sleep(0.9)
+                    out = run_osascript(script, timeout=90, label=f"find episode {video_no} position (retry)")
+                except ImportError:
+                    pass
+
         if out.startswith("ERROR:"):
             self.logger.log(f"Download episode {video_no}: {out}", step="13")
             return "download_not_found"
@@ -2535,10 +2562,10 @@ class PodcastsController:
         """
         nav = self.navigate_to_downloaded_tab()
         if nav not in ("navigated",):
-            self.logger.log(f"wait_for_downloads: nav failed ({nav}) — fallback 45s", step="14")
-            time.sleep(45)
+            self.logger.log(f"wait_for_downloads: nav failed ({nav}) — fallback 120s", step="14")
+            time.sleep(120)
             self.state.data["download_state"] = "stable_unknown"
-            self.state.data["download_wait_seconds"] = 45
+            self.state.data["download_wait_seconds"] = 120
             self.state.save()
             return "stable_unknown"
 
@@ -2576,12 +2603,13 @@ class PodcastsController:
         initial_text = _has_text_in_progress() if not initial_progress else True
 
         if not initial_progress and not initial_text:
-            # Neither detector found active downloads — unknown state
+            # Neither detector found active downloads — unknown state.
+            # Use 120s fallback: podcast episodes commonly take 1-3 min to download.
             self.logger.log(
-                "Download state: no active indicators detected — waiting 45s (stable_unknown)",
+                "Download state: no active indicators detected — waiting 120s (stable_unknown)",
                 step="14", download_state="stable_unknown",
             )
-            time.sleep(45)
+            time.sleep(120)
             waited = int(time.time() - t_start)
             self.state.data["download_state"] = "stable_unknown"
             self.state.data["download_wait_seconds"] = waited
@@ -2890,8 +2918,8 @@ class PodcastsController:
                 set contentLeft to (item 1 of wPos) + 180
                 set needle to "__SHOW_NAME__"
                 set q to {window 1}
-                set deadline to (current date) + 14
-                repeat 800 times
+                set deadline to (current date) + 25
+                repeat 3000 times
                     if (count of q) = 0 then exit repeat
                     if (current date) > deadline then exit repeat
                     set elem to item 1 of q
@@ -2909,13 +2937,15 @@ class PodcastsController:
                             set eVal to name of elem as string
                         end try
                     end if
-                    -- Case-insensitive substring match via lowercasing (AppleScript workaround)
-                    set lVal to do shell script "echo " & quoted form of eVal & " | tr '[:upper:]' '[:lower:]'"
-                    set lNeedle to do shell script "echo " & quoted form of needle & " | tr '[:upper:]' '[:lower:]'"
-                    if lVal contains lNeedle then
+                    -- ignoring case avoids spawning a shell process per element
+                    set matched to false
+                    ignoring case
+                        if eVal contains needle then set matched to true
+                    end ignoring
+                    if matched then
                         -- Found text match — climb up to card container
                         set candidate to elem
-                        repeat 8 times
+                        repeat 12 times
                             try
                                 set cPos to position of candidate
                                 set cSz to size of candidate
@@ -2936,7 +2966,7 @@ class PodcastsController:
                         end repeat
                     end try
                 end repeat
-                return "NOCARD"
+                return "NOCARD|WIN:" & (item 1 of wPos) & "," & (item 2 of wPos) & "," & (item 1 of (size of window 1)) & "," & (item 2 of (size of window 1))
             end tell
         end tell
         """.replace("__SHOW_NAME__", safe_name)
