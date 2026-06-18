@@ -1540,6 +1540,77 @@ class PodcastsController:
         """.replace("__TIMEOUT__", str(timeout_sec))
         run_osascript(script, timeout=timeout_sec + 5, label="wait for Podcasts window")
 
+    def capture_show_name(self) -> str:
+        """Read the podcast show name from the current Podcasts window.
+
+        Tries window title first, then the first prominent heading in the AX tree.
+        Returns a non-empty string or 'unknown_show'.
+        """
+        script = """
+        tell application "System Events"
+            tell process "Podcasts"
+                if not (exists window 1) then return "unknown_show"
+                -- Window title often contains the show name (e.g. "My Podcast – Podcasts")
+                set wTitle to ""
+                try
+                    set wTitle to name of window 1 as string
+                end try
+                if wTitle is not "" and wTitle is not "Podcasts" then
+                    return wTitle
+                end if
+                -- Fall back: first static text with value length > 4 in content area
+                set wPos to position of window 1
+                set contentLeft to (item 1 of wPos) + 180
+                set q to {window 1}
+                set deadline to (current date) + 5
+                repeat 400 times
+                    if (count of q) = 0 then exit repeat
+                    if (current date) > deadline then exit repeat
+                    set elem to item 1 of q
+                    if (count of q) > 1 then
+                        set q to items 2 thru -1 of q
+                    else
+                        set q to {}
+                    end if
+                    set eRole to ""
+                    try
+                        set eRole to role of elem as string
+                    end try
+                    if eRole is "AXStaticText" then
+                        set eVal to ""
+                        try
+                            set eVal to value of elem as string
+                        end try
+                        if length of eVal > 4 then
+                            try
+                                set ePos to position of elem
+                                if (item 1 of ePos) > contentLeft then
+                                    return eVal
+                                end if
+                            end try
+                        end if
+                    end if
+                    try
+                        repeat with ch in UI elements of elem
+                            set end of q to ch
+                        end repeat
+                    end try
+                end repeat
+                return "unknown_show"
+            end tell
+        end tell
+        """
+        try:
+            raw = run_osascript(script, timeout=12, label="capture show name")
+            # Strip " – Podcasts" suffix that appears in the window title
+            name = raw.strip()
+            for suffix in (" – Podcasts", " - Podcasts", " — Podcasts"):
+                if name.endswith(suffix):
+                    name = name[: -len(suffix)].strip()
+            return name if name and name != "unknown_show" else "unknown_show"
+        except AutomationError:
+            return "unknown_show"
+
     def click_see_all(self, time_budget_sec: int = DEFAULT_SEE_ALL_BUDGET_SEC) -> str:
         """Return 'clicked', 'list_already_expanded', or 'see_all_not_found'.
 
@@ -2958,11 +3029,25 @@ class Orchestrator:
         self.podcasts.open_url(podcast_url)
         self.podcasts.activate()
         self.podcasts.wait_for_window()
-        # Extra wait for the episode list to fully render before the See All BFS.
-        # Over VPN the show page can take 15-20 s; without this the BFS starts on
-        # a partially-rendered tree and wastes the entire budget without finding it.
         time.sleep(10)
         self.logger.log("Podcasts page loaded", step="10")
+
+        # Capture show name for state-driven cleanup
+        show_name = self.podcasts.capture_show_name()
+        self.logger.log(f"Show name captured: {show_name!r}", step="10", show_name=show_name)
+
+        # Record this tab in processed_shows so cleanup can find it by name
+        shows = self.state.data.setdefault("processed_shows", {})
+        cycle_shows: list[dict[str, Any]] = shows.setdefault(str(cycle), [])
+        show_entry: dict[str, Any] = {
+            "tab": tab_task.tab,
+            "url": podcast_url,
+            "show_name": show_name,
+            "videos_requested": list(tab_task.videos),
+            "videos_downloaded": [],
+        }
+        cycle_shows.append(show_entry)
+        self.state.save()
 
         see_all_result = self.podcasts.click_see_all()
         self.logger.log(f"See All {see_all_result}", step="11", status=see_all_result)
@@ -2993,13 +3078,14 @@ class Orchestrator:
             self.state.update(current_video=video_no)
             self.logger.log(f"Target video {video_no} searching", step="13", video=video_no)
             status = self.podcasts.download_episode_row(video_no)
-            ss = self.podcasts._take_screenshot(f"post_download_v{video_no}")
-            self.logger.log(f"Target video {video_no} {status}, screenshot: {ss}", step="13",
+            self.logger.log(f"Target video {video_no} {status}", step="13",
                             video=video_no, status=status)
             self.state.mark_phase(cycle, f"video_{tab_task.tab}_{video_no}_download_clicked")
+            show_entry["videos_downloaded"].append(video_no)
+            self.state.save()
             self.state.add_task_result(
                 cycle=cycle, tab=tab_task.tab, video=video_no,
-                status=status, url=url, title=title,
+                status=status, url=url, title=title, show_name=show_name,
             )
 
         self.state.mark_phase(cycle, f"tab_{tab_task.tab}_completed")
