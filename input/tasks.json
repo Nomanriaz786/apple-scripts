@@ -3,10 +3,12 @@
   "vpn": {
     "enabled": true,
     "app": "ProtonVPN",
-    "location": "United States"
+    "location": "United States",
+    "require_provider_in_org": false
   },
   "tabs": [
     { "tab": 1, "videos": [1] }
   ],
-  "cleanup": true
+  "cleanup": true,
+  "clean_start": false
 }
