@@ -82,6 +82,7 @@ class Config:
     tabs: list[TabTask]
     check_downloads: bool = False
     clean_start: bool = False
+    cleanup_mode: str = "remove_download"  # "remove_download" | "remove_from_library"
 
 
 def _parse_vpn(raw_vpn: Any) -> VPNConfig:
@@ -147,6 +148,12 @@ def load_config(path: Path) -> Config:
 
     clean_start = bool(raw.get("clean_start", False))
 
+    cleanup_mode_raw = str(raw.get("cleanup_mode", "remove_download")).strip()
+    if cleanup_mode_raw not in ("remove_download", "remove_from_library"):
+        raise ValueError(
+            f"cleanup_mode must be 'remove_download' or 'remove_from_library', got {cleanup_mode_raw!r}"
+        )
+
     return Config(
         repeat=repeat,
         vpn=vpn,
@@ -154,6 +161,7 @@ def load_config(path: Path) -> Config:
         tabs=tabs,
         check_downloads=check_downloads,
         clean_start=clean_start,
+        cleanup_mode=cleanup_mode_raw,
     )
 
 
@@ -3590,8 +3598,8 @@ class Orchestrator:
         try:
             self.logger.log(
                 f"Loaded minimal input: repeat={self.config.repeat} vpn={self.config.vpn} "
-                f"cleanup={self.config.cleanup} clean_start={self.config.clean_start} "
-                f"tabs={len(self.config.tabs)}",
+                f"cleanup={self.config.cleanup} cleanup_mode={self.config.cleanup_mode} "
+                f"clean_start={self.config.clean_start} tabs={len(self.config.tabs)}",
                 step="02",
             )
             self.logger.log(f"Loaded runtime state: {self.state.path}", step="03",
@@ -3999,7 +4007,10 @@ class Orchestrator:
         self.podcasts.activate()
         self.podcasts.wait_for_window()
 
-        self.logger.log("Cleanup phase start", step="14", cycle=cycle)
+        mode = self.config.cleanup_mode
+        self.logger.log(
+            f"Cleanup phase start (mode={mode})", step="14", cycle=cycle, cleanup_mode=mode,
+        )
 
         # Wait for all downloads to complete before removing anything.
         dl_status = self.podcasts.wait_for_downloads_stable(timeout=180)
@@ -4012,31 +4023,57 @@ class Orchestrator:
         self.state.mark_phase(cycle, "downloads_stable")
 
         # Collect full show info from this cycle's processed_shows for targeted cleanup.
-        # Primary path: navigate to each show's episode list and remove downloaded episodes
-        # via the episode row ⋯ menu (AX-accessible, unlike Downloaded tab cards).
         cycle_shows: list[dict[str, Any]] = self.state.data.get("processed_shows", {}).get(str(cycle), [])
         valid_shows = [
             s for s in cycle_shows
             if s.get("show_name") and s["show_name"] != "unknown_show" and s.get("url")
         ]
 
-        if valid_shows:
-            show_names = [s["show_name"] for s in valid_shows]
-            self.logger.log(f"Cleanup: targeting shows by name: {show_names}", step="14", cycle=cycle)
-            results = self.podcasts.cleanup_by_show_info(valid_shows)
-        else:
-            # No show info captured — fall back to generic card-based cleanup
+        if mode == "remove_from_library":
+            # Hard-clean mode: navigate to Downloaded tab, find the show card, and
+            # use "Remove from Library".  Removes the local file AND the library entry.
+            # WARNING: the show card disappears from the library, so the next cycle
+            # cannot rely on the show being visible without re-following it.
             self.logger.log(
-                "Cleanup: no show info in state — using generic card cleanup", step="14", cycle=cycle,
+                "Cleanup mode=remove_from_library: using Downloaded-tab card approach",
+                step="14", cycle=cycle,
             )
-            results = self.podcasts.cleanup_all_downloaded()
+            if valid_shows:
+                show_names = [s["show_name"] for s in valid_shows]
+                self.logger.log(f"Cleanup: targeting shows: {show_names}", step="14", cycle=cycle)
+                results = self.podcasts.cleanup_by_show_names(show_names)
+            else:
+                self.logger.log(
+                    "Cleanup: no show info in state — using generic card cleanup", step="14", cycle=cycle,
+                )
+                results = self.podcasts.cleanup_all_downloaded()
+        else:
+            # Default mode (remove_download): navigate to each show's episode list
+            # and click Remove Download via the row ⋯ menu.  Removes only the local
+            # cached file; the show stays in the library so the next cycle can
+            # download the same episode again cleanly.
+            self.logger.log(
+                "Cleanup mode=remove_download: using episode-list row ⋯ approach",
+                step="14", cycle=cycle,
+            )
+            if valid_shows:
+                show_names = [s["show_name"] for s in valid_shows]
+                self.logger.log(f"Cleanup: targeting shows: {show_names}", step="14", cycle=cycle)
+                results = self.podcasts.cleanup_by_show_info(valid_shows)
+            else:
+                self.logger.log(
+                    "Cleanup: no show info in state — using generic card cleanup", step="14", cycle=cycle,
+                )
+                results = self.podcasts.cleanup_all_downloaded()
 
         for r in results:
             self.state.add_cleanup_result(cycle=cycle, **r)
 
         self.state.mark_phase(cycle, "cleanup_completed")
-        self.logger.log(f"Cleanup finished: {len(results)} actions", step="14",
-                        action_count=len(results))
+        self.logger.log(
+            f"Cleanup finished: {len(results)} actions (mode={mode})", step="14",
+            action_count=len(results), cleanup_mode=mode,
+        )
 
 
 # -----------------------------------------------------------------------------

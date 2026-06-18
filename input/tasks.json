@@ -7,8 +7,10 @@
     "require_provider_in_org": false
   },
   "tabs": [
-    { "tab": 1, "videos": [1] }
+    { "tab": 1, "videos": [1, 2, 3] },
+    { "tab": 2, "videos": [1, 2] }
   ],
   "cleanup": true,
+  "cleanup_mode": "remove_download",
   "clean_start": false
 }
