@@ -1324,7 +1324,13 @@ class VPNController:
 
             # ── Level 2: route changed ─────────────────────────────────────────
             current_route = self.net.default_route_gateway()
-            route_changed = bool(current_route) and (current_route != baseline_route)
+            # Accept three conditions: route changed to new value, OR route is gone
+            # (ProtonVPN kill-switch drops the default route while tunnel is active).
+            # Baseline may also be empty on cycle 2+ if previous VPN left no default route.
+            route_changed = (
+                (bool(current_route) and current_route != baseline_route)
+                or (has_tunnel and not current_route)
+            )
 
             if not route_changed:
                 self.logger.log(
