@@ -2786,10 +2786,261 @@ class PodcastsController:
             count = 0
         return {"status": status, "count": count, "sample": sample}
 
-    # ── Show-name-targeted cleanup (primary) ─────────────────────────────────
+    # ── Show-info-targeted cleanup (primary — uses episode list, not Downloaded tab) ──
+
+    def cleanup_by_show_info(self, show_entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Remove downloaded episodes by navigating to each show's episode list.
+
+        Uses the episode row ⋯ menu which IS AX-accessible, unlike the
+        Downloaded tab's show cards (Mac Catalyst does not expose card text via AX).
+        """
+        results: list[dict[str, Any]] = []
+        for entry in show_entries:
+            show_name = entry.get("show_name", "unknown")
+            show_url = entry.get("url", "")
+            videos_downloaded: list[int] = entry.get("videos_downloaded") or entry.get("videos_requested") or []
+            result = self._cleanup_show_via_episode_list(show_url, show_name, videos_downloaded)
+            results.append({"show_name": show_name, "result": result})
+            self.logger.log(f"Cleanup show {show_name!r}: {result}", step="14")
+            time.sleep(0.6)
+        return results
+
+    def _cleanup_show_via_episode_list(
+        self, show_url: str, show_name: str, video_nos: list[int]
+    ) -> str:
+        """Navigate to the show's episode list and remove each downloaded episode.
+
+        For each video_no: hover row center → click ⋯ → 'Remove Download' via AX
+        or keyboard fallback (Down×4+Enter).  No confirmation dialog for Remove Download.
+        """
+        if not show_url or not video_nos:
+            return "no_info"
+
+        self.open_url(show_url)
+        self.activate()
+        self.wait_for_window()
+        time.sleep(8)
+
+        see_all_status = self.click_see_all()
+        if see_all_status == "error":
+            return "see_all_failed"
+        self.scroll_to_top()
+        time.sleep(1.0)
+
+        try:
+            import Quartz  # type: ignore[import]
+        except ImportError:
+            return "quartz_unavailable"
+
+        def _mouse(kind: int, x: int, y: int) -> None:
+            pt = Quartz.CGPointMake(x, y)
+            ev = Quartz.CGEventCreateMouseEvent(None, kind, pt, Quartz.kCGMouseButtonLeft)
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+            time.sleep(0.05)
+
+        removed: list[int] = []
+        for video_no in sorted(set(video_nos)):
+            out = run_osascript(
+                self._episode_position_script(video_no),
+                timeout=90,
+                label=f"find episode {video_no} for removal",
+            )
+
+            # Scroll retry if needed (same logic as download)
+            if out.startswith("ERROR:episode_not_found"):
+                import re as _re
+                seen_m = _re.search(r"seen=(\d+)", out)
+                seen_n = int(seen_m.group(1)) if seen_m else 0
+                if seen_n > 0:
+                    row_h_est = 120
+                    scroll_px = (video_no - seen_n + 2) * row_h_est
+                    ev = Quartz.CGEventCreateScrollWheelEvent(
+                        None, Quartz.kCGScrollEventUnitPixel, 1, -scroll_px
+                    )
+                    Quartz.CGEventSetLocation(ev, Quartz.CGPointMake(1060, 450))
+                    Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+                    time.sleep(0.9)
+                    out = run_osascript(
+                        self._episode_position_script(video_no),
+                        timeout=90,
+                        label=f"find episode {video_no} for removal (retry)",
+                    )
+
+            if out.startswith("ERROR:"):
+                self.logger.log(f"Cleanup episode {video_no}: row not found ({out})", step="14")
+                continue
+
+            row_x = row_y = row_w = row_h = more_x = more_y = 0
+            for chunk in out.split("|"):
+                if chunk.startswith("ROW:"):
+                    parts = chunk[4:].split(",")
+                    if len(parts) == 4:
+                        try:
+                            row_x, row_y, row_w, row_h = int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])
+                        except ValueError:
+                            pass
+                elif chunk.startswith("MORE:"):
+                    parts = chunk[5:].split(",")
+                    if len(parts) == 2:
+                        try:
+                            more_x, more_y = int(parts[0]), int(parts[1])
+                        except ValueError:
+                            pass
+
+            if row_w == 0 or more_x == 0:
+                self.logger.log(f"Cleanup episode {video_no}: bad position in '{out}'", step="14")
+                continue
+
+            row_cx = row_x + row_w // 2
+            row_cy = row_y + row_h // 2
+
+            # Hover row center to reveal the ⋯ button, then click ⋯
+            _mouse(Quartz.kCGEventMouseMoved, row_cx, row_cy)
+            time.sleep(0.4)
+            _mouse(Quartz.kCGEventLeftMouseDown, more_x, more_y)
+            time.sleep(0.1)
+            _mouse(Quartz.kCGEventLeftMouseUp, more_x, more_y)
+            time.sleep(0.7)
+
+            self.logger.log(
+                f"Cleanup episode {video_no}: clicked ⋯ at ({more_x},{more_y})", step="14"
+            )
+
+            # Try AX menu first; keyboard fallback otherwise
+            ax_ok = self._click_remove_menu_item_ax()
+            if not ax_ok:
+                # Down×4 = 'Remove Download' in the episode row context menu
+                import subprocess as _sp
+                _sp.run(
+                    ["osascript", "-e",
+                     'tell application "System Events" to key code 125\n'
+                     'tell application "System Events" to key code 125\n'
+                     'tell application "System Events" to key code 125\n'
+                     'tell application "System Events" to key code 125\n'
+                     'tell application "System Events" to key code 36'],
+                    timeout=5, check=False,
+                )
+                self.logger.log(f"Cleanup episode {video_no}: keyboard Down×4+Enter used", step="14")
+                self.state.data["cleanup_fallback_keyboard_used"] = True
+
+            removed.append(video_no)
+            time.sleep(1.2)
+
+        if not removed:
+            return "no_episodes_removed"
+        return f"removed_episodes:{','.join(str(v) for v in removed)}"
+
+    def _episode_position_script(self, video_no: int) -> str:
+        """Return the AppleScript that locates the Nth episode row position."""
+        return f"""
+        tell application "System Events"
+            set frontmost of process "Podcasts" to true
+        end tell
+        delay 0.3
+        tell application "System Events"
+            tell process "Podcasts"
+                if not (exists window 1) then return "ERROR:no_window"
+                set targetN to {video_no}
+                set seenCount to 0
+                set targetEp to missing value
+                set queue to {{window 1}}
+                set deadline to (current date) + 75
+                repeat 3000 times
+                    if (count of queue) = 0 then exit repeat
+                    if (current date) > deadline then return "ERROR:deadline_exceeded"
+                    set elem to item 1 of queue
+                    if (count of queue) > 1 then
+                        set queue to items 2 thru -1 of queue
+                    else
+                        set queue to {{}}
+                    end if
+                    set isBtn to false
+                    try
+                        if class of elem is button then set isBtn to true
+                    end try
+                    if isBtn then
+                        set dd to ""
+                        try
+                            set dd to description of elem as string
+                        end try
+                        set looksLikeEpisode to false
+                        if dd contains ", " and length of dd > 20 then
+                            set upDD to dd
+                            if upDD starts with "TODAY" or upDD starts with "YESTERDAY" or upDD starts with "MON" or upDD starts with "TUE" or upDD starts with "WED" or upDD starts with "THU" or upDD starts with "FRI" or upDD starts with "SAT" or upDD starts with "SUN" or upDD starts with "JAN" or upDD starts with "FEB" or upDD starts with "MAR" or upDD starts with "APR" or upDD starts with "MAY" or upDD starts with "JUN" or upDD starts with "JUL" or upDD starts with "AUG" or upDD starts with "SEP" or upDD starts with "OCT" or upDD starts with "NOV" or upDD starts with "DEC" then
+                                set looksLikeEpisode to true
+                            end if
+                            if not looksLikeEpisode then
+                                try
+                                    set sz to size of elem
+                                    if (item 2 of sz) > 50 then set looksLikeEpisode to true
+                                end try
+                            end if
+                        end if
+                        if looksLikeEpisode then
+                            set seenCount to seenCount + 1
+                            if seenCount = targetN then
+                                set targetEp to elem
+                                exit repeat
+                            end if
+                        end if
+                    end if
+                    try
+                        repeat with ch in UI elements of elem
+                            set end of queue to ch
+                        end repeat
+                    end try
+                end repeat
+                if targetEp is missing value then
+                    return "ERROR:episode_not_found|seen=" & seenCount
+                end if
+                set ePos to position of targetEp
+                set eSz to size of targetEp
+                set eX to (item 1 of ePos) as integer
+                set eY to (item 2 of ePos) as integer
+                set eW to (item 1 of eSz) as integer
+                set eH to (item 2 of eSz) as integer
+                set moreX to 0
+                set moreY to 0
+                try
+                    repeat with k in UI elements of targetEp
+                        set kd to ""
+                        try
+                            set kd to description of k as string
+                        end try
+                        if kd is "more" then
+                            set mp to position of k
+                            set ms to size of k
+                            set moreX to ((item 1 of mp) + (item 1 of ms) / 2) as integer
+                            set moreY to ((item 2 of mp) + (item 2 of ms) / 2) as integer
+                            exit repeat
+                        end if
+                        try
+                            repeat with gk in UI elements of k
+                                set gkd to ""
+                                try
+                                    set gkd to description of gk as string
+                                end try
+                                if gkd is "more" then
+                                    set mp to position of gk
+                                    set ms to size of gk
+                                    set moreX to ((item 1 of mp) + (item 1 of ms) / 2) as integer
+                                    set moreY to ((item 2 of mp) + (item 2 of ms) / 2) as integer
+                                    exit repeat
+                                end if
+                            end repeat
+                        end try
+                        if moreX > 0 then exit repeat
+                    end repeat
+                end try
+                return "ROW:" & eX & "," & eY & "," & eW & "," & eH & "|MORE:" & moreX & "," & moreY
+            end tell
+        end tell
+        """
+
+    # ── Show-name-targeted cleanup (Downloaded-tab card approach — fallback) ──────
 
     def cleanup_by_show_names(self, show_names: list[str]) -> list[dict[str, Any]]:
-        """Remove each show by name from the Downloaded tab."""
+        """Remove each show by name from the Downloaded tab (fallback when no URL available)."""
         results: list[dict[str, Any]] = []
         for show_name in show_names:
             result = self._cleanup_show(show_name)
@@ -2966,13 +3217,13 @@ class PodcastsController:
                         end repeat
                     end try
                 end repeat
-                return "NOCARD|WIN:" & (item 1 of wPos) & "," & (item 2 of wPos) & "," & (item 1 of (size of window 1)) & "," & (item 2 of (size of window 1))
+                return "NOCARD"
             end tell
         end tell
         """.replace("__SHOW_NAME__", safe_name)
         )
         try:
-            out = run_osascript(script, timeout=22, label=f"find card for {show_name!r}")
+            out = run_osascript(script, timeout=35, label=f"find card for {show_name!r}")
         except AutomationError as exc:
             self.logger.log(f"_find_downloaded_card_by_show_name error: {exc}", step="14")
             return None
@@ -3582,17 +3833,23 @@ class Orchestrator:
         )
         self.state.mark_phase(cycle, "downloads_stable")
 
-        # Collect show names from this cycle's processed_shows for targeted cleanup
+        # Collect full show info from this cycle's processed_shows for targeted cleanup.
+        # Primary path: navigate to each show's episode list and remove downloaded episodes
+        # via the episode row ⋯ menu (AX-accessible, unlike Downloaded tab cards).
         cycle_shows: list[dict[str, Any]] = self.state.data.get("processed_shows", {}).get(str(cycle), [])
-        show_names = [s["show_name"] for s in cycle_shows if s.get("show_name") and s["show_name"] != "unknown_show"]
+        valid_shows = [
+            s for s in cycle_shows
+            if s.get("show_name") and s["show_name"] != "unknown_show" and s.get("url")
+        ]
 
-        if show_names:
+        if valid_shows:
+            show_names = [s["show_name"] for s in valid_shows]
             self.logger.log(f"Cleanup: targeting shows by name: {show_names}", step="14", cycle=cycle)
-            results = self.podcasts.cleanup_by_show_names(show_names)
+            results = self.podcasts.cleanup_by_show_info(valid_shows)
         else:
-            # No show names captured — fall back to generic card-based cleanup
+            # No show info captured — fall back to generic card-based cleanup
             self.logger.log(
-                "Cleanup: no show names in state — using generic card cleanup", step="14", cycle=cycle,
+                "Cleanup: no show info in state — using generic card cleanup", step="14", cycle=cycle,
             )
             results = self.podcasts.cleanup_all_downloaded()
 
