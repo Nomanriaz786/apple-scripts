@@ -2437,44 +2437,108 @@ class PodcastsController:
         )
         return None
 
-    def wait_for_download_complete(self, timeout: int = 180) -> str:
-        """Navigate to Downloaded tab and wait until no active download is detected.
+    def wait_for_downloads_stable(self, timeout: int = 180) -> str:
+        """Wait for all downloads to finish before cleanup starts.
 
-        Returns 'complete', 'complete_assumed' (fallback), 'timeout', or 'no_downloads_tab'.
+        Strategy (in order):
+          1. Check for AXProgressIndicator elements in the window (most reliable).
+          2. Check for 'Downloading' text via check_downloads_state().
+          3. If neither detector fires, wait a fixed 45s fallback and log it.
+
+        Returns one of: 'completed' | 'in_progress_polled' | 'stable_unknown' | 'timeout'.
+        State fields written: download_state, download_wait_seconds.
         """
         nav = self.navigate_to_downloaded_tab()
         if nav not in ("navigated",):
-            self.logger.log(f"wait_for_download: nav failed ({nav}) — fixed wait 45s", step="14")
+            self.logger.log(f"wait_for_downloads: nav failed ({nav}) — fallback 45s", step="14")
             time.sleep(45)
-            return "no_downloads_tab"
+            self.state.data["download_state"] = "stable_unknown"
+            self.state.data["download_wait_seconds"] = 45
+            self.state.save()
+            return "stable_unknown"
 
-        time.sleep(5)  # allow download to register in the Downloaded tab view
+        time.sleep(5)  # let download register in Downloaded tab view
 
-        state = self.check_downloads_state()
-        status = state.get("status", "")
-        self.logger.log(f"Download initial state: {state}", step="14")
+        progress_check_script = """
+        tell application "System Events"
+            tell process "Podcasts"
+                if not (exists window 1) then return "0"
+                set cnt to 0
+                try
+                    set cnt to count (every UI element of entire contents of window 1 whose role is "AXProgressIndicator")
+                end try
+                return cnt as text
+            end tell
+        end tell
+        """
 
-        if status == "downloads_in_progress":
-            deadline = time.time() + timeout
-            while time.time() < deadline:
-                time.sleep(5)
-                state = self.check_downloads_state()
-                status = state.get("status", "")
-                self.logger.log(f"Download progress check: {state}", step="14")
-                if status != "downloads_in_progress":
-                    break
-            else:
-                self.logger.log("Download wait timed out", step="14")
-                return "timeout"
-            return "complete"
+        def _has_progress_indicators() -> bool:
+            try:
+                out = run_osascript(progress_check_script, timeout=10, label="progress indicator check")
+                return int(out.strip()) > 0
+            except (AutomationError, ValueError):
+                return False
 
-        if status == "download_status_unknown":
-            # Detection unavailable (likely graphical progress only) — fixed fallback wait
-            self.logger.log("Download state unknown — waiting 45s as fallback", step="14")
+        def _has_text_in_progress() -> bool:
+            try:
+                s = self.check_downloads_state()
+                return s.get("status") == "downloads_in_progress"
+            except Exception:
+                return False
+
+        t_start = time.time()
+        initial_progress = _has_progress_indicators()
+        initial_text = _has_text_in_progress() if not initial_progress else True
+
+        if not initial_progress and not initial_text:
+            # Neither detector found active downloads — unknown state
+            self.logger.log(
+                "Download state: no active indicators detected — waiting 45s (stable_unknown)",
+                step="14", download_state="stable_unknown",
+            )
             time.sleep(45)
-            return "complete_assumed"
+            waited = int(time.time() - t_start)
+            self.state.data["download_state"] = "stable_unknown"
+            self.state.data["download_wait_seconds"] = waited
+            self.state.save()
+            return "stable_unknown"
 
-        return "complete"
+        # Active downloads detected — poll until they finish
+        self.logger.log(
+            f"Downloads active (progress_indicators={initial_progress}, text={initial_text})"
+            f" — polling up to {timeout}s",
+            step="14", download_state="in_progress",
+        )
+        deadline = time.time() + timeout
+        poll_interval = 5
+        while time.time() < deadline:
+            time.sleep(poll_interval)
+            still_going = _has_progress_indicators() or _has_text_in_progress()
+            elapsed = int(time.time() - t_start)
+            self.logger.log(
+                f"Download poll: active={still_going} elapsed={elapsed}s", step="14",
+            )
+            if not still_going:
+                self.state.data["download_state"] = "completed"
+                self.state.data["download_wait_seconds"] = elapsed
+                self.state.save()
+                self.logger.log(f"Downloads completed after {elapsed}s", step="14",
+                                download_state="completed", download_wait_seconds=elapsed)
+                return "completed"
+
+        elapsed = int(time.time() - t_start)
+        self.logger.log(
+            f"Download wait timed out after {elapsed}s — proceeding with cleanup anyway",
+            step="14", download_state="timeout", download_wait_seconds=elapsed,
+        )
+        self.state.data["download_state"] = "timeout"
+        self.state.data["download_wait_seconds"] = elapsed
+        self.state.save()
+        return "timeout"
+
+    def wait_for_download_complete(self, timeout: int = 180) -> str:
+        """Compatibility shim — delegates to wait_for_downloads_stable."""
+        return self.wait_for_downloads_stable(timeout=timeout)
 
     def _click_downloaded_card_three_dots(self) -> str:
         """Hover over the show card in the Downloaded view and click its ⋯ button.
@@ -3141,21 +3205,32 @@ class Orchestrator:
         self.podcasts.activate()
         self.podcasts.wait_for_window()
 
-        ss = self.podcasts._take_screenshot("cleanup_phase_start")
-        self.logger.log(f"Cleanup phase start, screenshot: {ss}", step="14", cycle=cycle)
+        self.logger.log("Cleanup phase start", step="14", cycle=cycle)
 
-        # Navigate to Downloaded tab and wait for any active download to finish.
-        # Cleanup is deferred to this point so all tabs/videos for this cycle are
-        # downloaded before any removal changes the show/library state.
-        dl_status = self.podcasts.wait_for_download_complete(timeout=180)
-        self.logger.log(f"Download wait status: {dl_status}", step="14", cycle=cycle)
+        # Wait for all downloads to complete before removing anything.
+        dl_status = self.podcasts.wait_for_downloads_stable(timeout=180)
+        self.logger.log(
+            f"Download wait: {dl_status} "
+            f"(state={self.state.data.get('download_state')} "
+            f"waited={self.state.data.get('download_wait_seconds')}s)",
+            step="14", cycle=cycle,
+        )
         self.state.mark_phase(cycle, "downloads_stable")
 
-        ss = self.podcasts._take_screenshot("cleanup_downloaded_tab")
-        self.logger.log(f"Downloaded tab state, screenshot: {ss}", step="14", cycle=cycle)
+        # Collect show names from this cycle's processed_shows for targeted cleanup
+        cycle_shows: list[dict[str, Any]] = self.state.data.get("processed_shows", {}).get(str(cycle), [])
+        show_names = [s["show_name"] for s in cycle_shows if s.get("show_name") and s["show_name"] != "unknown_show"]
 
-        # Remove each downloaded show via the Downloaded tab card ⋯ menu
-        results = self.podcasts.cleanup_all_downloaded()
+        if show_names:
+            self.logger.log(f"Cleanup: targeting shows by name: {show_names}", step="14", cycle=cycle)
+            results = self.podcasts.cleanup_by_show_names(show_names)
+        else:
+            # No show names captured — fall back to generic card-based cleanup
+            self.logger.log(
+                "Cleanup: no show names in state — using generic card cleanup", step="14", cycle=cycle,
+            )
+            results = self.podcasts.cleanup_all_downloaded()
+
         for r in results:
             self.state.add_cleanup_result(cycle=cycle, **r)
 
