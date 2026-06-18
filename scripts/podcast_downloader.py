@@ -694,6 +694,19 @@ class VPNController:
                 )
                 if result == "connected_verified":
                     self._record_server(target_server)
+                    # Record full verified session (slot name, not assumed real server name)
+                    snap = self.net.snapshot()
+                    sessions = self.state.data.setdefault("vpn_sessions", [])
+                    sessions.append({
+                        "cycle": cycle,
+                        "slot": target_server,
+                        "verified": True,
+                        "utun": (snap.get("tunnel_interfaces") or [None])[0],
+                        "public_ip": snap.get("public_ip"),
+                        "country": snap.get("country"),
+                        "verified_at": datetime.now().isoformat(),
+                    })
+                    self.state.save()
                 return result
             except AutomationError as exc:
                 last_exc = exc
@@ -1861,26 +1874,17 @@ class PodcastsController:
                         if class of elem is button then set isBtn to true
                     end try
                     if isBtn then
-                        set dd to ""
-                        try
-                            set dd to description of elem as string
-                        end try
-                        -- Episode rows start with a day name (TODAY, YESTERDAY, MON-SUN)
-                        -- and are tall buttons (height > 50px); playback controls are small.
+                        -- Structural filter: episode rows are tall (>60px) and wide (>400px).
+                        -- This is locale-independent and robust to date-format changes.
                         set looksLikeEpisode to false
-                        if dd contains ", " and length of dd > 20 then
-                            set upDD to dd
-                            if upDD starts with "TODAY" or upDD starts with "YESTERDAY" or upDD starts with "MON" or upDD starts with "TUE" or upDD starts with "WED" or upDD starts with "THU" or upDD starts with "FRI" or upDD starts with "SAT" or upDD starts with "SUN" or upDD starts with "JAN" or upDD starts with "FEB" or upDD starts with "MAR" or upDD starts with "APR" or upDD starts with "MAY" or upDD starts with "JUN" or upDD starts with "JUL" or upDD starts with "AUG" or upDD starts with "SEP" or upDD starts with "OCT" or upDD starts with "NOV" or upDD starts with "DEC" then
+                        try
+                            set eSz to size of elem
+                            set btnH to (item 2 of eSz) as integer
+                            set btnW to (item 1 of eSz) as integer
+                            if btnH > 60 and btnW > 400 then
                                 set looksLikeEpisode to true
                             end if
-                            if not looksLikeEpisode then
-                                -- Fall back to height check for other date formats
-                                try
-                                    set sz to size of elem
-                                    if (item 2 of sz) > 50 then set looksLikeEpisode to true
-                                end try
-                            end if
-                        end if
+                        end try
                         if looksLikeEpisode then
                             set seenCount to seenCount + 1
                             if seenCount = targetN then
@@ -2058,18 +2062,161 @@ class PodcastsController:
         _mouse(Quartz.kCGEventMouseMoved, row_cx, row_cy)
         time.sleep(0.6)
 
-        # Move cursor to the download button position before clicking
-        # (keeps the hover state active since dl_x,dl_y is still within the row)
+        # Move cursor to the download button position and wait for icons to render
         _mouse(Quartz.kCGEventMouseMoved, dl_x, dl_y)
-        time.sleep(0.15)
+        time.sleep(0.35)
+
+        # Pre-click: AX scan to detect already-downloaded state (best-effort)
+        hover_state = self._check_hover_downloaded(row_y, row_h)
+        self.logger.log(
+            f"Episode {video_no}: hover state check → {hover_state}", step="13"
+        )
+        if hover_state == "already_downloaded":
+            # Move mouse away to clear hover, then skip click
+            _mouse(Quartz.kCGEventMouseMoved, row_cx, row_cy - 150)
+            return "already_downloaded"
 
         # Click the download button
         _mouse(Quartz.kCGEventLeftMouseDown, dl_x, dl_y)
         time.sleep(0.1)
         _mouse(Quartz.kCGEventLeftMouseUp, dl_x, dl_y)
-        time.sleep(0.5)
+        time.sleep(1.0)
+
+        # Safety net: if an unexpected delete/remove dialog appeared, cancel it
+        dialog_result = self._dismiss_delete_dialog_if_unexpected()
+        if dialog_result == "dismissed":
+            self.logger.log(
+                f"Episode {video_no}: delete dialog detected and dismissed — already downloaded",
+                step="13",
+            )
+            return "already_downloaded_popup_dismissed"
 
         return "download_clicked"
+
+    def _check_hover_downloaded(self, row_y: int, row_h: int) -> str:
+        """Shallow AX scan after hover to detect already-downloaded state.
+
+        Looks for a button with description 'Remove Download' within the
+        episode row's Y bounds.  Mac Catalyst AX is limited — treat 'unknown'
+        as safe to proceed (the post-click dialog guard is the safety net).
+        Returns: 'already_downloaded' | 'ready_to_download' | 'unknown'
+        """
+        script = f"""
+        tell application "System Events"
+            tell process "Podcasts"
+                if not (exists window 1) then return "unknown"
+                set rowMinY to {row_y - 5}
+                set rowMaxY to {row_y + row_h + 5}
+                set foundRemove to false
+                try
+                    repeat with g1 in groups of window 1
+                        if foundRemove then exit repeat
+                        try
+                            repeat with g2 in (every group of g1)
+                                if foundRemove then exit repeat
+                                try
+                                    repeat with btn in (every button of g2)
+                                        set bpos to position of btn
+                                        set bY to (item 2 of bpos) as integer
+                                        if bY >= rowMinY and bY <= rowMaxY then
+                                            set bd to ""
+                                            try
+                                                set bd to description of btn as string
+                                            end try
+                                            if bd contains "Remove Download" then
+                                                set foundRemove to true
+                                                exit repeat
+                                            end if
+                                        end if
+                                    end repeat
+                                end try
+                            end repeat
+                            repeat with btn in (every button of g1)
+                                set bpos to position of btn
+                                set bY to (item 2 of bpos) as integer
+                                if bY >= rowMinY and bY <= rowMaxY then
+                                    set bd to ""
+                                    try
+                                        set bd to description of btn as string
+                                    end try
+                                    if bd contains "Remove Download" then
+                                        set foundRemove to true
+                                        exit repeat
+                                    end if
+                                end if
+                            end repeat
+                        end try
+                    end repeat
+                end try
+                if foundRemove then return "already_downloaded"
+                return "ready_to_download"
+            end tell
+        end tell
+        """
+        try:
+            result = run_osascript(script, timeout=6, label="check hover downloaded state")
+            return result.strip()
+        except AutomationError:
+            return "unknown"
+
+    def _dismiss_delete_dialog_if_unexpected(self) -> str:
+        """Check for an unexpected remove/delete sheet after a download click.
+
+        If a removal confirmation sheet appeared (meaning we accidentally activated
+        the delete icon instead of the download icon), press Escape to cancel it.
+        Returns: 'dismissed' | 'no_dialog'
+        """
+        check_script = """
+        tell application "System Events"
+            tell process "Podcasts"
+                set shCount to 0
+                try
+                    set shCount to count of sheets of window 1
+                end try
+                if shCount is 0 then return "no_dialog"
+                set matchBtn to ""
+                try
+                    repeat with btn in buttons of sheet 1 of window 1
+                        set bn to ""
+                        try
+                            set bn to name of btn as string
+                        end try
+                        if bn contains "Remove" or bn contains "Delete" then
+                            set matchBtn to bn
+                            exit repeat
+                        end if
+                    end repeat
+                end try
+                if matchBtn is not "" then return "delete_sheet:" & matchBtn
+                return "sheet_unknown"
+            end tell
+        end tell
+        """
+        try:
+            result = run_osascript(check_script, timeout=5, label="check for unexpected delete dialog")
+            result = result.strip()
+            if result == "no_dialog":
+                return "no_dialog"
+            # A sheet appeared — dismiss it with Escape
+            try:
+                import Quartz as _Q
+                for _down in (True, False):
+                    ev = _Q.CGEventCreateKeyboardEvent(None, 0x35, _down)
+                    _Q.CGEventPost(_Q.kCGHIDEventTap, ev)
+                    time.sleep(0.05)
+            except ImportError:
+                try:
+                    run_osascript(
+                        'tell application "System Events" to key code 53',
+                        timeout=5, label="Escape to dismiss delete dialog",
+                    )
+                except AutomationError:
+                    pass
+            time.sleep(0.5)
+            self.logger.log(f"Unexpected delete dialog dismissed: {result}", step="13")
+            return "dismissed"
+        except AutomationError:
+            return "no_dialog"
 
     def cleanup_episode_row(self, video_no: int) -> str:
         """Remove a download via the episode-list ⋯ menu (Down×1+Enter = Remove Download).
@@ -2106,23 +2253,15 @@ class PodcastsController:
                         if class of elem is button then set isBtn to true
                     end try
                     if isBtn then
-                        set dd to ""
-                        try
-                            set dd to description of elem as string
-                        end try
                         set looksLikeEpisode to false
-                        if dd contains ", " and length of dd > 20 then
-                            set upDD to dd
-                            if upDD starts with "TODAY" or upDD starts with "YESTERDAY" or upDD starts with "MON" or upDD starts with "TUE" or upDD starts with "WED" or upDD starts with "THU" or upDD starts with "FRI" or upDD starts with "SAT" or upDD starts with "SUN" or upDD starts with "JAN" or upDD starts with "FEB" or upDD starts with "MAR" or upDD starts with "APR" or upDD starts with "MAY" or upDD starts with "JUN" or upDD starts with "JUL" or upDD starts with "AUG" or upDD starts with "SEP" or upDD starts with "OCT" or upDD starts with "NOV" or upDD starts with "DEC" then
+                        try
+                            set eSz to size of elem
+                            set btnH to (item 2 of eSz) as integer
+                            set btnW to (item 1 of eSz) as integer
+                            if btnH > 60 and btnW > 400 then
                                 set looksLikeEpisode to true
                             end if
-                            if not looksLikeEpisode then
-                                try
-                                    set sz to size of elem
-                                    if (item 2 of sz) > 50 then set looksLikeEpisode to true
-                                end try
-                            end if
-                        end if
+                        end try
                         if looksLikeEpisode then
                             set seenCount to seenCount + 1
                             if seenCount = targetN then
@@ -2559,12 +2698,15 @@ class PodcastsController:
         """Wait for all downloads to finish before cleanup starts.
 
         Strategy (in order):
-          1. Check for AXProgressIndicator elements in the window (most reliable).
-          2. Check for 'Downloading' text via check_downloads_state().
-          3. If neither detector fires, wait a fixed 45s fallback and log it.
+          1. Navigate to Downloaded tab.
+          2. Probe for AXProgressIndicator or 'Downloading' text over a 30s window
+             (6 probes × 5s). This catches downloads that register slowly.
+          3. If neither detector fires after 30s, use a 120s fallback and mark
+             state as 'stable_unknown' so cleanup proceeds with a warning.
+          4. If active downloads are found, poll every 5s until they finish.
 
         Returns one of: 'completed' | 'in_progress_polled' | 'stable_unknown' | 'timeout'.
-        State fields written: download_state, download_wait_seconds.
+        State fields written: download_state, download_wait_seconds, can_cleanup.
         """
         nav = self.navigate_to_downloaded_tab()
         if nav not in ("navigated",):
@@ -2572,10 +2714,9 @@ class PodcastsController:
             time.sleep(120)
             self.state.data["download_state"] = "stable_unknown"
             self.state.data["download_wait_seconds"] = 120
+            self.state.data["can_cleanup"] = True
             self.state.save()
             return "stable_unknown"
-
-        time.sleep(5)  # let download register in Downloaded tab view
 
         progress_check_script = """
         tell application "System Events"
@@ -2605,24 +2746,40 @@ class PodcastsController:
                 return False
 
         t_start = time.time()
-        initial_progress = _has_progress_indicators()
-        initial_text = _has_text_in_progress() if not initial_progress else True
 
-        if not initial_progress and not initial_text:
-            # Neither detector found active downloads — unknown state.
-            # Use 120s fallback: podcast episodes commonly take 1-3 min to download.
+        # Probe for up to 30s (6 probes × 5s) — downloads can take several seconds
+        # to register in the Downloaded tab after the click.
+        active_found = False
+        for probe in range(6):
+            time.sleep(5)
+            if _has_progress_indicators() or _has_text_in_progress():
+                active_found = True
+                break
+            elapsed = int(time.time() - t_start)
             self.logger.log(
-                "Download state: no active indicators detected — waiting 120s (stable_unknown)",
+                f"Download probe {probe + 1}/6: no indicators yet ({elapsed}s elapsed)",
+                step="14",
+            )
+
+        initial_progress = _has_progress_indicators() if active_found else False
+        initial_text = _has_text_in_progress() if (active_found and not initial_progress) else active_found
+
+        if not active_found:
+            # No indicators detected after 30s — download may be already complete
+            # or failed silently.  Use 120s fallback and proceed with cleanup warning.
+            self.logger.log(
+                "Download state: no active indicators after 30s — waiting 120s (stable_unknown)",
                 step="14", download_state="stable_unknown",
             )
             time.sleep(120)
             waited = int(time.time() - t_start)
             self.state.data["download_state"] = "stable_unknown"
             self.state.data["download_wait_seconds"] = waited
+            self.state.data["can_cleanup"] = True
             self.state.save()
             return "stable_unknown"
 
-        # Active downloads detected — poll until they finish
+        # Active downloads detected — poll every 5s until they finish or timeout
         self.logger.log(
             f"Downloads active (progress_indicators={initial_progress}, text={initial_text})"
             f" — polling up to {timeout}s",
@@ -2640,6 +2797,7 @@ class PodcastsController:
             if not still_going:
                 self.state.data["download_state"] = "completed"
                 self.state.data["download_wait_seconds"] = elapsed
+                self.state.data["can_cleanup"] = True
                 self.state.save()
                 self.logger.log(f"Downloads completed after {elapsed}s", step="14",
                                 download_state="completed", download_wait_seconds=elapsed)
@@ -2652,6 +2810,7 @@ class PodcastsController:
         )
         self.state.data["download_state"] = "timeout"
         self.state.data["download_wait_seconds"] = elapsed
+        self.state.data["can_cleanup"] = True
         self.state.save()
         return "timeout"
 
@@ -2914,10 +3073,19 @@ class PodcastsController:
                 f"Cleanup episode {video_no}: clicked ⋯ at ({more_x},{more_y})", step="14"
             )
 
-            # Try AX menu first; keyboard fallback otherwise
+            # Try AX direct menu selection first; keyboard fallback if menu not AX-accessible
             ax_ok = self._click_remove_menu_item_ax()
-            if not ax_ok:
-                # Down×4 = 'Remove Download' in the episode row context menu
+            if ax_ok:
+                self.logger.log(
+                    f"Cleanup episode {video_no}: AX menu selection used",
+                    step="14",
+                )
+                self.state.data.setdefault("cleanup_menu_method", {}).update(
+                    {str(video_no): "ax_direct"}
+                )
+            else:
+                # Mac Catalyst ⋯ menus are not AX-accessible — keyboard nav fallback.
+                # Down×4 = 'Remove Download' (4th item in episode row context menu).
                 import subprocess as _sp
                 _sp.run(
                     ["osascript", "-e",
@@ -2928,8 +3096,14 @@ class PodcastsController:
                      'tell application "System Events" to key code 36'],
                     timeout=5, check=False,
                 )
-                self.logger.log(f"Cleanup episode {video_no}: keyboard Down×4+Enter used", step="14")
+                self.logger.log(
+                    f"Cleanup episode {video_no}: keyboard Down×4+Enter used (AX menu not accessible)",
+                    step="14",
+                )
                 self.state.data["cleanup_fallback_keyboard_used"] = True
+                self.state.data.setdefault("cleanup_menu_method", {}).update(
+                    {str(video_no): "keyboard_fallback_down4_enter"}
+                )
 
             removed.append(video_no)
             time.sleep(1.2)
@@ -2967,23 +3141,15 @@ class PodcastsController:
                         if class of elem is button then set isBtn to true
                     end try
                     if isBtn then
-                        set dd to ""
-                        try
-                            set dd to description of elem as string
-                        end try
                         set looksLikeEpisode to false
-                        if dd contains ", " and length of dd > 20 then
-                            set upDD to dd
-                            if upDD starts with "TODAY" or upDD starts with "YESTERDAY" or upDD starts with "MON" or upDD starts with "TUE" or upDD starts with "WED" or upDD starts with "THU" or upDD starts with "FRI" or upDD starts with "SAT" or upDD starts with "SUN" or upDD starts with "JAN" or upDD starts with "FEB" or upDD starts with "MAR" or upDD starts with "APR" or upDD starts with "MAY" or upDD starts with "JUN" or upDD starts with "JUL" or upDD starts with "AUG" or upDD starts with "SEP" or upDD starts with "OCT" or upDD starts with "NOV" or upDD starts with "DEC" then
+                        try
+                            set eSz to size of elem
+                            set btnH to (item 2 of eSz) as integer
+                            set btnW to (item 1 of eSz) as integer
+                            if btnH > 60 and btnW > 400 then
                                 set looksLikeEpisode to true
                             end if
-                            if not looksLikeEpisode then
-                                try
-                                    set sz to size of elem
-                                    if (item 2 of sz) > 50 then set looksLikeEpisode to true
-                                end try
-                            end if
-                        end if
+                        end try
                         if looksLikeEpisode then
                             set seenCount to seenCount + 1
                             if seenCount = targetN then
@@ -3002,11 +3168,11 @@ class PodcastsController:
                     return "ERROR:episode_not_found|seen=" & seenCount
                 end if
                 set ePos to position of targetEp
-                set eSz to size of targetEp
+                set epSz to size of targetEp
                 set eX to (item 1 of ePos) as integer
                 set eY to (item 2 of ePos) as integer
-                set eW to (item 1 of eSz) as integer
-                set eH to (item 2 of eSz) as integer
+                set eW to (item 1 of epSz) as integer
+                set eH to (item 2 of epSz) as integer
                 set moreX to 0
                 set moreY to 0
                 try
@@ -3778,8 +3944,12 @@ class Orchestrator:
             status = self.podcasts.download_episode_row(video_no)
             self.logger.log(f"Target video {video_no} {status}", step="13",
                             video=video_no, status=status)
-            self.state.mark_phase(cycle, f"video_{tab_task.tab}_{video_no}_download_clicked")
-            show_entry["videos_downloaded"].append(video_no)
+            self.state.mark_phase(cycle, f"video_{tab_task.tab}_{video_no}_{status}")
+            # Track as downloaded for cleanup purposes regardless of whether the
+            # download was newly triggered or was already present on the device.
+            if status in ("download_clicked", "already_downloaded",
+                          "already_downloaded_popup_dismissed"):
+                show_entry["videos_downloaded"].append(video_no)
             self.state.save()
             self.state.add_task_result(
                 cycle=cycle, tab=tab_task.tab, video=video_no,
