@@ -3229,8 +3229,8 @@ class Orchestrator:
             raise AutomationError("This script must run on macOS")
 
         # Python version
-        if sys.version_info < (3, 10):
-            failures.append(f"Python ≥ 3.10 required (got {sys.version.split()[0]})")
+        if sys.version_info < (3, 9):
+            failures.append(f"Python ≥ 3.9 required (got {sys.version.split()[0]})")
 
         # Required apps
         required_apps = {"Google Chrome": "Google Chrome", "Podcasts": "Podcasts"}
