@@ -3421,8 +3421,19 @@ class Orchestrator:
         time.sleep(10)
         self.logger.log("Podcasts page loaded", step="10")
 
-        # Capture show name for state-driven cleanup
-        show_name = self.podcasts.capture_show_name()
+        # Capture show name for state-driven cleanup.
+        # Primary: Chrome tab title (most reliable — e.g. "The Daily - Apple Podcasts").
+        # Secondary: Podcasts AX window title / heading.
+        chrome_title = title.strip()
+        for suffix in (" - Apple Podcasts", " – Apple Podcasts", " — Apple Podcasts",
+                       " | Apple Podcasts", " - Podcasts", " – Podcasts", " — Podcasts"):
+            if chrome_title.endswith(suffix):
+                chrome_title = chrome_title[: -len(suffix)].strip()
+                break
+        if chrome_title and chrome_title.lower() not in ("", "podcasts", "apple podcasts"):
+            show_name = chrome_title
+        else:
+            show_name = self.podcasts.capture_show_name()
         self.logger.log(f"Show name captured: {show_name!r}", step="10", show_name=show_name)
 
         # Record this tab in processed_shows so cleanup can find it by name
