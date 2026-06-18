@@ -202,6 +202,12 @@ class StateManager:
             "resume_available": True,
             "started_at": now,
             "updated_at": now,
+            # v2 fields
+            "processed_shows": {},          # {str(cycle): [{tab, url, show_name, videos_requested, videos_downloaded}]}
+            "vpn_verify_level": None,       # "tunnel+route" | "tunnel+route+ip" | "tunnel+route+ip+country" | "tunnel_only"
+            "download_state": None,         # "completed" | "in_progress" | "stable_unknown" | "timeout"
+            "download_wait_seconds": None,
+            "cleanup_fallback_keyboard_used": False,
         }
 
     def save(self) -> None:
@@ -443,11 +449,7 @@ class NetworkState:
 
         # ── ipinfo.io (fallback) ──────────────────────────────────────────────────
         import ssl
-        try:
-            import certifi  # type: ignore[import]
-            ctx = ssl.create_default_context(cafile=certifi.where())
-        except ImportError:
-            ctx = ssl.create_default_context()
+        ctx = ssl.create_default_context()
 
         if now - self._last_429_at < 60.0:
             return None  # both services rate-limited; caller uses tunnel fallback
@@ -2617,11 +2619,13 @@ class Orchestrator:
             )
             self.logger.log(f"Loaded runtime state: {self.state.path}", step="03",
                             completed_cycles=self.state.data["completed_cycles"])
-            self._validate_environment()
+            self.run_preflight()  # comprehensive: platform, apps, AX, dirs, Chrome tab count
 
-            self.chrome.activate()
-            tabs_cache = self.chrome.enumerate_tabs()
-            self.logger.log(f"Detected Chrome tabs ({len(tabs_cache)} found)", step="04",
+            tabs_cache = self.state.data.get("chrome_tabs_cache", {})
+            if not tabs_cache:
+                self.chrome.activate()
+                tabs_cache = self.chrome.enumerate_tabs()
+            self.logger.log(f"Chrome tabs: {len(tabs_cache)} found", step="04",
                             tab_count=len(tabs_cache))
             self._preflight_chrome_tasks(tabs_cache)
 
@@ -2692,25 +2696,84 @@ class Orchestrator:
             self.logger.save_report(state=self.state.data)
 
     def _validate_environment(self) -> None:
-        env = {"platform": platform.system(), "has_pyxa": HAS_PYXA}
-        self.logger.log(f"Environment: {env}", step="03", **env)
+        self.run_preflight()
+
+    def run_preflight(self) -> None:
+        """Comprehensive preflight checks. Raises AutomationError on first failure."""
+        failures: list[str] = []
+
+        # Platform
         if platform.system() != "Darwin":
             raise AutomationError("This script must run on macOS")
-        if not HAS_PYXA:
-            raise AutomationError(
-                "PyXA not installed. Run: python3 -m pip install -r requirements.txt"
-            )
-        apps = {
-            "Google Chrome": self._app_available("Google Chrome"),
-            "Podcasts": self._app_available("Podcasts"),
-        }
+
+        # Python version
+        if sys.version_info < (3, 10):
+            failures.append(f"Python ≥ 3.10 required (got {sys.version.split()[0]})")
+
+        # Required apps
+        required_apps = {"Google Chrome": "Google Chrome", "Podcasts": "Podcasts"}
         if self.config.vpn.enabled:
-            apps[self.config.vpn.app] = self._app_available(self.config.vpn.app)
-        self.state.data["environment_checks"] = {"apps": apps, **env}
+            required_apps[self.config.vpn.app] = self.config.vpn.app
+        missing_apps = [name for name in required_apps if not self._app_available(name)]
+        if missing_apps:
+            failures.append(f"Required app not found: {', '.join(missing_apps)}")
+
+        # Accessibility permission — attempt a harmless AX operation
+        ax_ok = False
+        try:
+            out = run_osascript(
+                'tell application "System Events" to tell process "Finder" to get exists',
+                timeout=6, label="ax_permission_check",
+            )
+            ax_ok = True
+        except AutomationError as exc:
+            if "25211" in str(exc) or "assistive" in str(exc).lower():
+                failures.append(
+                    "Accessibility permission not granted.\n"
+                    "  Fix: System Settings → Privacy & Security → Accessibility\n"
+                    "       Enable Terminal (or your launcher), then re-run."
+                )
+            else:
+                ax_ok = True  # different error; AX itself may be fine
+
+        # Writable directories
+        for d in (self.logger.log_path.parent, self.state.path.parent):
+            try:
+                d.mkdir(parents=True, exist_ok=True)
+                test = d / ".preflight_write_test"
+                test.write_text("ok")
+                test.unlink()
+            except OSError as exc:
+                failures.append(f"Directory not writable ({d}): {exc}")
+
+        env = {
+            "platform": platform.system(),
+            "python": sys.version.split()[0],
+            "has_pyxa": HAS_PYXA,
+            "ax_permission": ax_ok,
+        }
+        self.state.data["environment_checks"] = {"apps": {k: k not in missing_apps for k in required_apps}, **env}
         self.state.save()
-        missing = [name for name, ok in apps.items() if not ok]
-        if missing:
-            raise AutomationError(f"Required app not found: {', '.join(missing)}")
+
+        if failures:
+            raise AutomationError("Preflight failed:\n" + "\n".join(f"  • {f}" for f in failures))
+
+        self.logger.log(f"Preflight OK: {env}", step="03", **env)
+
+        # Chrome tab count check (done after AX / app checks pass)
+        if ax_ok and "Google Chrome" not in missing_apps:
+            try:
+                tabs_cache = self.chrome.enumerate_tabs()
+                max_tab = max((t.tab for t in self.config.tabs), default=1)
+                if len(tabs_cache) < max_tab:
+                    raise AutomationError(
+                        f"Input requests tab {max_tab} but Chrome only has {len(tabs_cache)} tab(s). "
+                        "Open the Apple Podcasts pages in Chrome first."
+                    )
+            except AutomationError:
+                raise
+            except Exception as exc:
+                self.logger.log(f"Chrome tab count check warning: {exc}", step="03")
 
     def _preflight_chrome_tasks(self, tabs_cache: dict[str, dict[str, str]]) -> None:
         for tab_task in self.config.tabs:
