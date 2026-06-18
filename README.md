@@ -23,7 +23,7 @@ macOS 12 Monterey and later. Tested on macOS 13 Ventura and 14 Sonoma.
 | Google Chrome | Yes | Must be open with Podcasts tabs loaded |
 | Apple Podcasts | Yes | Pre-installed on macOS |
 | ProtonVPN | Only if `vpn.enabled: true` | Must be signed in |
-| Python 3.10+ | Yes | `python3 --version` to check |
+| Python 3.9+ | Yes | `python3 --version` to check |
 
 ---
 
@@ -284,7 +284,7 @@ This activates Podcasts, navigates to the Downloaded tab, dumps the full AX tree
 Run these steps on **3 Macs** before deploying to 100+:
 
 - [ ] macOS version ≥ 12 on all target Macs
-- [ ] Python 3.10+ installed (`python3 --version`)
+- [ ] Python 3.9+ installed (`python3 --version`)
 - [ ] Accessibility permission granted for Terminal (or launcher)
 - [ ] Automation permission granted for Terminal
 - [ ] Google Chrome open with Apple Podcasts tabs in position
