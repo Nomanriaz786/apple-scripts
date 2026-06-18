@@ -1973,9 +1973,19 @@ class PodcastsController:
             self.logger.log(
                 f"Download episode {video_no}: bad position in '{out}'", step="13"
             )
+            self._dump_ax_tree(f"download_row_{video_no}_not_found")
             return "download_not_found"
 
-        # Phase 2: Quartz hover → pixel-click the download icon
+        # Phase 2: activate Podcasts, then Quartz hover → pixel-click download icon
+        try:
+            run_osascript(
+                'tell application "Podcasts" to activate',
+                timeout=5, label="activate Podcasts before download click",
+            )
+            time.sleep(0.3)
+        except AutomationError:
+            pass
+
         try:
             import Quartz  # type: ignore[import]
         except ImportError:
