@@ -1,5 +1,5 @@
 {
-  "repeat": 2,
+  "repeat": 1,
   "vpn": {
     "enabled": true,
     "app": "ProtonVPN",
@@ -7,8 +7,8 @@
     "require_provider_in_org": false
   },
   "tabs": [
-    { "tab": 1, "videos": [1, 2, 3] },
-    { "tab": 2, "videos": [1, 2] }
+    { "tab": 1, "videos": [7,26,40] },
+    { "tab": 2, "videos": [35,50,67,200] }
   ],
   "cleanup": true,
   "cleanup_mode": "remove_download",

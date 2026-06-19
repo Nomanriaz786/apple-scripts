@@ -579,7 +579,9 @@ class VPNController:
                     raise AutomationError(
                         f"{vpn_cfg.app} app not found. Install and sign in first."
                     )
-                servers = self._discover_servers(vpn_cfg.location, vpn_cfg.location_code)
+                servers = self._discover_servers(
+                    vpn_cfg.location, vpn_cfg.location_code, vpn_cfg.app
+                )
                 if not servers:
                     raise AutomationError(
                         f"No servers discovered for {vpn_cfg.location} in {vpn_cfg.app}. "
@@ -761,20 +763,287 @@ class VPNController:
                 seen.append(n)
         return ", ".join('"' + n.replace('"', '\\"') + '"' for n in seen)
 
-    def _discover_servers(self, location: str, location_code: str) -> list[str]:
-        """Return slot-based server names for position-driven rotation.
+    def _discover_servers(
+        self, location: str, location_code: str, app_name: str = "ProtonVPN"
+    ) -> list[str]:
+        """Discover the real number of available servers by expanding the country list.
 
-        ProtonVPN uses lazy rendering — server row text is never populated in the
-        accessibility tree until the row is hovered.  Rather than trying to read
-        names, we return positional slot tokens (e.g. US-SLOT-1 … US-SLOT-5).
-        _connect_via_slot translates a slot token into a hover+click on the Nth
-        visible server row in the expanded country list.
+        Runs the same Phase 1-3 ProtonVPN UI setup as _connect_via_slot to obtain
+        window coordinates, then expands the country row and counts server rows via:
+          1. AX table row count (works on the *filtered* list, which has ~50-100 rows,
+             not the unfiltered 6000+ row table).
+          2. Pixel brightness sampling fallback if AX times out.
+
+        Returns positional slot tokens (e.g. US-SLOT-1 … US-SLOT-N) because ProtonVPN
+        lazy-renders label text — real server names are only readable after hover.
+        Leaves ProtonVPN in the expanded/filtered state so the immediately following
+        _connect_via_slot(slot=1) call finds the list already expanded.
         """
-        self.logger.log(
-            f"Slot-based discovery for {location}: returning 5 positional slots",
-            step="06", location=location,
+        try:
+            import Quartz  # type: ignore[import]
+        except ImportError:
+            self.logger.log(
+                f"Quartz unavailable for discovery — using 5 positional slots",
+                step="06", location=location,
+            )
+            return [f"{location_code.upper()}-SLOT-{i + 1}" for i in range(5)]
+
+        process_list = self._process_name_candidates(app_name)
+
+        def _dmouse(kind, x, y):
+            pt = Quartz.CGPoint(x=float(x), y=float(y))
+            ev = Quartz.CGEventCreateMouseEvent(None, kind, pt, Quartz.kCGMouseButtonLeft)
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+            time.sleep(0.05)
+
+        def _dkey(vk, down, flags=0):
+            src = Quartz.CGEventSourceCreate(Quartz.kCGEventSourceStateCombinedSessionState)
+            ev = Quartz.CGEventCreateKeyboardEvent(src, vk, down)
+            if flags:
+                Quartz.CGEventSetFlags(ev, flags)
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+            time.sleep(0.05)
+
+        def _fallback(n: int = 5) -> list[str]:
+            return [f"{location_code.upper()}-SLOT-{i + 1}" for i in range(n)]
+
+        # ── Phase 1: get search-field + window coordinates ────────────────────
+        p1_script = f"""
+        tell application "System Events"
+            set procName to ""
+            repeat with candidate in {{{process_list}}}
+                if exists process (candidate as text) then
+                    set procName to candidate as text
+                    exit repeat
+                end if
+            end repeat
+            if procName is "" then return "ERROR:no_process"
+            tell process procName
+                set frontmost to true
+                delay 0.5
+                if not (exists window 1) then return "ERROR:no_window"
+                if not (exists text field 1 of group 1 of window 1) then return "ERROR:no_sf"
+                set sf to text field 1 of group 1 of window 1
+                set sfPos to position of sf
+                set sfSz to size of sf
+                set wPos to position of window 1
+                set wSz to size of window 1
+                return "SF:" & (item 1 of sfPos) & "," & (item 2 of sfPos) & "," & ¬
+                                (item 1 of sfSz) & "," & (item 2 of sfSz) & ¬
+                       "|W:" & (item 1 of wPos) & "," & (item 2 of wPos) & "," & ¬
+                               (item 1 of wSz)  & "," & (item 2 of wSz)
+            end tell
+        end tell
+        """
+        try:
+            p1 = run_osascript(p1_script, timeout=30, label=f"discover-p1 {location}")
+        except AutomationError as exc:
+            self.logger.log(f"Discovery p1 failed ({exc}) — using 5 slots", step="06")
+            return _fallback()
+
+        if p1.startswith("ERROR:"):
+            self.logger.log(f"Discovery p1 error: {p1} — using 5 slots", step="06")
+            return _fallback()
+
+        sf_x = sf_y = sf_w = sf_h = 0
+        w_x = w_y = w_w = w_h = 0
+        for chunk in p1.split("|"):
+            if chunk.startswith("SF:"):
+                parts = chunk[3:].split(",")
+                if len(parts) == 4:
+                    sf_x, sf_y, sf_w, sf_h = (int(p) for p in parts)
+            elif chunk.startswith("W:"):
+                parts = chunk[2:].split(",")
+                if len(parts) == 4:
+                    w_x, w_y, w_w, w_h = (int(p) for p in parts)
+
+        if sf_w == 0 or w_w == 0:
+            self.logger.log(f"Discovery p1 bad data: {p1!r} — using 5 slots", step="06")
+            return _fallback()
+
+        # ── Phase 2: paste search filter ──────────────────────────────────────
+        sf_cx, sf_cy = sf_x + sf_w // 2, sf_y + sf_h // 2
+        old_clip = subprocess.run(["pbpaste"], capture_output=True).stdout
+        try:
+            subprocess.run(["pbcopy"], input=location.encode(), check=True)
+            _dmouse(Quartz.kCGEventLeftMouseDown, sf_cx, sf_cy)
+            _dmouse(Quartz.kCGEventLeftMouseUp,   sf_cx, sf_cy)
+            time.sleep(0.4)
+            _dkey(0x00, True,  Quartz.kCGEventFlagMaskCommand)   # Cmd+A
+            _dkey(0x00, False, Quartz.kCGEventFlagMaskCommand)
+            time.sleep(0.1)
+            _dkey(0x33, True); _dkey(0x33, False)                # Backspace
+            time.sleep(0.5)
+            _dkey(0x09, True,  Quartz.kCGEventFlagMaskCommand)   # Cmd+V
+            _dkey(0x09, False, Quartz.kCGEventFlagMaskCommand)
+            time.sleep(3.0)
+            self.logger.log(f"Discovery: search filter pasted '{location}'", step="06")
+        finally:
+            subprocess.run(["pbcopy"], input=old_clip, check=False)
+
+        # ── Phase 3: scroll to top, get row-2 position ───────────────────────
+        p3_script = f"""
+        tell application "System Events"
+            set procName to ""
+            repeat with candidate in {{{process_list}}}
+                if exists process (candidate as text) then
+                    set procName to candidate as text
+                    exit repeat
+                end if
+            end repeat
+            if procName is "" then return "ERROR:no_process"
+            tell process procName
+                if not (exists scroll area 1 of window 1) then return "ERROR:no_scroll"
+                if not (exists table 1 of scroll area 1 of window 1) then return "ERROR:no_table"
+                set sc to scroll area 1 of window 1
+                try
+                    set value of scroll bar 1 of sc to 0
+                    delay 0.3
+                end try
+                if not (exists row 2 of table 1 of sc) then return "ERROR:no_row2"
+                set r2Pos to position of row 2 of table 1 of sc
+                set wPos to position of window 1
+                set wSz to size of window 1
+                return "R2:" & (item 2 of r2Pos) & ¬
+                       "|W:" & (item 1 of wPos) & "," & (item 2 of wPos) & "," & ¬
+                               (item 1 of wSz)  & "," & (item 2 of wSz)
+            end tell
+        end tell
+        """
+        try:
+            p3 = run_osascript(p3_script, timeout=20, label=f"discover-p3 {location}")
+        except AutomationError as exc:
+            self.logger.log(f"Discovery p3 failed ({exc}) — using 5 slots", step="06")
+            return _fallback()
+
+        if p3.startswith("ERROR:"):
+            self.logger.log(f"Discovery p3 error: {p3} — using 5 slots", step="06")
+            return _fallback()
+
+        r2_top = 0
+        for chunk in p3.split("|"):
+            if chunk.startswith("R2:"):
+                try:
+                    r2_top = int(chunk[3:])
+                except ValueError:
+                    pass
+            elif chunk.startswith("W:"):
+                parts = chunk[2:].split(",")
+                if len(parts) == 4:
+                    w_x, w_y, w_w, w_h = (int(p) for p in parts)
+
+        if r2_top == 0:
+            self.logger.log(f"Discovery p3 bad data: {p3!r} — using 5 slots", step="06")
+            return _fallback()
+
+        US_HEADER_H = 48
+        SERVER_ROW_H = 48
+        expand_x = w_x + w_w // 2
+        expand_y = r2_top + US_HEADER_H // 2
+
+        # ── Phase 4: expand if needed, then count server rows ────────────────
+        subprocess.run(
+            ["osascript", "-e",
+             f'tell application "System Events" to set frontmost of process "ProtonVPN" to true'],
+            timeout=4, check=False,
         )
-        return [f"{location_code.upper()}-SLOT-{i + 1}" for i in range(5)]
+        time.sleep(0.2)
+
+        def _sample_brightness(sx, sy, sw=40, sh=20) -> int:
+            rect = Quartz.CGRectMake(sx, sy, sw, sh)
+            img = Quartz.CGWindowListCreateImage(
+                rect, Quartz.kCGWindowListOptionOnScreenOnly,
+                Quartz.kCGNullWindowID, Quartz.kCGWindowImageDefault,
+            )
+            if img is None:
+                return 0
+            dp = Quartz.CGDataProviderCopyData(Quartz.CGImageGetDataProvider(img))
+            if not dp or len(dp) < 4:
+                return 0
+            return max(dp[i] + dp[i + 1] + dp[i + 2] for i in range(0, len(dp) - 3, 4))
+
+        first_server_y = r2_top + US_HEADER_H + SERVER_ROW_H // 2
+        bright = _sample_brightness(w_x + 10, first_server_y - 10)
+        is_expanded = bright > 270
+        self.logger.log(
+            f"Discovery: expansion brightness={bright} expanded={is_expanded}", step="06",
+        )
+
+        if not is_expanded:
+            _dmouse(Quartz.kCGEventLeftMouseDown, expand_x, expand_y)
+            _dmouse(Quartz.kCGEventLeftMouseUp,   expand_x, expand_y)
+            time.sleep(1.5)
+
+        # ── Count server rows ─────────────────────────────────────────────────
+        # Primary: AX row count (fast on the *filtered* table, ~50-100 rows max).
+        # After filtering to a single country the table is small; the 6000+ row
+        # problem only appears on the unfiltered table.
+        count_script = f"""
+        tell application "System Events"
+            set procName to ""
+            repeat with candidate in {{{process_list}}}
+                if exists process (candidate as text) then
+                    set procName to candidate as text
+                    exit repeat
+                end if
+            end repeat
+            if procName is "" then return "ERROR:no_process"
+            tell process procName
+                if not (exists table 1 of scroll area 1 of window 1) then return "ERROR:no_table"
+                set tbl to table 1 of scroll area 1 of window 1
+                set totalRows to count of rows of tbl
+                -- Row 1 = "All locations" header (32px), Row 2 = country header (48px)
+                -- Rows 3+ = individual server rows
+                set srvCount to totalRows - 2
+                if srvCount < 1 then set srvCount to 1
+                return srvCount as text
+            end tell
+        end tell
+        """
+        server_count = 0
+        try:
+            cr = run_osascript(count_script, timeout=15, label=f"discover-count {location}")
+            cr = cr.strip()
+            if not cr.startswith("ERROR:"):
+                server_count = int(cr)
+                self.logger.log(
+                    f"Discovery: AX row count → {server_count} servers for {location}",
+                    step="06",
+                )
+        except (AutomationError, ValueError) as exc:
+            self.logger.log(
+                f"Discovery: AX count failed ({exc}) — falling back to pixel sampling",
+                step="06",
+            )
+
+        # Fallback: pixel brightness sampling down from first server row
+        if server_count <= 0:
+            n, misses = 0, 0
+            max_slots = min(200, (w_h - (r2_top + US_HEADER_H)) // SERVER_ROW_H + 20)
+            while n < max_slots and misses < 3:
+                slot_y = r2_top + US_HEADER_H + n * SERVER_ROW_H + SERVER_ROW_H // 2
+                if slot_y > w_y + w_h:
+                    break
+                b = _sample_brightness(w_x + 10, slot_y)
+                if b > 200:
+                    n += 1
+                    misses = 0
+                else:
+                    misses += 1
+                    n += 1
+            server_count = max(n - misses, 1)
+            self.logger.log(
+                f"Discovery: pixel sampling → {server_count} visible slots for {location}",
+                step="06",
+            )
+
+        server_count = max(server_count, 1)
+        slots = [f"{location_code.upper()}-SLOT-{i + 1}" for i in range(server_count)]
+        self.logger.log(
+            f"Discovery complete: {len(slots)} positional slots for {location}",
+            step="06", location=location, slot_count=len(slots),
+        )
+        return slots
 
     def _click_server_by_name(
         self, app_name: str, server: str, location: str = "", force_retype: bool = False
@@ -1850,6 +2119,11 @@ class PodcastsController:
           3. Quartz: move mouse to row center → pause for hover state → click at
              (more_x - 35, more_y), which is where the download icon sits.
         """
+        # Reset scroll to top before each BFS — episode list uses lazy rendering
+        # so AX only exposes the currently visible rows. Without this, the row
+        # counter is relative to the current scroll position, not the episode number.
+        self.scroll_to_top()
+
         # Phase 1: AppleScript BFS — locate the Nth episode and its more-button center.
         script = f"""
         tell application "System Events"
@@ -1864,11 +2138,9 @@ class PodcastsController:
                 set seenCount to 0
                 set targetEp to missing value
                 set queue to {{window 1}}
-                set deadline to (current date) + 75
 
                 repeat 3000 times
                     if (count of queue) = 0 then exit repeat
-                    if (current date) > deadline then return "ERROR:deadline_exceeded"
 
                     set elem to item 1 of queue
                     if (count of queue) > 1 then
@@ -1957,7 +2229,11 @@ class PodcastsController:
                     end repeat
                 end try
 
-                return "ROW:" & eX & "," & eY & "," & eW & "," & eH & "|MORE:" & moreX & "," & moreY
+                set wPos to position of window 1
+                set wSz to size of window 1
+                set wY to (item 2 of wPos) as integer
+                set wH to (item 2 of wSz) as integer
+                return "WIN:" & wY & "," & wH & "|ROW:" & eX & "," & eY & "," & eW & "," & eH & "|MORE:" & moreX & "," & moreY
             end tell
         end tell
         """
@@ -1968,36 +2244,77 @@ class PodcastsController:
         # lazy-loads rows as the viewport scrolls; the first BFS sees only visible rows.
         if out.startswith("ERROR:episode_not_found"):
             import re as _re
+            # Multi-step scroll loop.
+            # After a scroll the BFS resets its counter from 1 (not from episode 1
+            # overall), so we must give it an *adjusted* target: how many more rows
+            # to count after the rows we already scrolled past.
+            # Each iteration scrolls past (seen_n - 1) rows and lowers the target
+            # by the same amount; the 1-row overlap keeps us from overshooting.
+            import re as _re2
             seen_m = _re.search(r"seen=(\d+)", out)
             seen_n = int(seen_m.group(1)) if seen_m else 0
-            if seen_n > 0 and seen_n < video_no:
-                self.logger.log(
-                    f"Download episode {video_no}: seen={seen_n} rows — scrolling down",
-                    step="13",
-                )
-                try:
-                    import Quartz as _Q  # type: ignore[import]
-                    row_h_est = 120
-                    scroll_px = (video_no - seen_n + 2) * row_h_est
+            total_skipped = 0
+            row_h_est = 115  # observed episode row height in px
+            # Scroll target coordinates: within the episode list content area.
+            # x≈880 is the horizontal centre of episode rows (470 + 823/2).
+            # y≈800 is safely inside the scrollable episode list (rows start ~y=660).
+            scroll_cx, scroll_cy = 880, 800
+            try:
+                import Quartz as _Q  # type: ignore[import]
+                for _scroll_attempt in range(30):
+                    if seen_n == 0 or seen_n >= video_no - total_skipped:
+                        break
+                    # On first attempt jump as far as needed in one shot;
+                    # on later attempts use smaller increments for fine adjustment.
+                    rows_remaining = video_no - total_skipped - seen_n
+                    if _scroll_attempt == 0 and rows_remaining > seen_n:
+                        rows_to_skip = rows_remaining - 3   # jump most of the way, leave 3-row cushion
+                    else:
+                        rows_to_skip = max(1, seen_n - 1)   # standard incremental step
+                    total_skipped += rows_to_skip
+                    scroll_px = rows_to_skip * row_h_est
+                    self.logger.log(
+                        f"Download episode {video_no}: seen={seen_n} → "
+                        f"scroll {scroll_px}px, adjusted target={video_no - total_skipped}",
+                        step="13",
+                    )
                     ev = _Q.CGEventCreateScrollWheelEvent(
                         None, _Q.kCGScrollEventUnitPixel, 1, -scroll_px
                     )
-                    content_cx = 1060  # center of content area (stable across window sizes)
-                    content_cy = 450
-                    _Q.CGEventSetLocation(ev, _Q.CGPointMake(content_cx, content_cy))
+                    _Q.CGEventSetLocation(ev, _Q.CGPointMake(scroll_cx, scroll_cy))
                     _Q.CGEventPost(_Q.kCGHIDEventTap, ev)
-                    time.sleep(0.9)
-                    out = run_osascript(script, timeout=90, label=f"find episode {video_no} position (retry)")
-                except ImportError:
-                    pass
+                    time.sleep(1.0)
+                    adjusted_target = video_no - total_skipped
+                    adj_script = script.replace(
+                        f"set targetN to {video_no}",
+                        f"set targetN to {adjusted_target}",
+                    )
+                    out = run_osascript(
+                        adj_script, timeout=90,
+                        label=f"find episode {video_no} (scroll {_scroll_attempt + 1})",
+                    )
+                    if not out.startswith("ERROR:episode_not_found"):
+                        break
+                    seen_m2 = _re2.search(r"seen=(\d+)", out)
+                    seen_n = int(seen_m2.group(1)) if seen_m2 else 0
+            except ImportError:
+                pass
 
         if out.startswith("ERROR:"):
             self.logger.log(f"Download episode {video_no}: {out}", step="13")
             return "download_not_found"
 
+        win_y = win_h = 0
         row_x = row_y = row_w = row_h = more_x = more_y = 0
         for chunk in out.split("|"):
-            if chunk.startswith("ROW:"):
+            if chunk.startswith("WIN:"):
+                parts = chunk[4:].split(",")
+                if len(parts) == 2:
+                    try:
+                        win_y, win_h = int(parts[0]), int(parts[1])
+                    except ValueError:
+                        pass
+            elif chunk.startswith("ROW:"):
                 parts = chunk[4:].split(",")
                 if len(parts) == 4:
                     try:
@@ -2047,6 +2364,32 @@ class PodcastsController:
             Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
             time.sleep(0.05)
 
+        # Scroll the episode row into view if its center falls outside the visible window.
+        # The AX tree exposes partially-visible rows at the viewport bottom, but their
+        # center coordinates land below the window edge — hover/clicks miss entirely.
+        if win_h > 0:
+            win_bottom = win_y + win_h
+            row_bottom = row_y + row_h
+            # Need 80px clearance above window bottom so the row center is safely inside.
+            if row_bottom > win_bottom - 80:
+                extra_px = row_bottom - (win_bottom - 120)
+                scroll_cx = row_x + row_w // 2
+                scroll_cy = win_y + win_h // 2
+                self.logger.log(
+                    f"Episode {video_no}: row bottom {row_bottom} near/below window bottom "
+                    f"{win_bottom} — scrolling {extra_px}px to bring into view",
+                    step="13",
+                )
+                ev = Quartz.CGEventCreateScrollWheelEvent(
+                    None, Quartz.kCGScrollEventUnitPixel, 1, -extra_px
+                )
+                Quartz.CGEventSetLocation(ev, Quartz.CGPointMake(scroll_cx, scroll_cy))
+                Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+                time.sleep(0.8)
+                # Adjust stored coordinates by the scroll amount (scroll moves rows up)
+                row_y -= extra_px
+                more_y -= extra_px
+
         row_cx = row_x + row_w // 2
         row_cy = row_y + row_h // 2
 
@@ -2075,12 +2418,11 @@ class PodcastsController:
         time.sleep(0.35)
 
         # Pre-click: AX scan to detect already-downloaded state (best-effort)
-        hover_state = self._check_hover_downloaded(row_y, row_h)
+        hover_state = self._check_hover_downloaded(row_y, row_h, dl_x, dl_y)
         self.logger.log(
             f"Episode {video_no}: hover state check → {hover_state}", step="13"
         )
         if hover_state == "already_downloaded":
-            # Move mouse away to clear hover, then skip click
             _mouse(Quartz.kCGEventMouseMoved, row_cx, row_cy - 150)
             return "already_downloaded"
 
@@ -2088,7 +2430,7 @@ class PodcastsController:
         _mouse(Quartz.kCGEventLeftMouseDown, dl_x, dl_y)
         time.sleep(0.1)
         _mouse(Quartz.kCGEventLeftMouseUp, dl_x, dl_y)
-        time.sleep(1.0)
+        time.sleep(1.2)
 
         # Safety net: if an unexpected delete/remove dialog appeared, cancel it
         dialog_result = self._dismiss_delete_dialog_if_unexpected()
@@ -2099,73 +2441,76 @@ class PodcastsController:
             )
             return "already_downloaded_popup_dismissed"
 
+        # Verify the download actually queued: move cursor away, re-hover, re-check state.
+        # If still "ready_to_download" the click missed — retry once with fallback coords.
+        _mouse(Quartz.kCGEventMouseMoved, row_cx, row_cy - 200)
+        time.sleep(1.0)
+        _mouse(Quartz.kCGEventMouseMoved, row_cx, row_cy)
+        time.sleep(0.7)
+        post_state = self._check_hover_downloaded(row_y, row_h, dl_x, dl_y)
+        self.logger.log(
+            f"Episode {video_no}: post-click state → {post_state}", step="13"
+        )
+        if post_state == "ready_to_download":
+            # Click missed — try once more at fallback position (right edge of row)
+            fallback_x = row_x + row_w - 65
+            fallback_y = row_cy
+            self.logger.log(
+                f"Episode {video_no}: retrying download click at fallback ({fallback_x},{fallback_y})",
+                step="13",
+            )
+            _mouse(Quartz.kCGEventMouseMoved, row_cx, row_cy)
+            time.sleep(0.5)
+            _mouse(Quartz.kCGEventLeftMouseDown, fallback_x, fallback_y)
+            time.sleep(0.1)
+            _mouse(Quartz.kCGEventLeftMouseUp, fallback_x, fallback_y)
+            time.sleep(1.2)
+            self._dismiss_delete_dialog_if_unexpected()
+
         return "download_clicked"
 
-    def _check_hover_downloaded(self, row_y: int, row_h: int) -> str:
-        """Shallow AX scan after hover to detect already-downloaded state.
+    def _check_hover_downloaded(self, row_y: int, row_h: int, dl_x: int = 0, dl_y: int = 0) -> str:
+        """Detect download button state after hover using direct AX position lookup.
 
-        Looks for a button with description 'Remove Download' within the
-        episode row's Y bounds.  Mac Catalyst AX is limited — treat 'unknown'
-        as safe to proceed (the post-click dialog guard is the safety net).
-        Returns: 'already_downloaded' | 'ready_to_download' | 'unknown'
+        Uses AXUIElementCopyElementAtPosition to directly query the AX element at the
+        download button coordinates — instant, no BFS traversal needed.
+        Returns: 'already_downloaded' | 'ready_to_download' | 'no_download_available' | 'unknown'
         """
-        script = f"""
-        tell application "System Events"
-            tell process "Podcasts"
-                if not (exists window 1) then return "unknown"
-                set rowMinY to {row_y - 5}
-                set rowMaxY to {row_y + row_h + 5}
-                set foundRemove to false
-                try
-                    repeat with g1 in groups of window 1
-                        if foundRemove then exit repeat
-                        try
-                            repeat with g2 in (every group of g1)
-                                if foundRemove then exit repeat
-                                try
-                                    repeat with btn in (every button of g2)
-                                        set bpos to position of btn
-                                        set bY to (item 2 of bpos) as integer
-                                        if bY >= rowMinY and bY <= rowMaxY then
-                                            set bd to ""
-                                            try
-                                                set bd to description of btn as string
-                                            end try
-                                            if bd contains "Remove Download" then
-                                                set foundRemove to true
-                                                exit repeat
-                                            end if
-                                        end if
-                                    end repeat
-                                end try
-                            end repeat
-                            repeat with btn in (every button of g1)
-                                set bpos to position of btn
-                                set bY to (item 2 of bpos) as integer
-                                if bY >= rowMinY and bY <= rowMaxY then
-                                    set bd to ""
-                                    try
-                                        set bd to description of btn as string
-                                    end try
-                                    if bd contains "Remove Download" then
-                                        set foundRemove to true
-                                        exit repeat
-                                    end if
-                                end if
-                            end repeat
-                        end try
-                    end repeat
-                end try
-                if foundRemove then return "already_downloaded"
-                return "ready_to_download"
-            end tell
-        end tell
-        """
-        try:
-            result = run_osascript(script, timeout=6, label="check hover downloaded state")
-            return result.strip()
-        except AutomationError:
-            return "unknown"
+        if dl_x > 0 and dl_y > 0:
+            try:
+                from ApplicationServices import (  # type: ignore[import]
+                    AXUIElementCreateApplication,
+                    AXUIElementCopyElementAtPosition,
+                    AXUIElementCopyAttributeValue,
+                    kAXDescriptionAttribute,
+                )
+                # Get Podcasts PID (fast osascript call, ~5ms)
+                pid_result = subprocess.run(
+                    ["osascript", "-e",
+                     "tell application \"System Events\"\nreturn unix id of process \"Podcasts\"\nend tell"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                pid = int(pid_result.stdout.strip())
+                app_ref = AXUIElementCreateApplication(pid)
+                err, elem = AXUIElementCopyElementAtPosition(app_ref, float(dl_x), float(dl_y), None)
+                if err == 0 and elem is not None:
+                    err2, desc = AXUIElementCopyAttributeValue(elem, kAXDescriptionAttribute, None)
+                    desc_str = str(desc) if (err2 == 0 and desc) else ""
+                    self.logger.log(
+                        f"AX@({dl_x},{dl_y}) err={err} desc='{desc_str[:60]}'", step="13"
+                    )
+                    if "Remove Download" in desc_str:
+                        return "already_downloaded"
+                    if "Download" in desc_str:
+                        return "ready_to_download"
+                # Element found but description unrecognised — treat as unknown so
+                # we still attempt the click (AXUIElementCopyElementAtPosition often
+                # returns the underlying episode-row button rather than the small
+                # hover-revealed download icon).
+                return "unknown"
+            except Exception:
+                pass  # fall through to unknown
+        return "unknown"
 
     def _dismiss_delete_dialog_if_unexpected(self) -> str:
         """Check for an unexpected remove/delete sheet after a download click.
@@ -2614,10 +2959,8 @@ class PodcastsController:
                 -- Content area begins past the sidebar (~180px from window left)
                 set contentLeft to wX + 180
                 set q to {window 1}
-                set deadline to (current date) + 14
-                repeat 800 times
+                repeat 3000 times
                     if (count of q) = 0 then exit repeat
-                    if (current date) > deadline then exit repeat
                     set elem to item 1 of q
                     if (count of q) > 1 then
                         set q to items 2 thru -1 of q
@@ -2636,12 +2979,18 @@ class PodcastsController:
                         set eW to (item 1 of eSz) as integer
                         set eH to (item 2 of eSz) as integer
                     end try
-                    -- Card criteria: in content area, right size, roughly square aspect ratio.
+                    -- Card criteria: in content area, reasonable size.
+                    -- Podcasts show cards are portrait-oriented (artwork + title + subtitle),
+                    -- typically 100–700 px wide and 150–800 px tall. No strict aspect-ratio
+                    -- filter — the card height can be up to 3× the width.
                     -- No class filter — Mac Catalyst exposes cards under various roles.
-                    if eX > contentLeft and eW >= 80 and eH >= 80 and eW <= 450 and eH <= 450 then
-                        -- Aspect ratio roughly square: W/H between 0.5 and 2
-                        if eW * 2 > eH and eW < eH * 2 then
-                            return "CARD:" & eX & "," & eY & "," & eW & "," & eH & "|WIN:" & wX & "," & wY & "," & wW & "," & wH
+                    if eX > contentLeft and eW >= 80 and eH >= 80 and eW <= 800 and eH <= 900 then
+                        -- Must not be a very thin strip (toolbar/separator) or near-full-width element
+                        if eW * 4 > eH and eH * 4 > eW then
+                            -- Exclude elements that span the full window width (containers, scroll areas)
+                            if eW < wW - 100 then
+                                return "CARD:" & eX & "," & eY & "," & eW & "," & eH & "|WIN:" & wX & "," & wY & "," & wW & "," & wH
+                            end if
                         end if
                     end if
                     try
@@ -2654,7 +3003,7 @@ class PodcastsController:
             end tell
         end tell
         """
-        out = run_osascript(script, timeout=22, label="find downloaded card frame")
+        out = run_osascript(script, timeout=90, label="find downloaded card frame")
         if out.startswith("ERROR:"):
             self.logger.log(f"_find_downloaded_card_frame: {out}", step="14")
             return None
@@ -3015,6 +3364,10 @@ class PodcastsController:
 
         removed: list[int] = []
         for video_no in sorted(set(video_nos)):
+            # Scroll to top before each BFS — episode list lazy-renders only the
+            # visible rows, so the row counter is relative to the current viewport.
+            self.scroll_to_top()
+            time.sleep(0.3)
             out = run_osascript(
                 self._episode_position_script(video_no),
                 timeout=90,
@@ -3075,7 +3428,8 @@ class PodcastsController:
             _mouse(Quartz.kCGEventLeftMouseDown, more_x, more_y)
             time.sleep(0.1)
             _mouse(Quartz.kCGEventLeftMouseUp, more_x, more_y)
-            time.sleep(0.7)
+            # Wait 1.2s for Mac Catalyst context menu to fully render before key nav
+            time.sleep(1.2)
 
             self.logger.log(
                 f"Cleanup episode {video_no}: clicked ⋯ at ({more_x},{more_y})", step="14"
@@ -3093,24 +3447,23 @@ class PodcastsController:
                 )
             else:
                 # Mac Catalyst ⋯ menus are not AX-accessible — keyboard nav fallback.
-                # Down×4 = 'Remove Download' (4th item in episode row context menu).
+                # Down×1 selects 'Remove Download' (first item when episode is downloaded).
+                # Enter activates it.  delay 0.3 between Down and Enter is required.
                 import subprocess as _sp
                 _sp.run(
                     ["osascript", "-e",
                      'tell application "System Events" to key code 125\n'
-                     'tell application "System Events" to key code 125\n'
-                     'tell application "System Events" to key code 125\n'
-                     'tell application "System Events" to key code 125\n'
+                     'delay 0.3\n'
                      'tell application "System Events" to key code 36'],
                     timeout=5, check=False,
                 )
                 self.logger.log(
-                    f"Cleanup episode {video_no}: keyboard Down×4+Enter used (AX menu not accessible)",
+                    f"Cleanup episode {video_no}: keyboard Down×1+Enter used (AX menu not accessible)",
                     step="14",
                 )
                 self.state.data["cleanup_fallback_keyboard_used"] = True
                 self.state.data.setdefault("cleanup_menu_method", {}).update(
-                    {str(video_no): "keyboard_fallback_down4_enter"}
+                    {str(video_no): "keyboard_fallback_down1_enter"}
                 )
 
             removed.append(video_no)
@@ -3570,6 +3923,110 @@ class PodcastsController:
             return "no_confirm_dialog"
         return f"remove_failed:{remove}"
 
+    def cleanup_all_from_downloads_tab(self) -> list[dict[str, Any]]:
+        """Remove all downloaded shows directly from the Downloads tab.
+
+        The Downloads tab displays show cards (artwork squares, roughly 80–450 px per
+        side).  Strategy: navigate to Downloaded, then loop:
+          1. Find the first show card via _find_downloaded_card_frame (BFS, card geometry).
+          2. Hover the card center to reveal the ⋯ button (bottom-right corner).
+          3. Click ⋯, wait 1.2s for the Mac Catalyst context menu.
+          4. Try AX click on 'Remove' / 'Delete' menu item; keyboard Down+Enter fallback.
+          5. If Podcasts shows a confirmation sheet, click Remove in it.
+          6. Re-navigate to Downloaded and repeat until no cards remain.
+        """
+        try:
+            import Quartz  # type: ignore[import]
+        except ImportError:
+            return [{"iteration": 0, "result": "quartz_unavailable"}]
+
+        def _mouse(kind: int, x: int, y: int) -> None:
+            pt = Quartz.CGPointMake(x, y)
+            ev = Quartz.CGEventCreateMouseEvent(None, kind, pt, Quartz.kCGMouseButtonLeft)
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+            time.sleep(0.05)
+
+        results: list[dict[str, Any]] = []
+        for iteration in range(50):
+            # Re-navigate each iteration — card removal may shift view focus
+            nav = self.navigate_to_downloaded_tab()
+            if nav != "navigated":
+                self.logger.log(f"Downloads cleanup: nav failed ({nav})", step="14")
+                results.append({"iteration": iteration + 1, "result": f"nav_failed:{nav}"})
+                break
+            time.sleep(1.5)
+
+            frame = self._find_downloaded_card_frame()
+            if frame is None:
+                # Retry once with extra wait (card might still be rendering)
+                time.sleep(3.0)
+                frame = self._find_downloaded_card_frame()
+            if frame is None:
+                self.logger.log(
+                    f"Downloads cleanup: no more show cards after {iteration} removal(s)",
+                    step="14",
+                )
+                results.append({"iteration": iteration + 1, "result": "done"})
+                break
+
+            card_x, card_y, card_w, card_h = frame
+            card_cx = card_x + card_w // 2
+            card_cy = card_y + card_h // 2
+
+            self.logger.log(
+                f"Downloads cleanup card {iteration + 1}: ({card_x},{card_y},{card_w},{card_h})",
+                step="14",
+            )
+
+            # Right-click at card center — opens the same context menu as ⋯ click
+            # and avoids the need to locate the hover-revealed ⋯ button pixel position.
+            pt = Quartz.CGPointMake(card_cx, card_cy)
+            ev = Quartz.CGEventCreateMouseEvent(
+                None, Quartz.kCGEventRightMouseDown, pt, Quartz.kCGMouseButtonRight
+            )
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+            time.sleep(0.05)
+            ev = Quartz.CGEventCreateMouseEvent(
+                None, Quartz.kCGEventRightMouseUp, pt, Quartz.kCGMouseButtonRight
+            )
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+            time.sleep(1.2)  # Mac Catalyst context menu render time
+
+            # AX click ('Remove from Library' contains 'Remove' → matched if accessible)
+            ax_ok = self._click_remove_menu_item_ax()
+            if not ax_ok:
+                # Keyboard fallback: menu order is Go to Show (1), Mark Played (2),
+                # Remove from Library (3). Down×3 + Enter selects the third item.
+                subprocess.run(
+                    ["osascript", "-e",
+                     'tell application "System Events" to key code 125\n'
+                     'delay 0.3\n'
+                     'tell application "System Events" to key code 125\n'
+                     'delay 0.3\n'
+                     'tell application "System Events" to key code 125\n'
+                     'delay 0.3\n'
+                     'tell application "System Events" to key code 36'],
+                    timeout=8, check=False,
+                )
+
+            # Wait for confirmation sheet — Podcasts shows "Remove all episodes…?" after
+            # "Remove from Library" is activated. Give it time to render.
+            time.sleep(1.5)
+            confirm = self._click_confirmation_remove()
+
+            method = "ax" if ax_ok else "keyboard"
+            result_label = f"removed:{method}"
+            if confirm not in ("no_sheet",):
+                result_label += f"+confirmed:{confirm}"
+
+            self.logger.log(
+                f"Downloads cleanup card {iteration + 1}: {result_label}", step="14"
+            )
+            results.append({"iteration": iteration + 1, "result": result_label})
+            time.sleep(1.5)
+
+        return results
+
     def quit_app(self) -> None:
         if HAS_PYXA:
             try:
@@ -3604,6 +4061,32 @@ class Orchestrator:
             )
             self.logger.log(f"Loaded runtime state: {self.state.path}", step="03",
                             completed_cycles=self.state.data["completed_cycles"])
+
+            # If every cycle in the current config is already marked complete, the
+            # previous run finished normally — this is a fresh re-run, not a resume.
+            # Reset run-specific fields so cycles execute again.
+            # Preserve VPN discovery and rotation history across runs.
+            all_expected = set(range(1, self.config.repeat + 1))
+            already_done = set(self.state.data.get("completed_cycles", []))
+            if all_expected and all_expected.issubset(already_done):
+                self.logger.log(
+                    f"All {self.config.repeat} cycle(s) were completed in a previous run — "
+                    f"resetting state for fresh run",
+                    step="03", status="state_reset_for_fresh_run",
+                )
+                for _key in (
+                    "completed_cycles", "cycle_phases", "processed_shows",
+                    "podcast_task_results", "download_check_results", "cleanup_results",
+                    "see_all_state", "vpn_sessions", "chrome_tabs_cache",
+                ):
+                    self.state.data[_key] = [] if isinstance(
+                        self.state.data.get(_key), list) else {}
+                self.state.data.update(
+                    current_cycle=None, current_tab=None, current_video=None,
+                    last_failed_step=None, last_error=None, resume_available=False,
+                )
+                self.state.save()
+
             self.run_preflight()  # comprehensive: platform, apps, AX, dirs, Chrome tab count
 
             tabs_cache = self.state.data.get("chrome_tabs_cache", {})
@@ -3980,25 +4463,17 @@ class Orchestrator:
     def _startup_cleanup(self) -> None:
         """Remove stale downloaded items before the first cycle begins.
 
-        Called only when clean_start=True in tasks.json.  Checks the Downloaded
-        tab for leftover items from a previous failed run and removes them.
+        Called only when clean_start=True in tasks.json.
         """
-        self.logger.log("clean_start: checking Downloaded tab for stale items", step="00")
+        self.logger.log("clean_start: checking Downloads tab for stale items", step="00")
         try:
             self.podcasts.activate()
             self.podcasts.wait_for_window()
-            nav = self.podcasts.navigate_to_downloaded_tab()
-            if nav != "navigated":
-                self.logger.log(f"clean_start: Downloaded nav failed ({nav})", step="00")
-                return
-            time.sleep(2)
-            frame = self.podcasts._find_downloaded_card_frame()
-            if frame is None:
-                self.logger.log("clean_start: no stale items found", step="00")
-                return
-            self.logger.log("clean_start: stale items found — cleaning up", step="00")
-            results = self.podcasts.cleanup_all_downloaded()
-            self.logger.log(f"clean_start cleanup done: {len(results)} actions", step="00")
+            results = self.podcasts.cleanup_all_from_downloads_tab()
+            removed = sum(1 for r in results if "removed" in r.get("result", ""))
+            self.logger.log(
+                f"clean_start cleanup done: {removed} episode(s) removed", step="00"
+            )
         except Exception as exc:
             self.logger.log(f"clean_start cleanup error (non-fatal): {exc}", step="00")
 
@@ -4006,13 +4481,9 @@ class Orchestrator:
         self.state.mark_phase(cycle, "cleanup_started")
         self.podcasts.activate()
         self.podcasts.wait_for_window()
+        self.logger.log("Cleanup phase start", step="14", cycle=cycle)
 
-        mode = self.config.cleanup_mode
-        self.logger.log(
-            f"Cleanup phase start (mode={mode})", step="14", cycle=cycle, cleanup_mode=mode,
-        )
-
-        # Wait for all downloads to complete before removing anything.
+        # Wait for all in-progress downloads to finish before removing anything.
         dl_status = self.podcasts.wait_for_downloads_stable(timeout=180)
         self.logger.log(
             f"Download wait: {dl_status} "
@@ -4022,57 +4493,18 @@ class Orchestrator:
         )
         self.state.mark_phase(cycle, "downloads_stable")
 
-        # Collect full show info from this cycle's processed_shows for targeted cleanup.
-        cycle_shows: list[dict[str, Any]] = self.state.data.get("processed_shows", {}).get(str(cycle), [])
-        valid_shows = [
-            s for s in cycle_shows
-            if s.get("show_name") and s["show_name"] != "unknown_show" and s.get("url")
-        ]
-
-        if mode == "remove_from_library":
-            # Hard-clean mode: navigate to Downloaded tab, find the show card, and
-            # use "Remove from Library".  Removes the local file AND the library entry.
-            # WARNING: the show card disappears from the library, so the next cycle
-            # cannot rely on the show being visible without re-following it.
-            self.logger.log(
-                "Cleanup mode=remove_from_library: using Downloaded-tab card approach",
-                step="14", cycle=cycle,
-            )
-            if valid_shows:
-                show_names = [s["show_name"] for s in valid_shows]
-                self.logger.log(f"Cleanup: targeting shows: {show_names}", step="14", cycle=cycle)
-                results = self.podcasts.cleanup_by_show_names(show_names)
-            else:
-                self.logger.log(
-                    "Cleanup: no show info in state — using generic card cleanup", step="14", cycle=cycle,
-                )
-                results = self.podcasts.cleanup_all_downloaded()
-        else:
-            # Default mode (remove_download): navigate to each show's episode list
-            # and click Remove Download via the row ⋯ menu.  Removes only the local
-            # cached file; the show stays in the library so the next cycle can
-            # download the same episode again cleanly.
-            self.logger.log(
-                "Cleanup mode=remove_download: using episode-list row ⋯ approach",
-                step="14", cycle=cycle,
-            )
-            if valid_shows:
-                show_names = [s["show_name"] for s in valid_shows]
-                self.logger.log(f"Cleanup: targeting shows: {show_names}", step="14", cycle=cycle)
-                results = self.podcasts.cleanup_by_show_info(valid_shows)
-            else:
-                self.logger.log(
-                    "Cleanup: no show info in state — using generic card cleanup", step="14", cycle=cycle,
-                )
-                results = self.podcasts.cleanup_all_downloaded()
+        # Remove every downloaded episode from the Downloads tab.
+        # No show-name tracking needed — just clear whatever is there.
+        results = self.podcasts.cleanup_all_from_downloads_tab()
 
         for r in results:
             self.state.add_cleanup_result(cycle=cycle, **r)
 
+        removed = sum(1 for r in results if "removed" in r.get("result", ""))
         self.state.mark_phase(cycle, "cleanup_completed")
         self.logger.log(
-            f"Cleanup finished: {len(results)} actions (mode={mode})", step="14",
-            action_count=len(results), cleanup_mode=mode,
+            f"Cleanup finished: {removed} episode(s) removed ({len(results)} actions)",
+            step="14", cycle=cycle, action_count=len(results), removed_count=removed,
         )
 
 
