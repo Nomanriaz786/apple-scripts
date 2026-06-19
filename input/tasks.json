@@ -1,5 +1,5 @@
 {
-  "repeat": 3,
+  "repeat": 1,
   "vpn": {
     "enabled": true,
     "app": "ProtonVPN",

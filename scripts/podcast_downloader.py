@@ -876,7 +876,7 @@ class VPNController:
             time.sleep(0.5)
             _dkey(0x09, True,  Quartz.kCGEventFlagMaskCommand)   # Cmd+V
             _dkey(0x09, False, Quartz.kCGEventFlagMaskCommand)
-            time.sleep(3.0)
+            time.sleep(1.5)
             self.logger.log(f"Discovery: search filter pasted '{location}'", step="06")
         finally:
             subprocess.run(["pbcopy"], input=old_clip, check=False)
@@ -972,7 +972,7 @@ class VPNController:
         if not is_expanded:
             _dmouse(Quartz.kCGEventLeftMouseDown, expand_x, expand_y)
             _dmouse(Quartz.kCGEventLeftMouseUp,   expand_x, expand_y)
-            time.sleep(1.5)
+            time.sleep(0.8)
 
         # ── Count server rows ─────────────────────────────────────────────────
         # Primary: AX row count (fast on the *filtered* table, ~50-100 rows max).
@@ -1234,7 +1234,7 @@ class VPNController:
             # Cmd+V to paste the location string.
             _key(0x09, True,  Quartz.kCGEventFlagMaskCommand)   # Cmd+V down
             _key(0x09, False, Quartz.kCGEventFlagMaskCommand)   # Cmd+V up
-            time.sleep(3.0)  # wait for ProtonVPN to apply the filter
+            time.sleep(1.5)  # wait for ProtonVPN to apply the filter
 
             self.logger.log(f"Search filter pasted: '{location}'", step="06")
         finally:
@@ -1400,17 +1400,17 @@ class VPNController:
             if not is_expanded_px:
                 _mouse(Quartz.kCGEventLeftMouseDown, expand_x, expand_y)
                 _mouse(Quartz.kCGEventLeftMouseUp,   expand_x, expand_y)
-                time.sleep(1.5)
+                time.sleep(0.8)
             else:
                 self.logger.log("Server list already expanded (pixel) — skipping expand click", step="06")
 
         hover_x = w_x + w_w // 2
         _mouse(Quartz.kCGEventMouseMoved, hover_x, server_y)
-        time.sleep(0.5)
+        time.sleep(0.3)
         for x in range(hover_x + 20, connect_x, 20):
             _mouse(Quartz.kCGEventMouseMoved, x, server_y)
         _mouse(Quartz.kCGEventMouseMoved, connect_x, server_y)
-        time.sleep(0.6)
+        time.sleep(0.4)
 
         _mouse(Quartz.kCGEventLeftMouseDown, connect_x, server_y)
         time.sleep(0.1)
@@ -2040,11 +2040,11 @@ class PodcastsController:
         end attemptClick
 
         tell application "Podcasts" to activate
-        delay 8.0
+        delay 1.5
         tell application "System Events"
             tell process "Podcasts"
                 set frontmost to true
-                delay 0.5
+                delay 0.3
                 if not (exists window 1) then return "no_window"
 
                 -- Retry for up to __BUDGET__ seconds; Podcasts can take 15-30 s to render
@@ -2057,11 +2057,11 @@ class PodcastsController:
                     if elem is not missing value then
                         set clickResult to my attemptClick(elem)
                         if clickResult is "click_failed" then return "see_all_click_failed"
-                        delay 0.9
+                        delay 0.4
                         return "clicked"
                     end if
                     if (current date) > deadline then return "see_all_not_found"
-                    delay 1.5
+                    delay 0.5
                 end repeat
             end tell
         end tell
@@ -2141,7 +2141,10 @@ class PodcastsController:
             end tell
         end tell
         """
-        run_osascript(script, timeout=5, label="scroll to top")
+        try:
+            run_osascript(script, timeout=5, label="scroll to top")
+        except AutomationError:
+            pass  # non-fatal — window may not be focused
 
     def download_episode_row(self, video_no: int) -> str:
         """Click the download (↓) button for the Nth episode.
@@ -2317,7 +2320,7 @@ class PodcastsController:
                     )
                     _Q.CGEventSetLocation(ev, _Q.CGPointMake(scroll_cx, scroll_cy))
                     _Q.CGEventPost(_Q.kCGHIDEventTap, ev)
-                    time.sleep(1.0)
+                    time.sleep(0.5)
                     adjusted_target = video_no - total_skipped
                     adj_script = script.replace(
                         f"set targetN to {video_no}",
@@ -2419,7 +2422,7 @@ class PodcastsController:
                 )
                 Quartz.CGEventSetLocation(ev, Quartz.CGPointMake(scroll_cx, scroll_cy))
                 Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
-                time.sleep(0.8)
+                time.sleep(0.4)
                 # Adjust stored coordinates by the scroll amount (scroll moves rows up)
                 row_y -= extra_px
                 more_y -= extra_px
@@ -2445,11 +2448,11 @@ class PodcastsController:
 
         # Hover over row center to trigger the hover state (shows download icon)
         _mouse(Quartz.kCGEventMouseMoved, row_cx, row_cy)
-        time.sleep(0.6)
+        time.sleep(0.3)
 
         # Move cursor to the download button position and wait for icons to render
         _mouse(Quartz.kCGEventMouseMoved, dl_x, dl_y)
-        time.sleep(0.35)
+        time.sleep(0.2)
 
         # Pre-click: AX scan to detect already-downloaded state (best-effort)
         hover_state = self._check_hover_downloaded(row_y, row_h, dl_x, dl_y)
@@ -2464,7 +2467,7 @@ class PodcastsController:
         _mouse(Quartz.kCGEventLeftMouseDown, dl_x, dl_y)
         time.sleep(0.1)
         _mouse(Quartz.kCGEventLeftMouseUp, dl_x, dl_y)
-        time.sleep(1.2)
+        time.sleep(0.7)
 
         # Safety net: if an unexpected delete/remove dialog appeared, cancel it
         dialog_result = self._dismiss_delete_dialog_if_unexpected()
@@ -2474,32 +2477,6 @@ class PodcastsController:
                 step="13",
             )
             return "already_downloaded_popup_dismissed"
-
-        # Verify the download actually queued: move cursor away, re-hover, re-check state.
-        # If still "ready_to_download" the click missed — retry once with fallback coords.
-        _mouse(Quartz.kCGEventMouseMoved, row_cx, row_cy - 200)
-        time.sleep(1.0)
-        _mouse(Quartz.kCGEventMouseMoved, row_cx, row_cy)
-        time.sleep(0.7)
-        post_state = self._check_hover_downloaded(row_y, row_h, dl_x, dl_y)
-        self.logger.log(
-            f"Episode {video_no}: post-click state → {post_state}", step="13"
-        )
-        if post_state == "ready_to_download":
-            # Click missed — try once more at fallback position (right edge of row)
-            fallback_x = row_x + row_w - 65
-            fallback_y = row_cy
-            self.logger.log(
-                f"Episode {video_no}: retrying download click at fallback ({fallback_x},{fallback_y})",
-                step="13",
-            )
-            _mouse(Quartz.kCGEventMouseMoved, row_cx, row_cy)
-            time.sleep(0.5)
-            _mouse(Quartz.kCGEventLeftMouseDown, fallback_x, fallback_y)
-            time.sleep(0.1)
-            _mouse(Quartz.kCGEventLeftMouseUp, fallback_x, fallback_y)
-            time.sleep(1.2)
-            self._dismiss_delete_dialog_if_unexpected()
 
         return "download_clicked"
 
@@ -2764,22 +2741,22 @@ class PodcastsController:
 
         # Hover at row center to trigger hover state, then move to ⋯ and click
         _mouse(Quartz.kCGEventMouseMoved, row_cx, row_cy)
-        time.sleep(0.6)
-        _mouse(Quartz.kCGEventMouseMoved, more_x, more_y)
         time.sleep(0.3)
+        _mouse(Quartz.kCGEventMouseMoved, more_x, more_y)
+        time.sleep(0.2)
         _mouse(Quartz.kCGEventLeftMouseDown, more_x, more_y)
         time.sleep(0.1)
         _mouse(Quartz.kCGEventLeftMouseUp, more_x, more_y)
-        time.sleep(1.5)
+        time.sleep(0.8)
 
         ss = self._take_screenshot("cleanup_context_menu")
         self.logger.log(f"⋯ clicked, screenshot: {ss}", step="14")
 
         # Down×1+Enter → "Remove Download" (first item in episode ⋯ menu)
         _key(0x7D, True); _key(0x7D, False)
-        time.sleep(0.3)
+        time.sleep(0.2)
         _key(0x24, True); _key(0x24, False)
-        time.sleep(1.5)
+        time.sleep(0.8)
 
         ss = self._take_screenshot("cleanup_after_enter")
         self.logger.log(f"Down×1+Enter done, screenshot: {ss}", step="14")
@@ -2881,7 +2858,7 @@ class PodcastsController:
         _mouse(Quartz.kCGEventLeftMouseDown, cx, cy)
         time.sleep(0.1)
         _mouse(Quartz.kCGEventLeftMouseUp, cx, cy)
-        time.sleep(1.5)
+        time.sleep(0.8)
 
         self.logger.log(f"Clicked Downloaded sidebar at ({cx},{cy})", step="14")
         return "navigated"
@@ -3085,123 +3062,186 @@ class PodcastsController:
         )
         return None
 
-    def wait_for_downloads_stable(self, timeout: int = 180) -> str:
-        """Wait for all downloads to finish before cleanup starts.
+    def _find_downloading_button(self) -> tuple[int, int] | None:
+        """BFS the Podcasts window for an element with 'Downloading' in its description.
 
-        Strategy (in order):
-          1. Navigate to Downloaded tab.
-          2. Probe for AXProgressIndicator or 'Downloading' text over a 30s window
-             (6 probes × 5s). This catches downloads that register slowly.
-          3. If neither detector fires after 30s, use a 120s fallback and mark
-             state as 'stable_unknown' so cleanup proceeds with a warning.
-          4. If active downloads are found, poll every 5s until they finish.
-
-        Returns one of: 'completed' | 'in_progress_polled' | 'stable_unknown' | 'timeout'.
-        State fields written: download_state, download_wait_seconds, can_cleanup.
+        Returns (cx, cy) pixel center if found, else None.
+        Matches elements > 50px wide so we skip tiny labels.
         """
-        nav = self.navigate_to_downloaded_tab()
-        if nav not in ("navigated",):
-            self.logger.log(f"wait_for_downloads: nav failed ({nav}) — fallback 120s", step="14")
-            time.sleep(120)
-            self.state.data["download_state"] = "stable_unknown"
-            self.state.data["download_wait_seconds"] = 120
-            self.state.data["can_cleanup"] = True
-            self.state.save()
-            return "stable_unknown"
-
-        progress_check_script = """
+        script = """
+        tell application "System Events"
+            set frontmost of process "Podcasts" to true
+        end tell
+        delay 0.1
         tell application "System Events"
             tell process "Podcasts"
-                if not (exists window 1) then return "0"
-                set cnt to 0
-                try
-                    set cnt to count (every UI element of entire contents of window 1 whose role is "AXProgressIndicator")
-                end try
-                return cnt as text
+                if not (exists window 1) then return "not_found"
+                set q to {window 1}
+                set deadline to (current date) + 3
+                repeat 800 times
+                    if (count of q) = 0 then exit repeat
+                    if (current date) > deadline then exit repeat
+                    set elem to item 1 of q
+                    if (count of q) > 1 then
+                        set q to items 2 thru -1 of q
+                    else
+                        set q to {}
+                    end if
+                    -- Check description, title, and value for "Downloading" text
+                    set matchFound to false
+                    set lbl to ""
+                    repeat with attr in {"description", "title", "value"}
+                        try
+                            if attr is "description" then
+                                set lbl to description of elem as string
+                            else if attr is "title" then
+                                set lbl to title of elem as string
+                            else
+                                set lbl to value of elem as string
+                            end if
+                        end try
+                        if lbl contains "Downloading" and lbl does not contain "Downloaded" then
+                            set matchFound to true
+                            exit repeat
+                        end if
+                    end repeat
+                    if matchFound then
+                        set sz to {0, 0}
+                        try
+                            set sz to size of elem
+                        end try
+                        if (item 1 of sz) > 50 then
+                            set pos to {0, 0}
+                            try
+                                set pos to position of elem
+                            end try
+                            set cx to ((item 1 of pos) + (item 1 of sz) / 2) as integer
+                            set cy to ((item 2 of pos) + (item 2 of sz) / 2) as integer
+                            return "CENTER:" & cx & "," & cy
+                        end if
+                    end if
+                    try
+                        repeat with ch in UI elements of elem
+                            set end of q to ch
+                        end repeat
+                    end try
+                end repeat
+                return "not_found"
             end tell
         end tell
         """
+        out = run_osascript(script, timeout=8, label="find Downloading button")
+        if not out.startswith("CENTER:"):
+            return None
+        try:
+            cx, cy = (int(v) for v in out.replace("CENTER:", "").split(","))
+            return (cx, cy)
+        except ValueError:
+            return None
 
-        def _has_progress_indicators() -> bool:
-            try:
-                out = run_osascript(progress_check_script, timeout=10, label="progress indicator check")
-                return int(out.strip()) > 0
-            except (AutomationError, ValueError):
-                return False
+    def wait_for_downloads_stable(self, timeout: int = 180) -> str:
+        """Wait for all downloads to finish by monitoring Podcasts' Downloading indicator.
 
-        def _has_text_in_progress() -> bool:
-            try:
-                s = self.check_downloads_state()
-                return s.get("status") == "downloads_in_progress"
-            except Exception:
-                return False
-
+        Strategy:
+          1. Navigate to the Downloaded tab where the 'Downloading' progress section
+             appears at the top of the page when downloads are active.
+          2. Probe up to 10s (5 × 2s) for a 'Downloading' element to appear.
+          3. If found: click it (opens the progress view) then poll every 3s until
+             the element disappears — Podcasts auto-closes the view when all done.
+          4. After the indicator clears (or was never seen): wait 5s then proceed.
+          5. Returns 'completed' | 'completed_fast' | 'timeout'.
+        """
         t_start = time.time()
+        pos: tuple[int, int] | None = None
 
-        # Probe for up to 30s (6 probes × 5s) — downloads can take several seconds
-        # to register in the Downloaded tab after the click.
-        active_found = False
-        for probe in range(6):
-            time.sleep(5)
-            if _has_progress_indicators() or _has_text_in_progress():
-                active_found = True
+        # Navigate to the Downloaded tab — the 'Downloading' section is at the top.
+        nav = self.navigate_to_downloaded_tab()
+        self.logger.log(f"Download wait: navigated to Downloaded tab ({nav})", step="14")
+
+        # Two-pass probe: check at ~3s then ~11s after nav.
+        # If the Downloading button appears, it means episodes are still in flight.
+        # If it never appears, downloads finished before/during nav (fast connection).
+        for attempt, delay in enumerate((3, 8)):
+            time.sleep(delay)
+            pos = self._find_downloading_button()
+            if pos is not None:
                 break
             elapsed = int(time.time() - t_start)
             self.logger.log(
-                f"Download probe {probe + 1}/6: no indicators yet ({elapsed}s elapsed)",
+                f"Download queue check {attempt + 1}/2: not visible yet ({elapsed}s)",
                 step="14",
             )
 
-        initial_progress = _has_progress_indicators() if active_found else False
-        initial_text = _has_text_in_progress() if (active_found and not initial_progress) else active_found
-
-        if not active_found:
-            # No indicators detected after 30s — download may be already complete
-            # or failed silently.  Use 120s fallback and proceed with cleanup warning.
+        if pos is None:
+            # Downloading indicator never appeared — downloads finished quickly.
             self.logger.log(
-                "Download state: no active indicators after 30s — waiting 120s (stable_unknown)",
-                step="14", download_state="stable_unknown",
+                "Downloading button not found — downloads likely done",
+                step="14",
             )
-            time.sleep(120)
-            waited = int(time.time() - t_start)
-            self.state.data["download_state"] = "stable_unknown"
-            self.state.data["download_wait_seconds"] = waited
-            self.state.data["can_cleanup"] = True
-            self.state.save()
-            return "stable_unknown"
-
-        # Active downloads detected — poll every 5s until they finish or timeout
-        self.logger.log(
-            f"Downloads active (progress_indicators={initial_progress}, text={initial_text})"
-            f" — polling up to {timeout}s",
-            step="14", download_state="in_progress",
-        )
-        deadline = time.time() + timeout
-        poll_interval = 5
-        while time.time() < deadline:
-            time.sleep(poll_interval)
-            still_going = _has_progress_indicators() or _has_text_in_progress()
+            time.sleep(5)
             elapsed = int(time.time() - t_start)
-            self.logger.log(
-                f"Download poll: active={still_going} elapsed={elapsed}s", step="14",
-            )
-            if not still_going:
-                self.state.data["download_state"] = "completed"
-                self.state.data["download_wait_seconds"] = elapsed
-                self.state.data["can_cleanup"] = True
+            self.state.data.update({
+                "download_state": "completed_fast",
+                "download_wait_seconds": elapsed,
+                "can_cleanup": True,
+            })
+            self.state.save()
+            return "completed_fast"
+
+        # Found the Downloading button — click it to open the progress view.
+        try:
+            import Quartz  # type: ignore[import]
+            cx, cy = pos
+
+            def _mouse(kind, x, y):
+                pt = Quartz.CGPointMake(x, y)
+                ev = Quartz.CGEventCreateMouseEvent(None, kind, pt, Quartz.kCGMouseButtonLeft)
+                Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+                time.sleep(0.05)
+
+            _mouse(Quartz.kCGEventMouseMoved, cx, cy)
+            time.sleep(0.2)
+            _mouse(Quartz.kCGEventLeftMouseDown, cx, cy)
+            time.sleep(0.1)
+            _mouse(Quartz.kCGEventLeftMouseUp, cx, cy)
+            time.sleep(0.5)
+            self.logger.log(f"Clicked Downloading progress button at ({cx},{cy})", step="14")
+        except Exception as exc:
+            self.logger.log(f"Downloading button click failed: {exc}", step="14")
+
+        # Poll until the Downloading indicator disappears (all done) or timeout.
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            time.sleep(2)
+            elapsed = int(time.time() - t_start)
+            still_active = self._find_downloading_button() is not None
+            self.logger.log(f"Downloads in progress ({elapsed}s)", step="14")
+            if not still_active:
+                time.sleep(5)
+                elapsed = int(time.time() - t_start)
+                self.logger.log(
+                    f"Downloads complete after {elapsed}s",
+                    step="14", download_state="completed", download_wait_seconds=elapsed,
+                )
+                self.state.data.update({
+                    "download_state": "completed",
+                    "download_wait_seconds": elapsed,
+                    "can_cleanup": True,
+                })
                 self.state.save()
-                self.logger.log(f"Downloads completed after {elapsed}s", step="14",
-                                download_state="completed", download_wait_seconds=elapsed)
                 return "completed"
 
         elapsed = int(time.time() - t_start)
         self.logger.log(
-            f"Download wait timed out after {elapsed}s — proceeding with cleanup anyway",
+            f"Download wait timed out after {elapsed}s — proceeding anyway",
             step="14", download_state="timeout", download_wait_seconds=elapsed,
         )
-        self.state.data["download_state"] = "timeout"
-        self.state.data["download_wait_seconds"] = elapsed
-        self.state.data["can_cleanup"] = True
+        time.sleep(5)
+        self.state.data.update({
+            "download_state": "timeout",
+            "download_wait_seconds": elapsed,
+            "can_cleanup": True,
+        })
         self.state.save()
         return "timeout"
 
@@ -3254,13 +3294,13 @@ class PodcastsController:
         )
 
         _mouse(Quartz.kCGEventMouseMoved, card_cx, card_cy)
-        time.sleep(0.8)
-        _mouse(Quartz.kCGEventMouseMoved, three_dots_x, three_dots_y)
         time.sleep(0.4)
+        _mouse(Quartz.kCGEventMouseMoved, three_dots_x, three_dots_y)
+        time.sleep(0.2)
         _mouse(Quartz.kCGEventLeftMouseDown, three_dots_x, three_dots_y)
         time.sleep(0.1)
         _mouse(Quartz.kCGEventLeftMouseUp, three_dots_x, three_dots_y)
-        time.sleep(1.5)
+        time.sleep(0.8)
 
         return "three_dots_clicked"
 
@@ -3375,15 +3415,14 @@ class PodcastsController:
         self.open_url(show_url)
         self.activate()
         self.wait_for_window()
-        # 15s: ProtonVPN kill-switch leaves no default route; Podcasts needs extra
-        # time to load episode metadata through the VPN tunnel on cycle 2+.
-        time.sleep(15)
+        # Give Podcasts time to load episode metadata through the VPN tunnel.
+        time.sleep(5)
 
         see_all_status = self.click_see_all()
         if see_all_status in ("error", "see_all_not_found"):
             return f"see_all_failed:{see_all_status}"
         self.scroll_to_top()
-        time.sleep(1.0)
+        time.sleep(0.5)
 
         try:
             import Quartz  # type: ignore[import]
@@ -3462,8 +3501,8 @@ class PodcastsController:
             _mouse(Quartz.kCGEventLeftMouseDown, more_x, more_y)
             time.sleep(0.1)
             _mouse(Quartz.kCGEventLeftMouseUp, more_x, more_y)
-            # Wait 1.2s for Mac Catalyst context menu to fully render before key nav
-            time.sleep(1.2)
+            # Wait for Mac Catalyst context menu to render before key nav
+            time.sleep(0.8)
 
             self.logger.log(
                 f"Cleanup episode {video_no}: clicked ⋯ at ({more_x},{more_y})", step="14"
@@ -3501,7 +3540,7 @@ class PodcastsController:
                 )
 
             removed.append(video_no)
-            time.sleep(1.2)
+            time.sleep(0.6)
 
         if not removed:
             return "no_episodes_removed"
@@ -3681,13 +3720,13 @@ class PodcastsController:
             step="14",
         )
         _mouse(Quartz.kCGEventMouseMoved, card_cx, card_cy)
-        time.sleep(0.8)
-        _mouse(Quartz.kCGEventMouseMoved, three_dots_x, three_dots_y)
         time.sleep(0.4)
+        _mouse(Quartz.kCGEventMouseMoved, three_dots_x, three_dots_y)
+        time.sleep(0.2)
         _mouse(Quartz.kCGEventLeftMouseDown, three_dots_x, three_dots_y)
         time.sleep(0.1)
         _mouse(Quartz.kCGEventLeftMouseUp, three_dots_x, three_dots_y)
-        time.sleep(1.5)
+        time.sleep(0.8)
 
         # ── AX menu item 'Remove' first ───────────────────────────────────────
         remove_by_ax = self._click_remove_menu_item_ax()
@@ -3703,13 +3742,13 @@ class PodcastsController:
             self.state.save()
             for _ in range(3):
                 _key(0x7D, True); _key(0x7D, False)
-                time.sleep(0.3)
+                time.sleep(0.2)
             _key(0x24, True); _key(0x24, False)
-            time.sleep(1.5)
+            time.sleep(0.8)
 
         # ── Confirmation sheet ────────────────────────────────────────────────
         remove = self._click_confirmation_remove()
-        time.sleep(1.0)
+        time.sleep(0.5)
         self.logger.log(f"Confirmation sheet: {remove}", step="14")
 
         if "clicked" in remove:
@@ -3934,7 +3973,7 @@ class PodcastsController:
         _mouse(Quartz.kCGEventLeftMouseDown, three_dots_x, three_dots_y)
         time.sleep(0.1)
         _mouse(Quartz.kCGEventLeftMouseUp, three_dots_x, three_dots_y)
-        time.sleep(1.5)
+        time.sleep(0.8)
 
         remove_by_ax = self._click_remove_menu_item_ax()
         if not remove_by_ax:
@@ -3944,12 +3983,12 @@ class PodcastsController:
             self.state.save()
             for _ in range(3):
                 _key(0x7D, True); _key(0x7D, False)
-                time.sleep(0.3)
+                time.sleep(0.2)
             _key(0x24, True); _key(0x24, False)
-            time.sleep(1.5)
+            time.sleep(0.8)
 
         remove = self._click_confirmation_remove()
-        time.sleep(1.0)
+        time.sleep(0.5)
 
         if "clicked" in remove:
             return "removed"
@@ -3988,12 +4027,12 @@ class PodcastsController:
                 self.logger.log(f"Downloads cleanup: nav failed ({nav})", step="14")
                 results.append({"iteration": iteration + 1, "result": f"nav_failed:{nav}"})
                 break
-            time.sleep(1.5)
+            time.sleep(0.8)
 
             frame = self._find_downloaded_card_frame()
             if frame is None:
                 # Retry once with extra wait (card might still be rendering)
-                time.sleep(3.0)
+                time.sleep(1.5)
                 frame = self._find_downloaded_card_frame()
             if frame is None:
                 self.logger.log(
@@ -4024,7 +4063,7 @@ class PodcastsController:
                 None, Quartz.kCGEventRightMouseUp, pt, Quartz.kCGMouseButtonRight
             )
             Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
-            time.sleep(1.2)  # Mac Catalyst context menu render time
+            time.sleep(0.8)  # Mac Catalyst context menu render time
 
             # AX click ('Remove from Library' contains 'Remove' → matched if accessible)
             ax_ok = self._click_remove_menu_item_ax()
@@ -4398,7 +4437,7 @@ class Orchestrator:
         self.podcasts.open_url(podcast_url)
         self.podcasts.activate()
         self.podcasts.wait_for_window()
-        time.sleep(10)
+        time.sleep(3)
         self.logger.log("Podcasts page loaded", step="10")
 
         # Capture show name for state-driven cleanup.
@@ -4442,7 +4481,7 @@ class Orchestrator:
         self.logger.log(f"See All {see_all_result}", step="11", status=see_all_result)
         self.state.data.setdefault("see_all_state", {})[str(tab_task.tab)] = see_all_result
         self.state.save()
-        if see_all_result == "see_all_not_found":
+        if see_all_result not in ("clicked",) and not see_all_result.startswith("list_already_expanded"):
             list_state = self.podcasts.episode_list_state(min_rows=max(tab_task.videos))
             self.logger.log(f"Episode list state after missing See All: {list_state}",
                             step="11", status=list_state, tab=tab_task.tab)
