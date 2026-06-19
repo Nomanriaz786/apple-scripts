@@ -1262,9 +1262,25 @@ class VPNController:
                     delay 0.3
                 end try
                 if not (exists row 1 of tbl) then return "ERROR:no_rows_after_search"
+                -- Row 2 is the US country header when the list is collapsed.
+                -- When already expanded, row 2 is the first individual server.
+                -- Detect: if row 3 exists AND is within 60px of row 2, the list
+                -- is already expanded (servers are already showing as rows).
                 set cRow to missing value
+                set alreadyExpanded to false
                 if exists row 2 of tbl then
                     set cRow to row 2 of tbl
+                    if exists row 3 of tbl then
+                        set r2p to position of row 2 of tbl
+                        set r3p to position of row 3 of tbl
+                        set r2y to (item 2 of r2p) as integer
+                        set r3y to (item 2 of r3p) as integer
+                        -- If rows 2 and 3 are within 60px, the US list is already expanded
+                        -- and row 2 is actually the first server, not the US header.
+                        if (r3y - r2y) < 60 then
+                            set alreadyExpanded to true
+                        end if
+                    end if
                 else
                     set cRow to row 1 of tbl
                 end if
@@ -1276,7 +1292,9 @@ class VPNController:
                 set wX to (item 1 of wPos) as integer
                 set wY to (item 2 of wPos) as integer
                 set wW to (item 1 of wSz) as integer
-                return "R2:" & r2X & "," & r2Top & "|W:" & wX & "," & wY & "," & wW
+                set expandedFlag to "0"
+                if alreadyExpanded then set expandedFlag to "1"
+                return "R2:" & r2X & "," & r2Top & "|W:" & wX & "," & wY & "," & wW & "|EXP:" & expandedFlag
             end tell
         end tell
         """
@@ -1294,6 +1312,7 @@ class VPNController:
 
         r2_x = r2_top = 0
         w_x2 = w_y2 = w_w2 = 0
+        already_expanded = False
         for chunk in p3.split("|"):
             if chunk.startswith("R2:"):
                 nums = chunk[3:].split(",")
@@ -1303,6 +1322,8 @@ class VPNController:
                 nums = chunk[2:].split(",")
                 if len(nums) == 3:
                     w_x2, w_y2, w_w2 = int(nums[0]), int(nums[1]), int(nums[2])
+            elif chunk.startswith("EXP:"):
+                already_expanded = chunk[4:].strip() == "1"
 
         # Use phase3 window coords if available (most current), fall back to phase1.
         if w_w2 > 0:
@@ -1315,16 +1336,26 @@ class VPNController:
         US_HEADER_H = 48   # United States country header row height (empirically measured)
         SERVER_ROW_H = 48  # Individual server row height
 
-        expand_x = w_x + w_w // 2
-        expand_y = r2_top + US_HEADER_H // 2
         connect_x = w_x + w_w - 38
-        server_y = r2_top + US_HEADER_H + (slot_num - 1) * SERVER_ROW_H + SERVER_ROW_H // 2
+
+        if already_expanded:
+            # Row 2 is already the first server — no header offset needed.
+            # server_y points directly to the Nth server row from r2_top.
+            expand_y = r2_top - US_HEADER_H // 2  # US header is one row above r2
+            server_y = r2_top + (slot_num - 1) * SERVER_ROW_H + SERVER_ROW_H // 2
+        else:
+            # Row 2 is the US country header — need to expand it first.
+            expand_y = r2_top + US_HEADER_H // 2
+            server_y = r2_top + US_HEADER_H + (slot_num - 1) * SERVER_ROW_H + SERVER_ROW_H // 2
+
+        expand_x = w_x + w_w // 2
         title_bar_x = w_x + w_w // 2
         title_bar_y = w_y + 12
 
         self.logger.log(
             f"Slot {slot_num}: r2=({r2_x},{r2_top}) w=({w_x},{w_y},{w_w}) "
-            f"expand=({expand_x},{expand_y}) server_y={server_y} connect_x={connect_x}",
+            f"already_expanded={already_expanded} expand=({expand_x},{expand_y}) "
+            f"server_y={server_y} connect_x={connect_x}",
             step="06", slot=slot_num,
         )
 
@@ -1354,21 +1385,24 @@ class VPNController:
         _mouse(Quartz.kCGEventLeftMouseUp,   title_bar_x, title_bar_y)
         time.sleep(0.2)
 
-        brightness = _sample_max_brightness(w_x + 10, server_y - 10)
-        # 308 = fully expanded server row, 117 = collapsed (dark background).
-        # 245 = highlighted/recently-connected row — treat as NOT expanded.
-        is_expanded = brightness > 270
-        self.logger.log(
-            f"Pixel expansion check: brightness={brightness} expanded={is_expanded}",
-            step="06",
-        )
-
-        if not is_expanded:
-            _mouse(Quartz.kCGEventLeftMouseDown, expand_x, expand_y)
-            _mouse(Quartz.kCGEventLeftMouseUp,   expand_x, expand_y)
-            time.sleep(1.5)
+        if already_expanded:
+            # US server list detected as expanded via AX row spacing — skip expand click.
+            self.logger.log("Server list already expanded (AX row check) — skipping expand click", step="06")
         else:
-            self.logger.log("Server list already expanded — skipping expand click", step="06")
+            brightness = _sample_max_brightness(w_x + 10, server_y - 10)
+            # 308 = fully expanded server row, 117 = collapsed (dark background).
+            # 245 = highlighted/recently-connected row — treat as NOT expanded.
+            is_expanded_px = brightness > 270
+            self.logger.log(
+                f"Pixel expansion check: brightness={brightness} expanded={is_expanded_px}",
+                step="06",
+            )
+            if not is_expanded_px:
+                _mouse(Quartz.kCGEventLeftMouseDown, expand_x, expand_y)
+                _mouse(Quartz.kCGEventLeftMouseUp,   expand_x, expand_y)
+                time.sleep(1.5)
+            else:
+                self.logger.log("Server list already expanded (pixel) — skipping expand click", step="06")
 
         hover_x = w_x + w_w // 2
         _mouse(Quartz.kCGEventMouseMoved, hover_x, server_y)
