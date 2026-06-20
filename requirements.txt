@@ -1,1 +1,2 @@
+pyobjc-framework-Quartz
 mac-pyxa
