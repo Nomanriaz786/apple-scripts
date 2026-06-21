@@ -6,16 +6,18 @@
 
 set -u
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-VENV_PY="$SCRIPT_DIR/.venv/bin/python"
 CAL_SCRIPT="$SCRIPT_DIR/scripts/calibrate.py"
 
 echo "ProtonVPN calibration"
 echo "Project folder: $SCRIPT_DIR"
 echo
 
-if [ ! -x "$VENV_PY" ]; then
-  echo "ERROR: project virtualenv not found at $VENV_PY"
-  echo "Run run.command once first — it creates the .venv and installs deps."
+# Detect Python, create .venv, and install deps (shared with run.command).
+# Sets VENV_PY on success — so calibrate works on a fresh Mac without needing
+# run.command to have been run first.
+source "$SCRIPT_DIR/scripts/bootstrap_venv.sh"
+if ! ensure_venv "$SCRIPT_DIR"; then
+  echo
   read -r -p "Press Enter to close..."
   exit 1
 fi
