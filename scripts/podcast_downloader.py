@@ -18,7 +18,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -64,6 +64,24 @@ class TabTask:
 
 
 @dataclass(frozen=True)
+class VPNCalibration:
+    """Per-device pixel geometry for the ProtonVPN server list.
+
+    These are the only machine-dependent numbers in the connect routine.  They
+    default to the values that work on the reference Mac, but differ across
+    machines/displays/ProtonVPN versions, so they can be overridden per device
+    via `vpn.calibration` in input/tasks.json (produced by scripts/calibrate.py).
+
+    All offsets are anchored to values the connect routine reads live at runtime
+    (the window's right edge and the US country-header row position `r2_top`), so
+    they stay correct even when the window is moved between runs.
+    """
+    connect_offset_from_right: int = 38   # window_right_edge - Connect_button_x
+    header_height: int = 48               # US country-header row height
+    row_height: int = 48                  # individual server row height
+
+
+@dataclass(frozen=True)
 class VPNConfig:
     enabled: bool
     app: str = "Proton VPN"
@@ -72,6 +90,7 @@ class VPNConfig:
     servers: tuple[str, ...] = ()
     require_provider_in_org: bool = True
     verify_timeout: int = DEFAULT_VERIFY_TIMEOUT_SEC
+    calibration: VPNCalibration = field(default_factory=VPNCalibration)
 
 
 @dataclass(frozen=True)
@@ -106,6 +125,17 @@ def _parse_vpn(raw_vpn: Any) -> VPNConfig:
     require_default = "proton" in app.lower()
     require = bool(raw_vpn.get("require_provider_in_org", require_default))
 
+    cal_raw = raw_vpn.get("calibration", {})
+    if not isinstance(cal_raw, dict):
+        raise ValueError("'vpn.calibration' must be an object (see scripts/calibrate.py)")
+    defaults = VPNCalibration()
+    calibration = VPNCalibration(
+        connect_offset_from_right=int(cal_raw.get("connect_offset_from_right",
+                                                  defaults.connect_offset_from_right)),
+        header_height=int(cal_raw.get("header_height", defaults.header_height)),
+        row_height=int(cal_raw.get("row_height", defaults.row_height)),
+    )
+
     return VPNConfig(
         enabled=enabled,
         app=app,
@@ -114,6 +144,7 @@ def _parse_vpn(raw_vpn: Any) -> VPNConfig:
         servers=servers,
         require_provider_in_org=require,
         verify_timeout=int(raw_vpn.get("verify_timeout", DEFAULT_VERIFY_TIMEOUT_SEC)),
+        calibration=calibration,
     )
 
 
@@ -675,7 +706,7 @@ class VPNController:
 
             ui_status = self._click_server_by_name(
                 vpn_cfg.app, target_server, vpn_cfg.location,
-                force_retype=(attempt_i > 0),
+                force_retype=(attempt_i > 0), calibration=vpn_cfg.calibration,
             )
             self.logger.log(
                 f"{vpn_cfg.app} server '{target_server}': {ui_status}",
@@ -1046,7 +1077,8 @@ class VPNController:
         return slots
 
     def _click_server_by_name(
-        self, app_name: str, server: str, location: str = "", force_retype: bool = False
+        self, app_name: str, server: str, location: str = "", force_retype: bool = False,
+        calibration: "VPNCalibration | None" = None,
     ) -> str:
         """Route to slot-based connect or (future) named-server connect."""
         if "-SLOT-" in server:
@@ -1056,7 +1088,7 @@ class VPNController:
                 slot_num = 1
             return self._connect_via_slot(
                 app_name, location or server.split("-SLOT-")[0], slot_num,
-                force_retype=force_retype,
+                force_retype=force_retype, calibration=calibration,
             )
         # Named server fallback (not normally reached with slot discovery).
         process_list = self._process_name_candidates(app_name)
@@ -1097,7 +1129,8 @@ class VPNController:
         return run_osascript(script, timeout=20, label=f"click server {server}")
 
     def _connect_via_slot(
-        self, app_name: str, location: str, slot_num: int, force_retype: bool = False
+        self, app_name: str, location: str, slot_num: int, force_retype: bool = False,
+        calibration: "VPNCalibration | None" = None,
     ) -> str:
         """Search for location in ProtonVPN, expand the country row via Quartz click,
         then hover+click the Nth server row's Connect button.
@@ -1110,8 +1143,11 @@ class VPNController:
           - "All locations" header: 32 px
           - Country header row:     48 px
           - Individual server rows: 48 px
-        Connect button appears at right_edge - 38 px on hover.
+        Connect button appears at right_edge - 38 px on hover (default; see
+        VPNCalibration / scripts/calibrate.py for per-device overrides).
         """
+        if calibration is None:
+            calibration = VPNCalibration()
         process_list = self._process_name_candidates(app_name)
 
         # ProtonVPN Mac Catalyst text field accepts NEITHER AppleScript keystroke NOR
@@ -1347,10 +1383,11 @@ class VPNController:
             self.logger.log(f"Bad phase3 data: {p3!r}", step="06")
             return "bad_anchor_data"
 
-        US_HEADER_H = 48   # United States country header row height (empirically measured)
-        SERVER_ROW_H = 48  # Individual server row height
+        # Per-device geometry (calibrate.py overrides these via vpn.calibration).
+        US_HEADER_H = calibration.header_height   # US country header row height
+        SERVER_ROW_H = calibration.row_height     # individual server row height
 
-        connect_x = w_x + w_w - 38
+        connect_x = w_x + w_w - calibration.connect_offset_from_right
 
         if already_expanded:
             # Row 2 is already the first server — no header offset needed.
@@ -1367,7 +1404,9 @@ class VPNController:
         self.logger.log(
             f"Slot {slot_num}: r2=({r2_x},{r2_top}) w=({w_x},{w_y},{w_w}) "
             f"already_expanded={already_expanded} expand=({expand_x},{expand_y}) "
-            f"server_y={server_y} connect_x={connect_x}",
+            f"server_y={server_y} connect_x={connect_x} "
+            f"cal=(right={calibration.connect_offset_from_right},"
+            f"hdr={calibration.header_height},row={calibration.row_height})",
             step="06", slot=slot_num,
         )
 
