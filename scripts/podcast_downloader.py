@@ -1135,6 +1135,22 @@ class VPNController:
             Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
             time.sleep(0.05)
 
+        def _warp(x, y):
+            # Move the REAL hardware cursor, then post a mouse-moved event.
+            # ProtonVPN's Mac Catalyst Connect button is rendered only while the
+            # cursor hovers the row (an NSTrackingArea), and tracking follows the
+            # *actual* cursor position — a synthetic kCGEventMouseMoved alone does
+            # not reliably enter the tracking area on every Mac (it worked on one
+            # mini, not another, where the button never appeared and the click hit
+            # nothing).  CGWarpMouseCursorPosition guarantees the cursor is really
+            # over the row so the button paints before we click it.
+            pt = Quartz.CGPoint(x=float(x), y=float(y))
+            Quartz.CGWarpMouseCursorPosition(pt)
+            ev = Quartz.CGEventCreateMouseEvent(None, Quartz.kCGEventMouseMoved, pt,
+                                                Quartz.kCGMouseButtonLeft)
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+            time.sleep(0.05)
+
         def _key(vk, down, flags=0):
             src = Quartz.CGEventSourceCreate(Quartz.kCGEventSourceStateCombinedSessionState)
             ev = Quartz.CGEventCreateKeyboardEvent(src, vk, down)
@@ -1404,13 +1420,23 @@ class VPNController:
             _mouse(Quartz.kCGEventLeftMouseUp,   expand_x, expand_y)
             time.sleep(1.2)  # extra headroom for slow machines / animation lag
 
+        # Hover the target server row so its Connect button renders, then click it.
+        # Warp the REAL cursor (not just synthetic moves): enter the row from just
+        # above it (forces a fresh mouseEntered on the tracking area), settle on the
+        # row, slide right to the Connect button, dwell so it finishes painting,
+        # then click.  This is what makes the button actually appear on machines
+        # where plain synthetic moves don't trigger Catalyst hover tracking.
         hover_x = w_x + w_w // 2
-        _mouse(Quartz.kCGEventMouseMoved, hover_x, server_y)
-        time.sleep(0.3)
+        _warp(hover_x, server_y - SERVER_ROW_H)   # approach from above the row
+        time.sleep(0.15)
+        _warp(hover_x, server_y)                  # settle on the row center
+        time.sleep(0.35)
         for x in range(hover_x + 20, connect_x, 20):
-            _mouse(Quartz.kCGEventMouseMoved, x, server_y)
-        _mouse(Quartz.kCGEventMouseMoved, connect_x, server_y)
-        time.sleep(0.4)
+            _warp(x, server_y)                    # slide toward the Connect button
+        _warp(connect_x, server_y)
+        time.sleep(0.5)                           # let the button finish rendering
+        # Re-couple cursor + mouse so the click registers at the warped position.
+        Quartz.CGAssociateMouseAndMouseCursorPosition(True)
 
         _mouse(Quartz.kCGEventLeftMouseDown, connect_x, server_y)
         time.sleep(0.1)
