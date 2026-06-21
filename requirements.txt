@@ -1,2 +1,7 @@
-pyobjc-framework-Quartz
-mac-pyxa
+# Pinned to the combo proven working on the reference Mac.
+# mac-pyxa needs pyobjc 9.x. Leaving pyobjc unpinned makes pip pull pyobjc 12.x,
+# which is incompatible with mac-pyxa 0.3.x, so pip silently backtracks mac-pyxa
+# down to a broken 0.0.8 that imports fine on one Mac but fails on another
+# ("ERROR: PyXA still not importable" on the mac8 mini). Pinning both ends that.
+mac-pyxa==0.3.0.1
+pyobjc-framework-Quartz==9.2
