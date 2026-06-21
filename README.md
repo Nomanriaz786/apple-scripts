@@ -91,6 +91,7 @@ Edit `input/tasks.json`. Only these keys are used:
 | `vpn.app` | string | VPN app name (default: `"ProtonVPN"`) |
 | `vpn.location` | string | Target location (default: `"United States"`) |
 | `vpn.require_provider_in_org` | bool | Require VPN provider name in IP org field |
+| `vpn.calibration` | object | Per-device ProtonVPN click geometry — set by `calibrate.command` (see §6a). Optional; sensible defaults are used if absent |
 | `tabs` | array | Chrome tab numbers and episode row indexes to download |
 | `tabs[].tab` | int ≥ 1 | Chrome tab number (1-based, in front window) |
 | `tabs[].videos` | int[] | Episode row numbers to download (1 = top row) |
@@ -98,6 +99,31 @@ Edit `input/tasks.json`. Only these keys are used:
 | `clean_start` | bool | Remove any stale downloads before cycle 1 starts |
 
 Everything else (server names, show URLs, VPN servers) is auto-detected and saved in state.
+
+## 6a. Per-Device ProtonVPN Calibration
+
+ProtonVPN's per-server **Connect** button is drawn only on hover and is not exposed
+to Accessibility, so the automation must click it by pixel coordinates. Those
+coordinates differ across Macs, displays, and ProtonVPN versions. Run the
+calibration **once on each Mac**:
+
+1. Open ProtonVPN, sign in, and **disconnect**.
+2. Double-click **`calibrate.command`** (or run `python3 scripts/calibrate.py`).
+3. It searches "United States" and expands the list, then asks you to hover the
+   **Connect** button of the **first** and **second** US servers — just hover and
+   hold still; it captures automatically (no clicking).
+4. It writes `vpn.calibration` into `input/tasks.json` (a `.json.bak` backup is
+   kept). Then run `run.command` as normal.
+
+`vpn.calibration` fields (all pixels):
+
+| Field | Meaning |
+|-------|---------|
+| `connect_offset_from_right` | window right edge − Connect button x |
+| `header_height` | US country-header row height |
+| `row_height` | individual server row height |
+
+If `vpn.calibration` is absent, the reference-Mac defaults (`38 / 48 / 48`) are used.
 
 ---
 
