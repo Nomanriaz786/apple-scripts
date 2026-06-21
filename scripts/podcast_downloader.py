@@ -1209,8 +1209,6 @@ class VPNController:
         # also triggers the incremental search filter (rows collapse from ~181 → 2).
         sf_cx = sf_x + sf_w // 2
         sf_cy = sf_y + sf_h // 2
-        title_bar_x = w_x + w_w // 2
-        title_bar_y = w_y + 12
 
         # Save clipboard so we can restore it afterwards.
         old_clip = subprocess.run(["pbpaste"], capture_output=True).stdout
@@ -1349,8 +1347,6 @@ class VPNController:
             server_y = r2_top + US_HEADER_H + (slot_num - 1) * SERVER_ROW_H + SERVER_ROW_H // 2
 
         expand_x = w_x + w_w // 2
-        title_bar_x = w_x + w_w // 2
-        title_bar_y = w_y + 12
 
         self.logger.log(
             f"Slot {slot_num}: r2=({r2_x},{r2_top}) w=({w_x},{w_y},{w_w}) "
@@ -1359,50 +1355,54 @@ class VPNController:
             step="06", slot=slot_num,
         )
 
-        # ── Phase 4: expansion check → hover → click Connect ─────────────────────────
+        # ── Phase 4: ensure expanded (single AX signal) → hover → click Connect ──────
 
-        def _sample_max_brightness(sx, sy, sw=40, sh=20):
-            rect = Quartz.CGRectMake(sx, sy, sw, sh)
-            img = Quartz.CGWindowListCreateImage(
-                rect, Quartz.kCGWindowListOptionOnScreenOnly,
-                Quartz.kCGNullWindowID, Quartz.kCGWindowImageDefault,
-            )
-            if img is None:
-                return 0
-            dp = Quartz.CGDataProviderCopyData(Quartz.CGImageGetDataProvider(img))
-            if not dp or len(dp) < 4:
-                return 0
-            return max(dp[i] + dp[i + 1] + dp[i + 2] for i in range(0, len(dp) - 3, 4))
-
-        # Raise ProtonVPN and click title bar to ensure window focus for hover effects.
+        # Raise ProtonVPN so it receives hover events.
         subprocess.run(
             ["osascript", "-e",
              'tell application "System Events" to set frontmost of process "ProtonVPN" to true'],
             timeout=4, check=False,
         )
-        time.sleep(0.2)
-        _mouse(Quartz.kCGEventLeftMouseDown, title_bar_x, title_bar_y)
-        _mouse(Quartz.kCGEventLeftMouseUp,   title_bar_x, title_bar_y)
+        time.sleep(0.3)
+        # Seed the cursor inside the window's safe zone (above the server rows,
+        # below any nav bar) with a MOVE — not a click — so ProtonVPN starts
+        # tracking the cursor without risking activating a nav button.
+        # w_y + 12 (the old "title bar click") can land inside ProtonVPN's
+        # Mac Catalyst nav bar when the window is near the top of the screen
+        # (w_y ≈ 41 on mac8), which dismisses the search view.  A mouse-moved
+        # event to a neutral area is enough to prime hover-event delivery.
+        _mouse(Quartz.kCGEventMouseMoved, w_x + w_w // 2, expand_y - 30)
         time.sleep(0.2)
 
+        # Expansion is driven by ONE authoritative signal: the AX row-2/row-3
+        # spacing already computed in phase 3 (`already_expanded`), which is the
+        # same flag that drives the `server_y` geometry above.
+        #
+        # The old code split this decision in two — the AX flag drove the
+        # geometry while an independent pixel-brightness check drove whether to
+        # click expand — and the two could disagree (a highlighted row reads as
+        # "expanded" via brightness while AX reads "collapsed"). When they split,
+        # the geometry assumed one layout while the list was in the other, so the
+        # Connect click landed on empty space and no tunnel ever came up. Geometry
+        # and the expand decision now use the same flag, and the expand click is
+        # verified via AX (and retried) instead of being a blind toggle that could
+        # re-collapse an already-open list.
+        # The expand click is a TOGGLE, so it must fire exactly once and only when
+        # the list is closed — clicking an already-open list re-collapses it, and
+        # clicking twice (e.g. a "verify then retry" loop) toggles it shut again.
+        # We also can't re-read state to confirm: once the country expands to 6000+
+        # rows, `position of row N` is no longer coercible via AX, so any post-expand
+        # AX check returns garbage. So we trust the single authoritative phase-3
+        # signal and click at most once.
         if already_expanded:
-            # US server list detected as expanded via AX row spacing — skip expand click.
-            self.logger.log("Server list already expanded (AX row check) — skipping expand click", step="06")
+            # Row 2 is the first server — the list is already open. Leave it alone.
+            self.logger.log("Server list already expanded (AX) — skipping expand click", step="06")
         else:
-            brightness = _sample_max_brightness(w_x + 10, server_y - 10)
-            # 308 = fully expanded server row, 117 = collapsed (dark background).
-            # 245 = highlighted/recently-connected row — treat as NOT expanded.
-            is_expanded_px = brightness > 270
-            self.logger.log(
-                f"Pixel expansion check: brightness={brightness} expanded={is_expanded_px}",
-                step="06",
-            )
-            if not is_expanded_px:
-                _mouse(Quartz.kCGEventLeftMouseDown, expand_x, expand_y)
-                _mouse(Quartz.kCGEventLeftMouseUp,   expand_x, expand_y)
-                time.sleep(0.8)
-            else:
-                self.logger.log("Server list already expanded (pixel) — skipping expand click", step="06")
+            # Row 2 is the US country header — the list is closed. Expand it once.
+            self.logger.log("Server list collapsed (AX) — clicking expand once", step="06")
+            _mouse(Quartz.kCGEventLeftMouseDown, expand_x, expand_y)
+            _mouse(Quartz.kCGEventLeftMouseUp,   expand_x, expand_y)
+            time.sleep(1.2)  # extra headroom for slow machines / animation lag
 
         hover_x = w_x + w_w // 2
         _mouse(Quartz.kCGEventMouseMoved, hover_x, server_y)
