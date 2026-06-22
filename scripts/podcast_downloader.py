@@ -2087,13 +2087,84 @@ class PodcastsController:
             return "unknown_show"
 
     def click_see_all(self, time_budget_sec: int = DEFAULT_SEE_ALL_BUDGET_SEC) -> str:
-        """Return 'clicked', 'list_already_expanded', or 'see_all_not_found'.
+        """Find and click the episode-list 'See All' via the native AX walk (~1s/pass).
 
-        Walks the whole accessibility tree (bounded depth) looking for ANY
-        element whose name, description, or value matches a "See All" variant,
-        then tries multiple click methods (direct click and AXPress) because
-        Apple Podcasts implements the control as a styled link/static-text,
-        not always as a true AXButton.
+        Returns 'clicked' | 'list_already_expanded:native' | 'see_all_not_found'.
+        The old System Events version re-walked the deep tree on every poll (~18-20s,
+        sometimes the full 60s budget); this polls the fast native snapshot instead.
+        Falls back to the System Events walk if the native path can't resolve it.
+        """
+        try:
+            import Quartz  # type: ignore[import]
+        except ImportError:
+            return self._click_see_all_sysevents(time_budget_sec)
+
+        try:
+            run_osascript('tell application "Podcasts" to activate',
+                          timeout=5, label="activate before See All")
+        except AutomationError:
+            pass
+
+        def _click(cx: int, cy: int) -> None:
+            for k in (Quartz.kCGEventMouseMoved, Quartz.kCGEventLeftMouseDown,
+                      Quartz.kCGEventLeftMouseUp):
+                ev = Quartz.CGEventCreateMouseEvent(
+                    None, k, Quartz.CGPointMake(cx, cy), Quartz.kCGMouseButtonLeft)
+                Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+                time.sleep(0.08)
+
+        def _episode_count(nodes) -> int:
+            return sum(1 for role, _t, x, y, w, h in nodes
+                       if role == "AXButton" and h > 60 and w > 400)
+
+        deadline = time.time() + time_budget_sec
+        while time.time() < deadline:
+            nodes = self._ax_nodes()
+            # Content area starts past the sidebar; the real episode-list 'See All' is
+            # an AXButton there. EXCLUDE menu roles — the macOS menu bar contains an
+            # Apple-menu "Show All" item that would otherwise match (and is at the far
+            # left). Pick the topmost content-area button (above the recommendation
+            # carousels' own See All).
+            win_x = 0
+            for role, _t, x, y, w, h in nodes:
+                if role == "AXWindow" and w > 400 and h > 400:
+                    win_x = x
+                    break
+            content_left = win_x + 180
+            cands = sorted(
+                ((x + w // 2, y + h // 2) for role, t, x, y, w, h in nodes
+                 if w > 0 and not role.startswith("AXMenu")
+                 and (x + w // 2) > content_left
+                 and ("See All" in t or "Show All" in t)),
+                key=lambda c: c[1],
+            )
+            if cands:
+                before = _episode_count(nodes)
+                # Only the TOPMOST See All — that's the episodes section; carousel
+                # 'See All's sit lower and would navigate away from the show.
+                cx, cy = cands[0]
+                _click(cx, cy)
+                time.sleep(1.2)
+                after = _episode_count(self._ax_nodes())
+                if after >= 1 and after >= before:
+                    self.logger.log(
+                        f"See All (native): clicked at ({cx},{cy}); "
+                        f"episode rows {before}->{after}", step="11",
+                    )
+                    return "clicked"
+            elif _episode_count(nodes) >= 1:
+                # No See All but episodes are already on screen (short shows).
+                self.logger.log("See All (native): list already shows episodes", step="11")
+                return "list_already_expanded:native"
+            time.sleep(0.5)
+
+        self.logger.log("See All (native): not found in budget — System Events fallback",
+                        step="11")
+        return self._click_see_all_sysevents(time_budget_sec)
+
+    def _click_see_all_sysevents(self, time_budget_sec: int = DEFAULT_SEE_ALL_BUDGET_SEC) -> str:
+        """Fallback: System Events tree walk for 'See All' (~18-60s). Kept as a safety
+        net for click_see_all.
         """
         script = _BOUNDED_HELPERS + """
         on matchesSeeAll(s)
@@ -2527,14 +2598,50 @@ class PodcastsController:
     def _find_episode_rows(
         self, max_n: int
     ) -> tuple[int, int, dict[int, tuple[int, int, int, int, int, int]]]:
-        """One AppleScript BFS pass that measures the rects of episodes 1..max_n.
+        """Measure episode rows 1..max_n via the native AX walk (~1s).
 
-        Returns (win_y, win_h, rows) where rows maps episode number → (row_x,
-        row_y, row_w, row_h, more_x, more_y).  The System Events AX tree-walk is
-        the dominant cost in the download flow (~25-30s), and the old code paid it
-        once *per episode* (scroll-to-top + full re-walk every time).  Walking once
-        and recording every requested row collapses that to a single walk per show
-        — the rows are then clicked by pixel with no further BFS.
+        Episode rows are AXButtons that are tall (>60px) and wide (>400px); sorting
+        the visible ones top-to-bottom gives episode 1, 2, ….  The hover-only ⋯
+        button isn't in the tree (it appears only on physical hover), so its position
+        is synthesized from the row rect (more_x = right edge − 47, vertical centre) —
+        the same point the old System Events path reported.  Falls back to the
+        System Events walk if the native walk sees no rows.
+        """
+        nodes = self._ax_nodes()
+        win_y = win_h = 0
+        for role, _text, x, y, w, h in nodes:
+            if role == "AXWindow" and w > 400 and h > 400:
+                win_y, win_h = y, h
+                break
+        eps = sorted(
+            ((x, y, w, h) for role, _t, x, y, w, h in nodes
+             if role == "AXButton" and h > 60 and w > 400),
+            key=lambda r: r[1],
+        )
+        rows: dict[int, tuple[int, int, int, int, int, int]] = {}
+        for i, (x, y, w, h) in enumerate(eps, start=1):
+            if i > max_n:
+                break
+            more_x = x + w - 47       # ⋯ button centre (hover-only; from measured geometry)
+            more_y = y + h // 2
+            rows[i] = (x, y, w, h, more_x, more_y)
+        if rows:
+            self.logger.log(
+                f"_find_episode_rows (native): found {len(rows)} of {max_n} requested "
+                f"({len(eps)} visible rows)",
+                step="13",
+            )
+            return win_y, win_h, rows
+        # Native saw nothing (list not rendered?) — fall back to the slow walk.
+        self.logger.log("_find_episode_rows: native saw no rows — System Events fallback",
+                        step="13")
+        return self._find_episode_rows_sysevents(max_n)
+
+    def _find_episode_rows_sysevents(
+        self, max_n: int
+    ) -> tuple[int, int, dict[int, tuple[int, int, int, int, int, int]]]:
+        """Fallback: one AppleScript/System Events BFS measuring episodes 1..max_n
+        (~30s on the deep Catalyst tree). Kept as a safety net for _find_episode_rows.
         """
         script = f"""
         tell application "System Events"
@@ -2836,6 +2943,78 @@ class PodcastsController:
             except Exception:
                 pass  # fall through to unknown
         return "unknown"
+
+    def _ax_nodes(self, node_cap: int = 20000) -> list[tuple[str, str, int, int, int, int]]:
+        """Native AX walk of the Podcasts app — one flat snapshot of every node.
+
+        Returns a list of (role, text, x, y, w, h), where `text` is the first of
+        AXDescription / AXValue / AXTitle that is a non-empty string.  Measured live:
+        ~240 nodes in ~1s, and it DOES see the episode-list rows and Downloaded cards
+        (once rendered) — unlike System Events traversal, which is the same data at
+        20-35s.  All the See-All / episode / card finders are built on this.
+        """
+        try:
+            from ApplicationServices import (  # type: ignore[import]
+                AXUIElementCreateApplication,
+                AXUIElementCopyAttributeValue,
+                AXValueGetValue,
+                kAXChildrenAttribute,
+                kAXRoleAttribute,
+                kAXDescriptionAttribute,
+                kAXValueAttribute,
+                kAXTitleAttribute,
+                kAXPositionAttribute,
+                kAXSizeAttribute,
+                kAXValueCGPointType,
+                kAXValueCGSizeType,
+            )
+        except Exception:
+            return []
+        try:
+            pid_result = subprocess.run(
+                ["osascript", "-e",
+                 'tell application "System Events" to return unix id of process "Podcasts"'],
+                capture_output=True, text=True, timeout=5,
+            )
+            pid = int(pid_result.stdout.strip())
+        except Exception:
+            return []
+
+        app_ref = AXUIElementCreateApplication(pid)
+
+        def _attr(el, a):
+            try:
+                err, val = AXUIElementCopyAttributeValue(el, a, None)
+                return val if err == 0 else None
+            except Exception:
+                return None
+
+        out: list[tuple[str, str, int, int, int, int]] = []
+        stack = [app_ref]
+        seen = 0
+        while stack and seen < node_cap:
+            el = stack.pop()
+            seen += 1
+            role = _attr(el, kAXRoleAttribute)
+            text = ""
+            for a in (kAXDescriptionAttribute, kAXValueAttribute, kAXTitleAttribute):
+                v = _attr(el, a)
+                if isinstance(v, str) and v:
+                    text = v
+                    break
+            x = y = w = h = 0
+            pv = _attr(el, kAXPositionAttribute)
+            sv = _attr(el, kAXSizeAttribute)
+            if pv is not None and sv is not None:
+                okp, pt = AXValueGetValue(pv, kAXValueCGPointType, None)
+                oks, sz = AXValueGetValue(sv, kAXValueCGSizeType, None)
+                if okp and oks:
+                    x, y, w, h = int(pt.x), int(pt.y), int(sz.width), int(sz.height)
+            out.append((str(role or ""), text, x, y, w, h))
+            ch = _attr(el, kAXChildrenAttribute)
+            if ch:
+                stack.extend(ch)
+        return out
 
     def _ax_find_text_center(
         self, needle: str, exclude: str | None = None, node_cap: int = 20000
@@ -3470,13 +3649,40 @@ class PodcastsController:
             return ""
 
     def _find_downloaded_card_frame(self) -> tuple[int, int, int, int] | None:
-        """BFS for the first show card in the Downloaded tab content area.
+        """Find the first show card on the Downloaded tab via the native AX walk (~1s).
 
-        Returns (x, y, w, h) from the actual AXFrame of the card element.
-        No hardcoded window offsets — the position comes from the AX tree so it
-        works regardless of window size or position.
-        Accepts any element that is in the content area (right of sidebar),
-        roughly square (0.5 < W/H < 2), and between 80–450 px per side.
+        Returns (x, y, w, h). Card criteria match the old System Events version: in
+        the content area (right of the sidebar), roughly square-ish, 80–800 px per
+        side, not full-width.  Picks the top-left-most card.  Falls back to the
+        System Events walk (~30s) if the native walk finds none.
+        """
+        nodes = self._ax_nodes()
+        win_x = win_w = 0
+        for role, _t, x, y, w, h in nodes:
+            if role == "AXWindow" and w > 400 and h > 400:
+                win_x, win_w = x, w
+                break
+        if win_w == 0:
+            return self._find_downloaded_card_frame_sysevents()
+        content_left = win_x + 180
+        cards = [
+            (x, y, w, h) for role, _t, x, y, w, h in nodes
+            if x > content_left and 80 <= w <= 800 and 80 <= h <= 900
+            and w * 4 > h and h * 4 > w and w < win_w - 100
+        ]
+        if cards:
+            cards.sort(key=lambda c: (c[1], c[0]))  # top-left-most first
+            cx, cy, cw, ch = cards[0]
+            self.logger.log(
+                f"Downloaded card (native): ({cx},{cy},{cw},{ch})", step="14")
+            return cx, cy, cw, ch
+        # Native saw no card — could be genuinely empty, or a render lag. Let the
+        # System Events walk confirm (it's slow but authoritative).
+        return self._find_downloaded_card_frame_sysevents()
+
+    def _find_downloaded_card_frame_sysevents(self) -> tuple[int, int, int, int] | None:
+        """Fallback: System Events BFS for the first Downloaded card (~30s). Kept as a
+        safety net for _find_downloaded_card_frame.
         """
         script = """
         tell application "System Events"
