@@ -149,7 +149,20 @@ def _parse_vpn(raw_vpn: Any) -> VPNConfig:
 
 
 def load_config(path: Path) -> Config:
-    raw = json.loads(path.read_text(encoding="utf-8-sig"))
+    text = path.read_text(encoding="utf-8-sig")
+    try:
+        raw = json.loads(text)
+    except json.JSONDecodeError as exc:
+        # Point at the offending line/column with the actual text, instead of dumping
+        # a raw traceback — the usual cause is a stray/missing comma in tasks.json.
+        lines = text.splitlines()
+        snippet = lines[exc.lineno - 1] if 0 < exc.lineno <= len(lines) else ""
+        pointer = " " * (max(exc.colno - 1, 0)) + "^"
+        raise AutomationError(
+            f"Invalid JSON in {path} at line {exc.lineno}, column {exc.colno}: "
+            f"{exc.msg}.\n  {snippet}\n  {pointer}\n"
+            f"Check tasks.json for a missing or extra comma, quote, or bracket."
+        ) from None
 
     repeat = int(raw.get("repeat", 1))
     if repeat < 1:
@@ -648,7 +661,7 @@ class VPNController:
         disc = self._click_disconnect(vpn_cfg.app)
         self.logger.log(f"Pre-connect disconnect: {disc}", step="06", status=disc)
         if disc == "disconnect_clicked":
-            time.sleep(2.5)
+            time.sleep(1.5)
         ui_state = self._read_ui_connection_state(vpn_cfg.app)
         self.logger.log(f"{vpn_cfg.app} UI connection state: {ui_state}", step="06",
                         ui_connection_state=ui_state)
@@ -1342,9 +1355,10 @@ class VPNController:
                 set wX to (item 1 of wPos) as integer
                 set wY to (item 2 of wPos) as integer
                 set wW to (item 1 of wSz) as integer
+                set wH to (item 2 of wSz) as integer
                 set expandedFlag to "0"
                 if alreadyExpanded then set expandedFlag to "1"
-                return "R2:" & r2X & "," & r2Top & "|W:" & wX & "," & wY & "," & wW & "|EXP:" & expandedFlag
+                return "R2:" & r2X & "," & r2Top & "|W:" & wX & "," & wY & "," & wW & "," & wH & "|EXP:" & expandedFlag
             end tell
         end tell
         """
@@ -1361,7 +1375,7 @@ class VPNController:
             return p3
 
         r2_x = r2_top = 0
-        w_x2 = w_y2 = w_w2 = 0
+        w_x2 = w_y2 = w_w2 = w_h2 = 0
         already_expanded = False
         for chunk in p3.split("|"):
             if chunk.startswith("R2:"):
@@ -1370,12 +1384,17 @@ class VPNController:
                     r2_x, r2_top = int(nums[0]), int(nums[1])
             elif chunk.startswith("W:"):
                 nums = chunk[2:].split(",")
-                if len(nums) == 3:
+                if len(nums) >= 4:
+                    w_x2, w_y2, w_w2, w_h2 = (
+                        int(nums[0]), int(nums[1]), int(nums[2]), int(nums[3])
+                    )
+                elif len(nums) == 3:
                     w_x2, w_y2, w_w2 = int(nums[0]), int(nums[1]), int(nums[2])
             elif chunk.startswith("EXP:"):
                 already_expanded = chunk[4:].strip() == "1"
 
         # Use phase3 window coords if available (most current), fall back to phase1.
+        w_h = w_h2  # window height (phase1 does not capture it; 0 disables scroll)
         if w_w2 > 0:
             w_x, w_y, w_w = w_x2, w_y2, w_w2
 
@@ -1458,6 +1477,45 @@ class VPNController:
             _mouse(Quartz.kCGEventLeftMouseDown, expand_x, expand_y)
             _mouse(Quartz.kCGEventLeftMouseUp,   expand_x, expand_y)
             time.sleep(1.2)  # extra headroom for slow machines / animation lag
+
+        # Scroll the target server row into view before hovering.
+        # ProtonVPN's server list is virtualized: rows past the first visible page
+        # only exist once scrolled to. Before this step the code computed server_y
+        # for any slot but never scrolled, so slots below the window bottom got a
+        # cursor warp to an off-screen Y — the Connect button never rendered and the
+        # click hit nothing (the "stuck after the first ~5 servers" symptom).
+        # If server_y sits near/below the window bottom, scroll the list up so the
+        # row lands at a comfortable target inside the viewport, then shift server_y
+        # by the same amount (a vertical scroll does not change the Connect X).
+        if w_h > 0:
+            win_bottom = w_y + w_h
+            if server_y > win_bottom - 80:
+                target_y = w_y + (w_h // 2)
+                scroll_px = server_y - target_y
+                if scroll_px > 0:
+                    self.logger.log(
+                        f"Slot {slot_num}: server_y={server_y} below window bottom "
+                        f"{win_bottom} — scrolling list {scroll_px}px into view",
+                        step="06", slot=slot_num,
+                    )
+                    # Scroll in chunks: a single huge pixel-scroll event can be
+                    # clamped/dropped by the Mac Catalyst list, leaving the row
+                    # off-screen. ~400px steps land reliably.
+                    scroll_cx, scroll_cy = w_x + w_w // 2, w_y + w_h // 2
+                    remaining = scroll_px
+                    while remaining > 0:
+                        step_px = min(400, remaining)
+                        sev = Quartz.CGEventCreateScrollWheelEvent(
+                            None, Quartz.kCGScrollEventUnitPixel, 1, -step_px
+                        )
+                        Quartz.CGEventSetLocation(
+                            sev, Quartz.CGPointMake(scroll_cx, scroll_cy)
+                        )
+                        Quartz.CGEventPost(Quartz.kCGHIDEventTap, sev)
+                        time.sleep(0.12)
+                        remaining -= step_px
+                    time.sleep(0.4)
+                    server_y -= scroll_px
 
         # Hover the target server row so its Connect button renders, then click it.
         # Warp the REAL cursor (not just synthetic moves): enter the row from just
@@ -2105,11 +2163,11 @@ class PodcastsController:
         end attemptClick
 
         tell application "Podcasts" to activate
-        delay 1.5
+        delay 0.3
         tell application "System Events"
             tell process "Podcasts"
                 set frontmost to true
-                delay 0.3
+                delay 0.2
                 if not (exists window 1) then return "no_window"
 
                 -- Retry for up to __BUDGET__ seconds; Podcasts can take 15-30 s to render
@@ -2122,11 +2180,11 @@ class PodcastsController:
                     if elem is not missing value then
                         set clickResult to my attemptClick(elem)
                         if clickResult is "click_failed" then return "see_all_click_failed"
-                        delay 0.4
+                        delay 0.3
                         return "clicked"
                     end if
                     if (current date) > deadline then return "see_all_not_found"
-                    delay 0.5
+                    delay 0.25
                 end repeat
             end tell
         end tell
@@ -2202,7 +2260,7 @@ class PodcastsController:
             tell process "Podcasts"
                 set frontmost to true
                 key code 126 using command down
-                delay 0.4
+                delay 0.2
             end tell
         end tell
         """
@@ -2440,13 +2498,182 @@ class PodcastsController:
             self._dump_ax_tree(f"download_row_{video_no}_not_found")
             return "download_not_found"
 
-        # Phase 2: activate Podcasts, then Quartz hover → pixel-click download icon
+        return self._click_download_at(
+            win_y, win_h, row_x, row_y, row_w, row_h, more_x, more_y, video_no
+        )
+
+    def _find_episode_rows(
+        self, max_n: int
+    ) -> tuple[int, int, dict[int, tuple[int, int, int, int, int, int]]]:
+        """One AppleScript BFS pass that measures the rects of episodes 1..max_n.
+
+        Returns (win_y, win_h, rows) where rows maps episode number → (row_x,
+        row_y, row_w, row_h, more_x, more_y).  The System Events AX tree-walk is
+        the dominant cost in the download flow (~25-30s), and the old code paid it
+        once *per episode* (scroll-to-top + full re-walk every time).  Walking once
+        and recording every requested row collapses that to a single walk per show
+        — the rows are then clicked by pixel with no further BFS.
+        """
+        script = f"""
+        tell application "System Events"
+            set frontmost of process "Podcasts" to true
+        end tell
+        delay 0.3
+        tell application "System Events"
+            tell process "Podcasts"
+                if not (exists window 1) then return "ERROR:no_window"
+                set maxN to {max_n}
+                set seenCount to 0
+                set outStr to ""
+                set queue to {{window 1}}
+                repeat 3000 times
+                    if (count of queue) = 0 then exit repeat
+                    set elem to item 1 of queue
+                    if (count of queue) > 1 then
+                        set queue to items 2 thru -1 of queue
+                    else
+                        set queue to {{}}
+                    end if
+                    set isBtn to false
+                    try
+                        if class of elem is button then set isBtn to true
+                    end try
+                    if isBtn then
+                        set btnW to 0
+                        set btnH to 0
+                        try
+                            set eSz to size of elem
+                            set btnH to (item 2 of eSz) as integer
+                            set btnW to (item 1 of eSz) as integer
+                        end try
+                        if btnH > 60 and btnW > 400 then
+                            set seenCount to seenCount + 1
+                            set ePos to position of elem
+                            set eX to (item 1 of ePos) as integer
+                            set eY to (item 2 of ePos) as integer
+                            set moreX to 0
+                            set moreY to 0
+                            try
+                                repeat with k in UI elements of elem
+                                    set kd to ""
+                                    try
+                                        set kd to description of k as string
+                                    end try
+                                    if kd is "more" then
+                                        set mp to position of k
+                                        set ms to size of k
+                                        set moreX to ((item 1 of mp) + (item 1 of ms) / 2) as integer
+                                        set moreY to ((item 2 of mp) + (item 2 of ms) / 2) as integer
+                                        exit repeat
+                                    end if
+                                    try
+                                        repeat with gk in UI elements of k
+                                            set gkd to ""
+                                            try
+                                                set gkd to description of gk as string
+                                            end try
+                                            if gkd is "more" then
+                                                set mp to position of gk
+                                                set ms to size of gk
+                                                set moreX to ((item 1 of mp) + (item 1 of ms) / 2) as integer
+                                                set moreY to ((item 2 of mp) + (item 2 of ms) / 2) as integer
+                                                exit repeat
+                                            end if
+                                        end repeat
+                                    end try
+                                    if moreX > 0 then exit repeat
+                                end repeat
+                            end try
+                            set outStr to outStr & "EP:" & seenCount & "," & eX & "," & eY & "," & btnW & "," & btnH & "," & moreX & "," & moreY & ";"
+                            if seenCount = maxN then exit repeat
+                        end if
+                    end if
+                    try
+                        repeat with ch in UI elements of elem
+                            set end of queue to ch
+                        end repeat
+                    end try
+                end repeat
+                set wPos to position of window 1
+                set wSz to size of window 1
+                set wY to (item 2 of wPos) as integer
+                set wH to (item 2 of wSz) as integer
+                return "WIN:" & wY & "," & wH & "|" & outStr
+            end tell
+        end tell
+        """
+        out = run_osascript(script, timeout=90, label=f"measure episodes 1..{max_n}")
+        win_y = win_h = 0
+        rows: dict[int, tuple[int, int, int, int, int, int]] = {}
+        if out.startswith("ERROR:"):
+            self.logger.log(f"_find_episode_rows: {out}", step="13")
+            return win_y, win_h, rows
+        head = out.split("|", 1)[0]
+        if head.startswith("WIN:"):
+            parts = head[4:].split(",")
+            if len(parts) == 2:
+                try:
+                    win_y, win_h = int(parts[0]), int(parts[1])
+                except ValueError:
+                    pass
+        # Episode entries are joined by ';' in the trailing segment after WIN:.
+        if "|" in out:
+            tail = out.split("|", 1)[1]
+            for entry in tail.split(";"):
+                if not entry.startswith("EP:"):
+                    continue
+                nums = entry[3:].split(",")
+                if len(nums) != 7:
+                    continue
+                try:
+                    n, eX, eY, eW, eH, mX, mY = (int(v) for v in nums)
+                except ValueError:
+                    continue
+                rows[n] = (eX, eY, eW, eH, mX, mY)
+        return win_y, win_h, rows
+
+    def download_episode_rows(self, video_nos: list[int]) -> dict[int, str]:
+        """Download several episodes of the current show with ONE BFS pass.
+
+        Measures every requested row up-front (see _find_episode_rows), then
+        pixel-clicks each download button.  Any episode not captured in the single
+        pass (e.g. far enough down the list to need lazy-load scrolling) falls back
+        to the per-episode download_episode_row, which still handles scrolling.
+        """
+        results: dict[int, str] = {}
+        if not video_nos:
+            return results
+        max_n = max(video_nos)
+        self.scroll_to_top()
+        win_y, win_h, rows = self._find_episode_rows(max_n)
+        for video_no in video_nos:
+            rect = rows.get(video_no)
+            if rect is None:
+                self.logger.log(
+                    f"Episode {video_no}: not in single-pass measurement — "
+                    f"falling back to per-episode search",
+                    step="13",
+                )
+                results[video_no] = self.download_episode_row(video_no)
+                continue
+            row_x, row_y, row_w, row_h, more_x, more_y = rect
+            results[video_no] = self._click_download_at(
+                win_y, win_h, row_x, row_y, row_w, row_h, more_x, more_y, video_no
+            )
+        return results
+
+    def _click_download_at(
+        self, win_y: int, win_h: int, row_x: int, row_y: int, row_w: int, row_h: int,
+        more_x: int, more_y: int, video_no: int,
+    ) -> str:
+        """Hover the measured episode row and pixel-click its download icon."""
+        # Make sure Podcasts is frontmost so it delivers hover/tracking events.
         try:
             run_osascript(
                 'tell application "Podcasts" to activate',
                 timeout=5, label="activate Podcasts before download click",
             )
-            time.sleep(0.3)
+            time.sleep(0.2)
         except AutomationError:
             pass
 
@@ -2513,11 +2740,11 @@ class PodcastsController:
 
         # Hover over row center to trigger the hover state (shows download icon)
         _mouse(Quartz.kCGEventMouseMoved, row_cx, row_cy)
-        time.sleep(0.3)
+        time.sleep(0.2)
 
         # Move cursor to the download button position and wait for icons to render
         _mouse(Quartz.kCGEventMouseMoved, dl_x, dl_y)
-        time.sleep(0.2)
+        time.sleep(0.15)
 
         # Pre-click: AX scan to detect already-downloaded state (best-effort)
         hover_state = self._check_hover_downloaded(row_y, row_h, dl_x, dl_y)
@@ -2532,7 +2759,7 @@ class PodcastsController:
         _mouse(Quartz.kCGEventLeftMouseDown, dl_x, dl_y)
         time.sleep(0.1)
         _mouse(Quartz.kCGEventLeftMouseUp, dl_x, dl_y)
-        time.sleep(0.7)
+        time.sleep(0.3)
 
         # Safety net: if an unexpected delete/remove dialog appeared, cancel it
         dialog_result = self._dismiss_delete_dialog_if_unexpected()
@@ -2587,6 +2814,80 @@ class PodcastsController:
             except Exception:
                 pass  # fall through to unknown
         return "unknown"
+
+    def _ax_find_text_center(
+        self, needle: str, exclude: str | None = None, node_cap: int = 20000
+    ) -> tuple[int, int] | None:
+        """Find an element whose text contains `needle` via the native AX API.
+
+        Walks the Podcasts AX tree with ApplicationServices (AXUIElement), reading
+        AXDescription / AXValue / AXTitle on each node and returning the pixel center
+        of the first match (excluding any whose text contains `exclude`).
+
+        This replaces System Events traversal, which is unusably slow on the deeply
+        nested Catalyst tree: iterating `entire contents` re-resolves an absolute
+        reference per property read (~19s for 170 nodes), whereas this native walk
+        covers ~240 nodes in ~0.6s (measured live).
+        """
+        try:
+            from ApplicationServices import (  # type: ignore[import]
+                AXUIElementCreateApplication,
+                AXUIElementCopyAttributeValue,
+                AXValueGetValue,
+                kAXChildrenAttribute,
+                kAXDescriptionAttribute,
+                kAXValueAttribute,
+                kAXTitleAttribute,
+                kAXPositionAttribute,
+                kAXSizeAttribute,
+                kAXValueCGPointType,
+                kAXValueCGSizeType,
+            )
+        except Exception:
+            return None
+
+        try:
+            pid_result = subprocess.run(
+                ["osascript", "-e",
+                 'tell application "System Events" to return unix id of process "Podcasts"'],
+                capture_output=True, text=True, timeout=5,
+            )
+            pid = int(pid_result.stdout.strip())
+        except Exception:
+            return None
+
+        app_ref = AXUIElementCreateApplication(pid)
+
+        def _attr(el, a):
+            try:
+                err, val = AXUIElementCopyAttributeValue(el, a, None)
+                return val if err == 0 else None
+            except Exception:
+                return None
+
+        stack = [app_ref]
+        seen = 0
+        text_attrs = (kAXDescriptionAttribute, kAXValueAttribute, kAXTitleAttribute)
+        while stack and seen < node_cap:
+            el = stack.pop()
+            seen += 1
+            for a in text_attrs:
+                v = _attr(el, a)
+                if isinstance(v, str) and needle in v and (
+                    exclude is None or exclude not in v
+                ):
+                    pv = _attr(el, kAXPositionAttribute)
+                    sv = _attr(el, kAXSizeAttribute)
+                    if pv is not None and sv is not None:
+                        okp, pt = AXValueGetValue(pv, kAXValueCGPointType, None)
+                        oks, sz = AXValueGetValue(sv, kAXValueCGSizeType, None)
+                        if okp and oks:
+                            return (int(pt.x + sz.width / 2), int(pt.y + sz.height / 2))
+                    break
+            ch = _attr(el, kAXChildrenAttribute)
+            if ch:
+                stack.extend(ch)
+        return None
 
     def _dismiss_delete_dialog_if_unexpected(self) -> str:
         """Check for an unexpected remove/delete sheet after a download click.
@@ -2919,14 +3220,147 @@ class PodcastsController:
             time.sleep(0.05)
 
         _mouse(Quartz.kCGEventMouseMoved, cx, cy)
-        time.sleep(0.2)
+        time.sleep(0.15)
         _mouse(Quartz.kCGEventLeftMouseDown, cx, cy)
         time.sleep(0.1)
         _mouse(Quartz.kCGEventLeftMouseUp, cx, cy)
-        time.sleep(0.8)
+        time.sleep(0.4)
 
         self.logger.log(f"Clicked Downloaded sidebar at ({cx},{cy})", step="14")
         return "navigated"
+
+    def show_downloading_page(self, wait_timeout: int = 1800) -> str:
+        """Open the 'Downloading' progress modal, then wait for it to auto-close.
+
+        Run right after every show's episodes have been queued.  Apple Podcasts
+        surfaces a 'Downloading' entry at the top of the Downloaded view while
+        downloads are active; clicking it opens the 'Downloads' modal (Cancel All /
+        Done + per-episode progress).  Podcasts auto-dismisses that modal once every
+        queued episode has finished, so its disappearance is the all-downloads-complete
+        signal — we open it, then do nothing but poll until it closes, at which point
+        cleanup can start immediately with no further waiting.
+
+        Returns:
+          'completed'          – modal opened and then auto-closed → downloads done.
+          'no_downloading_item'– nothing queued/already finished → treat as done.
+          'opened_timeout'     – modal opened but did not close within wait_timeout.
+          'clicked_unconfirmed'– clicked 'Downloading' but the modal was not detected.
+          'not_navigated' | 'click_failed' – could not get there.
+        """
+        self.activate()
+        self.wait_for_window()
+        nav = self.navigate_to_downloaded_tab()
+        self.logger.log(f"Downloading page: navigated to Downloaded ({nav})", step="13")
+        if nav != "navigated":
+            return "not_navigated"
+
+        # The 'Downloading' entry can take a moment to register after navigation
+        # (the download has to be accepted into the queue first). Probe several
+        # times over ~15s before giving up.
+        pos: tuple[int, int] | None = None
+        for delay in (2, 3, 4):
+            time.sleep(delay)
+            pos = self._find_downloading_button()
+            if pos is not None:
+                break
+        if pos is None:
+            # Dump the AX tree so we can see what the Downloaded page actually
+            # exposes (the 'Downloading' element may use a label we don't match yet,
+            # or the queue may already be empty because the episodes finished).
+            dump = self._dump_ax_tree(
+                "downloading_page_not_found", max_depth=12, max_elements=1500
+            )
+            self.logger.log(
+                f"Downloading page: no 'Downloading' entry found — AX tree dumped to "
+                f"{dump} (downloads may have finished already)",
+                step="13",
+            )
+            return "no_downloading_item"
+
+        try:
+            import Quartz  # type: ignore[import]
+        except ImportError:
+            return "click_failed"
+
+        cx, cy = pos
+
+        def _mouse(kind, x, y):
+            pt = Quartz.CGPointMake(x, y)
+            ev = Quartz.CGEventCreateMouseEvent(None, kind, pt, Quartz.kCGMouseButtonLeft)
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+            time.sleep(0.05)
+
+        # Click the 'Downloading' header; clicking it opens the 'Downloads' modal
+        # (the sheet with Cancel All / Done and per-episode progress bars).  Verify
+        # the modal actually appeared and retry once if it didn't — the header sits
+        # close to the toolbar, so a single click can occasionally miss.
+        opened = False
+        for attempt in range(2):
+            try:
+                _mouse(Quartz.kCGEventMouseMoved, cx, cy)
+                time.sleep(0.2)
+                _mouse(Quartz.kCGEventLeftMouseDown, cx, cy)
+                time.sleep(0.1)
+                _mouse(Quartz.kCGEventLeftMouseUp, cx, cy)
+                time.sleep(0.6)
+            except Exception as exc:
+                self.logger.log(f"Downloading page: click failed ({exc})", step="13")
+                return "click_failed"
+
+            if self._downloads_modal_open():
+                self.logger.log(
+                    f"Downloading page: opened Downloads modal at ({cx},{cy}) "
+                    f"(attempt {attempt + 1})",
+                    step="13",
+                )
+                opened = True
+                break
+            # Re-locate the header before retrying (layout may have shifted).
+            repos = self._find_downloading_button()
+            if repos is not None:
+                cx, cy = repos
+
+        if not opened:
+            self.logger.log(
+                f"Downloading page: clicked 'Downloading' at ({cx},{cy}) but the "
+                f"Downloads modal was not detected",
+                step="13",
+            )
+            return "clicked_unconfirmed"
+
+        # Now do nothing but wait for the modal to auto-close. Podcasts dismisses it
+        # the moment the last queued episode finishes downloading, so its
+        # disappearance is the completion signal — as soon as it's gone we return and
+        # cleanup starts immediately, with no extra fixed wait.
+        t_open = time.time()
+        deadline = t_open + wait_timeout
+        while time.time() < deadline:
+            time.sleep(3)
+            if not self._downloads_modal_open():
+                waited = int(time.time() - t_open)
+                self.logger.log(
+                    f"Downloading page: modal auto-closed after {waited}s — all "
+                    f"downloads complete; starting cleanup",
+                    step="13",
+                )
+                return "completed"
+            waited = int(time.time() - t_open)
+            self.logger.log(f"Downloads still in progress ({waited}s)", step="13")
+
+        self.logger.log(
+            f"Downloading page: modal still open after {wait_timeout}s — proceeding",
+            step="13",
+        )
+        return "opened_timeout"
+
+    def _downloads_modal_open(self) -> bool:
+        """True if the 'Downloads' progress modal (Cancel All / Done) is showing.
+
+        Detected by the presence of the 'Cancel All' control via the native AX walk
+        (whole app tree, so it finds the control whether the modal is a sheet or a
+        child window).
+        """
+        return self._ax_find_text_center("Cancel All") is not None
 
     def _dump_ax_tree(self, label: str, max_depth: int = 6, max_elements: int = 500) -> str:
         """Dump the Podcasts AX tree to a text file in logs/.
@@ -3128,81 +3562,14 @@ class PodcastsController:
         return None
 
     def _find_downloading_button(self) -> tuple[int, int] | None:
-        """BFS the Podcasts window for an element with 'Downloading' in its description.
+        """Find the 'Downloading' element in the Downloaded view; return its center.
 
-        Returns (cx, cy) pixel center if found, else None.
-        Matches elements > 50px wide so we skip tiny labels.
+        The Downloaded view shows a 'Downloading' header at the top while downloads
+        are queued; clicking it opens the in-progress Downloads modal.  Returns
+        (cx, cy) pixel center if found, else None.  Uses the native AX walk
+        (~0.6s) — `exclude="Downloaded"` so the sidebar item never matches.
         """
-        script = """
-        tell application "System Events"
-            set frontmost of process "Podcasts" to true
-        end tell
-        delay 0.1
-        tell application "System Events"
-            tell process "Podcasts"
-                if not (exists window 1) then return "not_found"
-                set q to {window 1}
-                set deadline to (current date) + 3
-                repeat 800 times
-                    if (count of q) = 0 then exit repeat
-                    if (current date) > deadline then exit repeat
-                    set elem to item 1 of q
-                    if (count of q) > 1 then
-                        set q to items 2 thru -1 of q
-                    else
-                        set q to {}
-                    end if
-                    -- Check description, title, and value for "Downloading" text
-                    set matchFound to false
-                    set lbl to ""
-                    repeat with attr in {"description", "title", "value"}
-                        try
-                            if attr is "description" then
-                                set lbl to description of elem as string
-                            else if attr is "title" then
-                                set lbl to title of elem as string
-                            else
-                                set lbl to value of elem as string
-                            end if
-                        end try
-                        if lbl contains "Downloading" and lbl does not contain "Downloaded" then
-                            set matchFound to true
-                            exit repeat
-                        end if
-                    end repeat
-                    if matchFound then
-                        set sz to {0, 0}
-                        try
-                            set sz to size of elem
-                        end try
-                        if (item 1 of sz) > 50 then
-                            set pos to {0, 0}
-                            try
-                                set pos to position of elem
-                            end try
-                            set cx to ((item 1 of pos) + (item 1 of sz) / 2) as integer
-                            set cy to ((item 2 of pos) + (item 2 of sz) / 2) as integer
-                            return "CENTER:" & cx & "," & cy
-                        end if
-                    end if
-                    try
-                        repeat with ch in UI elements of elem
-                            set end of q to ch
-                        end repeat
-                    end try
-                end repeat
-                return "not_found"
-            end tell
-        end tell
-        """
-        out = run_osascript(script, timeout=8, label="find Downloading button")
-        if not out.startswith("CENTER:"):
-            return None
-        try:
-            cx, cy = (int(v) for v in out.replace("CENTER:", "").split(","))
-            return (cx, cy)
-        except ValueError:
-            return None
+        return self._ax_find_text_center("Downloading", exclude="Downloaded")
 
     def wait_for_downloads_stable(self, timeout: int = 180) -> str:
         """Wait for all downloads to finish by monitoring Podcasts' Downloading indicator.
@@ -3219,6 +3586,17 @@ class PodcastsController:
         t_start = time.time()
         pos: tuple[int, int] | None = None
 
+        # If show_downloading_page() left the 'Downloads' progress modal open, it is a
+        # blocking sheet that would swallow the sidebar navigation below. Dismiss it
+        # first with Escape (downloads keep running in the background — we never touch
+        # 'Cancel All').
+        if self._downloads_modal_open():
+            run_osascript(
+                'tell application "System Events" to key code 53',  # Escape
+                timeout=5, label="dismiss Downloads modal before cleanup",
+            )
+            time.sleep(0.5)
+
         # Navigate to the Downloaded tab — the 'Downloading' section is at the top.
         nav = self.navigate_to_downloaded_tab()
         self.logger.log(f"Download wait: navigated to Downloaded tab ({nav})", step="14")
@@ -3226,7 +3604,7 @@ class PodcastsController:
         # Two-pass probe: check at ~3s then ~11s after nav.
         # If the Downloading button appears, it means episodes are still in flight.
         # If it never appears, downloads finished before/during nav (fast connection).
-        for attempt, delay in enumerate((3, 8)):
+        for attempt, delay in enumerate((2, 5)):
             time.sleep(delay)
             pos = self._find_downloading_button()
             if pos is not None:
@@ -3243,7 +3621,7 @@ class PodcastsController:
                 "Downloading button not found — downloads likely done",
                 step="14",
             )
-            time.sleep(5)
+            time.sleep(2)
             elapsed = int(time.time() - t_start)
             self.state.data.update({
                 "download_state": "completed_fast",
@@ -3282,7 +3660,7 @@ class PodcastsController:
             still_active = self._find_downloading_button() is not None
             self.logger.log(f"Downloads in progress ({elapsed}s)", step="14")
             if not still_active:
-                time.sleep(5)
+                time.sleep(2)
                 elapsed = int(time.time() - t_start)
                 self.logger.log(
                     f"Downloads complete after {elapsed}s",
@@ -3301,7 +3679,7 @@ class PodcastsController:
             f"Download wait timed out after {elapsed}s — proceeding anyway",
             step="14", download_state="timeout", download_wait_seconds=elapsed,
         )
-        time.sleep(5)
+        time.sleep(2)
         self.state.data.update({
             "download_state": "timeout",
             "download_wait_seconds": elapsed,
@@ -3398,14 +3776,16 @@ class PodcastsController:
             end tell
         end tell
         """
-        # The sheet appears on screen quickly but can take up to ~20s to become
-        # AX-accessible as 'sheet 1 of window 1'.  Retry for up to 30 seconds.
+        # The sheet usually becomes AX-accessible within a couple of seconds.  Poll
+        # quickly (0.4s) so we react the instant it appears, and cap the wait at ~8s:
+        # the old 20×1.5s loop burned a flat 30s on every removal that produced no
+        # confirmation sheet at all, which dominated per-show removal time.
         out = "no_sheet"
         for _attempt in range(20):
-            out = run_osascript(script, timeout=10, label="click Remove in confirmation sheet")
+            out = run_osascript(script, timeout=5, label="click Remove in confirmation sheet")
             if out != "no_sheet":
                 break
-            time.sleep(1.5)
+            time.sleep(0.4)
         self.logger.log(f"Confirmation sheet click: {out}", step="14")
         return out
 
@@ -3481,7 +3861,7 @@ class PodcastsController:
         self.activate()
         self.wait_for_window()
         # Give Podcasts time to load episode metadata through the VPN tunnel.
-        time.sleep(5)
+        time.sleep(3)
 
         see_all_status = self.click_see_all()
         if see_all_status in ("error", "see_all_not_found"):
@@ -4092,12 +4472,12 @@ class PodcastsController:
                 self.logger.log(f"Downloads cleanup: nav failed ({nav})", step="14")
                 results.append({"iteration": iteration + 1, "result": f"nav_failed:{nav}"})
                 break
-            time.sleep(0.8)
+            time.sleep(0.3)
 
             frame = self._find_downloaded_card_frame()
             if frame is None:
                 # Retry once with extra wait (card might still be rendering)
-                time.sleep(1.5)
+                time.sleep(0.5)
                 frame = self._find_downloaded_card_frame()
             if frame is None:
                 self.logger.log(
@@ -4128,7 +4508,7 @@ class PodcastsController:
                 None, Quartz.kCGEventRightMouseUp, pt, Quartz.kCGMouseButtonRight
             )
             Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
-            time.sleep(0.8)  # Mac Catalyst context menu render time
+            time.sleep(0.5)  # Mac Catalyst context menu render time (min; bump if menu misses)
 
             # AX click ('Remove from Library' contains 'Remove' → matched if accessible)
             ax_ok = self._click_remove_menu_item_ax()
@@ -4147,9 +4527,10 @@ class PodcastsController:
                     timeout=8, check=False,
                 )
 
-            # Wait for confirmation sheet — Podcasts shows "Remove all episodes…?" after
-            # "Remove from Library" is activated. Give it time to render.
-            time.sleep(1.5)
+            # Podcasts shows a "Remove all episodes…?" sheet after "Remove from
+            # Library" is activated. _click_confirmation_remove() now polls quickly
+            # for it to render, so only a short settle is needed here.
+            time.sleep(0.4)
             confirm = self._click_confirmation_remove()
 
             method = "ax" if ax_ok else "keyboard"
@@ -4161,18 +4542,25 @@ class PodcastsController:
                 f"Downloads cleanup card {iteration + 1}: {result_label}", step="14"
             )
             results.append({"iteration": iteration + 1, "result": result_label})
-            time.sleep(1.5)
+            time.sleep(0.3)  # brief settle before re-navigating for the next card
 
         return results
 
     def quit_app(self) -> None:
-        if HAS_PYXA:
-            try:
-                PyXA.Application("Podcasts").quit()
-                return
-            except Exception:
-                pass
-        run_osascript('tell application "Podcasts" to quit', label="quit Podcasts")
+        # Both PyXA.quit() and `osascript ... quit` are GRACEFUL but SYNCHRONOUS:
+        # they block until Podcasts has fully terminated, which can take 10-30s after
+        # a cleanup pass (the app flushes its library/download state on the way out).
+        # That blocking was the entire "slow to quit" delay. Fire the quit
+        # asynchronously instead — the AppleScript still performs a clean quit, but
+        # the run continues immediately while Podcasts winds down in the background.
+        try:
+            subprocess.Popen(
+                ["osascript", "-e", 'tell application "Podcasts" to quit'],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            self.logger.log("Requested Podcasts quit (async)", step="15")
+        except Exception as exc:
+            self.logger.log(f"quit_app async launch failed: {exc}", step="15")
 
 
 # -----------------------------------------------------------------------------
@@ -4273,13 +4661,32 @@ class Orchestrator:
                     else:
                         self.logger.log("VPN disabled", step="06", status="vpn_disabled")
 
+                # Whether downloads are already confirmed complete before cleanup.
+                # On a resume that skips straight to cleanup we don't know, so the
+                # cleanup phase will fall back to its own download wait.
+                downloads_done = False
+
+                if not skip_to_cleanup:
                     for tab_task in self.config.tabs:
                         self._process_tab(tab_task, cycle)
 
                     self.state.mark_phase(cycle, "all_tabs_completed")
 
+                    # Open the Downloading progress page now that every show's
+                    # episodes are queued, then wait (doing nothing else) for that
+                    # modal to auto-close — its disappearance means every episode
+                    # finished downloading, so cleanup can start right away.
+                    try:
+                        dl_result = self.podcasts.show_downloading_page()
+                        downloads_done = dl_result in ("completed", "no_downloading_item")
+                    except Exception as exc:
+                        self.logger.log(
+                            f"show_downloading_page error (non-fatal): {exc}",
+                            step="13",
+                        )
+
                 if self.config.cleanup:
-                    self._cleanup_phase(cycle)
+                    self._cleanup_phase(cycle, downloads_already_done=downloads_done)
 
                 self.podcasts.quit_app()
 
@@ -4502,7 +4909,8 @@ class Orchestrator:
         self.podcasts.open_url(podcast_url)
         self.podcasts.activate()
         self.podcasts.wait_for_window()
-        time.sleep(3)
+        # No fixed settle: click_see_all() already polls for the element to render,
+        # so any wait here is dead time before that poll even starts.
         self.logger.log("Podcasts page loaded", step="10")
 
         # Capture show name for state-driven cleanup.
@@ -4567,10 +4975,18 @@ class Orchestrator:
         self.podcasts.scroll_to_top()
         self.logger.log("Episode list reset to top", step="12")
 
+        # Download every requested episode of this show with a SINGLE AX tree-walk:
+        # download_episode_rows measures all the rows up-front and then pixel-clicks
+        # each, instead of scrolling to top and re-walking the tree once per episode
+        # (which was the ~30s-per-episode latency between downloads).
+        self.logger.log(
+            f"Downloading episodes {list(tab_task.videos)} (single-pass)",
+            step="13", videos=list(tab_task.videos),
+        )
+        statuses = self.podcasts.download_episode_rows(list(tab_task.videos))
         for video_no in tab_task.videos:
             self.state.update(current_video=video_no)
-            self.logger.log(f"Target video {video_no} searching", step="13", video=video_no)
-            status = self.podcasts.download_episode_row(video_no)
+            status = statuses.get(video_no, "download_not_found")
             self.logger.log(f"Target video {video_no} {status}", step="13",
                             video=video_no, status=status)
             self.state.mark_phase(cycle, f"video_{tab_task.tab}_{video_no}_{status}")
@@ -4615,20 +5031,29 @@ class Orchestrator:
         except Exception as exc:
             self.logger.log(f"clean_start cleanup error (non-fatal): {exc}", step="00")
 
-    def _cleanup_phase(self, cycle: int) -> None:
+    def _cleanup_phase(self, cycle: int, downloads_already_done: bool = False) -> None:
         self.state.mark_phase(cycle, "cleanup_started")
         self.podcasts.activate()
         self.podcasts.wait_for_window()
         self.logger.log("Cleanup phase start", step="14", cycle=cycle)
 
-        # Wait for all in-progress downloads to finish before removing anything.
-        dl_status = self.podcasts.wait_for_downloads_stable(timeout=180)
-        self.logger.log(
-            f"Download wait: {dl_status} "
-            f"(state={self.state.data.get('download_state')} "
-            f"waited={self.state.data.get('download_wait_seconds')}s)",
-            step="14", cycle=cycle,
-        )
+        if downloads_already_done:
+            # show_downloading_page() already watched the Downloads modal close, so
+            # every episode is finished — no need to re-poll. Start removing now.
+            self.logger.log(
+                "Downloads already confirmed complete (Downloading modal closed) — "
+                "skipping download wait",
+                step="14", cycle=cycle,
+            )
+        else:
+            # Wait for all in-progress downloads to finish before removing anything.
+            dl_status = self.podcasts.wait_for_downloads_stable(timeout=180)
+            self.logger.log(
+                f"Download wait: {dl_status} "
+                f"(state={self.state.data.get('download_state')} "
+                f"waited={self.state.data.get('download_wait_seconds')}s)",
+                step="14", cycle=cycle,
+            )
         self.state.mark_phase(cycle, "downloads_stable")
 
         # Remove every downloaded episode from the Downloads tab.
@@ -4669,7 +5094,11 @@ def main(argv: list[str]) -> int:
                         help="Dump Podcasts AX tree (Downloaded tab state) to logs/ without running automation")
     args = parser.parse_args(argv)
 
-    config = load_config(args.input)
+    try:
+        config = load_config(args.input)
+    except AutomationError as exc:
+        print(f"\nConfiguration error:\n{exc}\n", file=sys.stderr)
+        return 1
     if args.diagnose_vpn:
         logger = RunLogger(args.output_dir)
         state = StateManager(args.state)

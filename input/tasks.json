@@ -4,11 +4,28 @@
     "enabled": true,
     "app": "ProtonVPN",
     "location": "United States",
-    "require_provider_in_org": false
+    "require_provider_in_org": false,
+    "calibration": {
+      "connect_offset_from_right": 49,
+      "header_height": 57,
+      "row_height": 32
+    }
   },
   "tabs": [
-    { "tab": 1, "videos": [1,2] },
-    { "tab": 2, "videos": [1,2] }
+    {
+      "tab": 1,
+      "videos": [
+        1,
+        2
+      ]
+    },
+    {
+      "tab": 2,
+      "videos": [
+        1,
+        2
+      ]
+    }
   ],
   "cleanup": true,
   "cleanup_mode": "remove_download",
