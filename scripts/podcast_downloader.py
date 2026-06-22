@@ -684,10 +684,22 @@ class VPNController:
                 step="06",
             )
 
-        # Build a try-order: start at the cycle-determined slot, wrap through all.
-        # If one slot's VPN never establishes (server down/busy), we disconnect
-        # and fall through to the next slot automatically.
-        start_idx = (cycle - 1) % len(servers)
+        # Build a try-order: start at the next server in a PERSISTENT rotation and
+        # wrap through all. The pointer is stored in state per location and advances
+        # by one on every connection, so the repeated flow walks through ALL servers
+        # instead of always starting at slot 1 on each fresh run. (The old
+        # `(cycle - 1) % len` reset to slot 1 every run, which is why only one IP was
+        # ever used.) Persist the advance immediately so a crash/next run continues
+        # from the next server.
+        rot = self.state.data.setdefault("vpn_rotation_index", {})
+        start_idx = int(rot.get(vpn_cfg.location, 0)) % len(servers)
+        rot[vpn_cfg.location] = (start_idx + 1) % len(servers)
+        self.state.save()
+        self.logger.log(
+            f"VPN rotation: starting at slot index {start_idx} "
+            f"({servers[start_idx]}); next run will use index {rot[vpn_cfg.location]}",
+            step="06", rotation_index=start_idx,
+        )
         servers_to_try = [servers[(start_idx + off) % len(servers)]
                           for off in range(len(servers))]
         last_exc: AutomationError | None = None
@@ -1478,44 +1490,54 @@ class VPNController:
             _mouse(Quartz.kCGEventLeftMouseUp,   expand_x, expand_y)
             time.sleep(1.2)  # extra headroom for slow machines / animation lag
 
-        # Scroll the target server row into view before hovering.
-        # ProtonVPN's server list is virtualized: rows past the first visible page
-        # only exist once scrolled to. Before this step the code computed server_y
-        # for any slot but never scrolled, so slots below the window bottom got a
-        # cursor warp to an off-screen Y — the Connect button never rendered and the
-        # click hit nothing (the "stuck after the first ~5 servers" symptom).
-        # If server_y sits near/below the window bottom, scroll the list up so the
-        # row lands at a comfortable target inside the viewport, then shift server_y
-        # by the same amount (a vertical scroll does not change the Connect X).
-        if w_h > 0:
-            win_bottom = w_y + w_h
-            if server_y > win_bottom - 80:
-                target_y = w_y + (w_h // 2)
-                scroll_px = server_y - target_y
-                if scroll_px > 0:
-                    self.logger.log(
-                        f"Slot {slot_num}: server_y={server_y} below window bottom "
-                        f"{win_bottom} — scrolling list {scroll_px}px into view",
-                        step="06", slot=slot_num,
-                    )
-                    # Scroll in chunks: a single huge pixel-scroll event can be
-                    # clamped/dropped by the Mac Catalyst list, leaving the row
-                    # off-screen. ~400px steps land reliably.
-                    scroll_cx, scroll_cy = w_x + w_w // 2, w_y + w_h // 2
-                    remaining = scroll_px
-                    while remaining > 0:
-                        step_px = min(400, remaining)
-                        sev = Quartz.CGEventCreateScrollWheelEvent(
-                            None, Quartz.kCGScrollEventUnitPixel, 1, -step_px
-                        )
-                        Quartz.CGEventSetLocation(
-                            sev, Quartz.CGPointMake(scroll_cx, scroll_cy)
-                        )
-                        Quartz.CGEventPost(Quartz.kCGHIDEventTap, sev)
-                        time.sleep(0.12)
-                        remaining -= step_px
-                    time.sleep(0.4)
-                    server_y -= scroll_px
+        # Bring the target server into view by setting the AX scroll-bar value.
+        # ProtonVPN's Mac Catalyst list IGNORES synthetic pixel scroll-wheel events
+        # (verified live: the rows never move, so the Connect click lands on the
+        # pinned header / empty space and nothing connects — the "stuck after the
+        # first ~5 servers" symptom). Setting `value of scroll bar 1` DOES work and is
+        # precise (verified live: 0.25 → mid-list). The "United States" header stays
+        # pinned at the top while servers scroll beneath it, so once we scroll slot N
+        # to the top of the server area we hover the FIRST visible server row (the
+        # slot-1 position) — which is now slot N.
+        total_slots = len(
+            self.state.data.get("discovered_servers_by_location", {}).get(location, [])
+        ) or slot_num
+        # Position needed once slot_num is past the first visible page. The first
+        # visible server sits at the slot-1 row position; rows below it are visible up
+        # to the window bottom.
+        first_server_y = (
+            r2_top + SERVER_ROW_H // 2 if already_expanded
+            else r2_top + US_HEADER_H + SERVER_ROW_H // 2
+        )
+        visible_rows = max(1, (w_y + w_h - first_server_y) // SERVER_ROW_H) if w_h > 0 else 12
+        if slot_num > visible_rows and total_slots > 1:
+            # Fraction of the list scroll range that puts slot_num at the top of the
+            # server area (scroll-bar value is linear in row index).
+            frac = min(1.0, max(0.0, (slot_num - 1) / float(total_slots)))
+            self.logger.log(
+                f"Slot {slot_num}: scrolling list via scroll bar to {frac:.5f} "
+                f"(of {total_slots} servers), then hovering first visible row",
+                step="06", slot=slot_num,
+            )
+            set_scroll = f"""
+            tell application "System Events"
+                repeat with candidate in {{{process_list}}}
+                    if exists process (candidate as text) then
+                        tell process (candidate as text)
+                            try
+                                set value of scroll bar 1 of scroll area 1 of window 1 to {frac:.6f}
+                            end try
+                        end tell
+                        exit repeat
+                    end if
+                end repeat
+            end tell
+            """
+            run_osascript(set_scroll, timeout=10,
+                          label=f"scroll to slot {slot_num} (frac {frac:.4f})")
+            time.sleep(0.6)
+            # slot_num is now the first visible server — hover that fixed row position.
+            server_y = first_server_y
 
         # Hover the target server row so its Connect button renders, then click it.
         # Warp the REAL cursor (not just synthetic moves): enter the row from just
@@ -4441,7 +4463,9 @@ class PodcastsController:
             return "no_confirm_dialog"
         return f"remove_failed:{remove}"
 
-    def cleanup_all_from_downloads_tab(self) -> list[dict[str, Any]]:
+    def cleanup_all_from_downloads_tab(
+        self, expected_cards: int | None = None
+    ) -> list[dict[str, Any]]:
         """Remove all downloaded shows directly from the Downloads tab.
 
         The Downloads tab displays show cards (artwork squares, roughly 80–450 px per
@@ -4451,7 +4475,12 @@ class PodcastsController:
           3. Click ⋯, wait 1.2s for the Mac Catalyst context menu.
           4. Try AX click on 'Remove' / 'Delete' menu item; keyboard Down+Enter fallback.
           5. If Podcasts shows a confirmation sheet, click Remove in it.
-          6. Re-navigate to Downloaded and repeat until no cards remain.
+          6. Re-navigate to Downloaded and repeat.
+
+        `expected_cards`: if given (the number of shows we actually downloaded this
+        cycle), stop after removing that many — this skips the expensive
+        "is the grid empty?" card search at the end (each such search is a ~30s
+        System Events AX walk, and it ran 2-3× per cleanup before).
         """
         try:
             import Quartz  # type: ignore[import]
@@ -4465,7 +4494,18 @@ class PodcastsController:
             time.sleep(0.05)
 
         results: list[dict[str, Any]] = []
+        removed = 0
         for iteration in range(50):
+            # Stop as soon as we've removed every card we expected — avoids the
+            # trailing empty-grid search(es), which dominate cleanup time.
+            if expected_cards is not None and removed >= expected_cards:
+                self.logger.log(
+                    f"Downloads cleanup: removed expected {removed} card(s) — done",
+                    step="14",
+                )
+                results.append({"iteration": iteration + 1, "result": "done_expected_count"})
+                break
+
             # Re-navigate each iteration — card removal may shift view focus
             nav = self.navigate_to_downloaded_tab()
             if nav != "navigated":
@@ -4542,6 +4582,7 @@ class PodcastsController:
                 f"Downloads cleanup card {iteration + 1}: {result_label}", step="14"
             )
             results.append({"iteration": iteration + 1, "result": result_label})
+            removed += 1
             time.sleep(0.3)  # brief settle before re-navigating for the next card
 
         return results
@@ -5056,9 +5097,14 @@ class Orchestrator:
             )
         self.state.mark_phase(cycle, "downloads_stable")
 
-        # Remove every downloaded episode from the Downloads tab.
-        # No show-name tracking needed — just clear whatever is there.
-        results = self.podcasts.cleanup_all_from_downloads_tab()
+        # Each downloaded show is one card on the Downloads tab. We know how many we
+        # queued this cycle, so tell cleanup to stop after removing exactly that many
+        # — this skips the ~30s-each empty-grid searches that used to run at the end.
+        shows = self.state.data.get("processed_shows", {}).get(str(cycle), [])
+        expected_cards = sum(1 for s in shows if s.get("videos_downloaded")) or None
+
+        # Remove every downloaded show from the Downloads tab.
+        results = self.podcasts.cleanup_all_from_downloads_tab(expected_cards=expected_cards)
 
         for r in results:
             self.state.add_cleanup_result(cycle=cycle, **r)
