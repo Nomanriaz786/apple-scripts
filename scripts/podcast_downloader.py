@@ -38,6 +38,9 @@ DEFAULT_VERIFY_TIMEOUT_SEC = 30
 DEFAULT_SEE_ALL_BUDGET_SEC = 60
 DEFAULT_ACCESSIBILITY_DEPTH = 20
 DEFAULT_OSASCRIPT_TIMEOUT = 30
+# Gap between consecutive episode download clicks — firing them back-to-back can
+# make Podcasts drop/queue-fail the next download.
+DOWNLOAD_GAP_SEC = 5.5
 APPLE_PODCASTS_HOST = "podcasts.apple.com"
 
 _COUNTRY_CODE_FALLBACK = {
@@ -2775,7 +2778,15 @@ class PodcastsController:
         max_n = max(video_nos)
         self.scroll_to_top()
         win_y, win_h, rows = self._find_episode_rows(max_n)
-        for video_no in video_nos:
+        for i, video_no in enumerate(video_nos):
+            # Keep a 5–6s gap between consecutive download clicks. Firing them
+            # back-to-back can make Podcasts drop/queue-fail the next download.
+            if i > 0:
+                self.logger.log(
+                    f"Waiting {DOWNLOAD_GAP_SEC}s before episode {video_no} download",
+                    step="13",
+                )
+                time.sleep(DOWNLOAD_GAP_SEC)
             rect = rows.get(video_no)
             if rect is None:
                 self.logger.log(
@@ -4712,13 +4723,13 @@ class PodcastsController:
                 results.append({"iteration": iteration + 1, "result": "done_expected_count"})
                 break
 
-            # Re-navigate each iteration — card removal may shift view focus
+            # Re-navigate each iteration — card removal may shift view focus.
+            # (navigate_to_downloaded_tab already waits for the click to settle.)
             nav = self.navigate_to_downloaded_tab()
             if nav != "navigated":
                 self.logger.log(f"Downloads cleanup: nav failed ({nav})", step="14")
                 results.append({"iteration": iteration + 1, "result": f"nav_failed:{nav}"})
                 break
-            time.sleep(0.3)
 
             frame = self._find_downloaded_card_frame()
             if frame is None:
@@ -4789,7 +4800,8 @@ class PodcastsController:
             )
             results.append({"iteration": iteration + 1, "result": result_label})
             removed += 1
-            time.sleep(0.3)  # brief settle before re-navigating for the next card
+            # No settle here — move straight on to the next show. (The card finder
+            # below retries if the next card hasn't rendered yet.)
 
         return results
 
