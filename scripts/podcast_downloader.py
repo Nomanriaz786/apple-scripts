@@ -2507,65 +2507,108 @@ class PodcastsController:
 
         out = run_osascript(script, timeout=90, label=f"find episode {video_no} position")
 
-        # If episode wasn't visible, scroll down and retry once — the episode list
-        # lazy-loads rows as the viewport scrolls; the first BFS sees only visible rows.
+        # Episode not visible in the initial BFS — scroll the list using AXScrollDownByPage.
+        # Mac Catalyst ignores CGEventCreateScrollWheelEvent and does not respond to
+        # osascript/Quartz Page Down key events for its episode list.  However, every
+        # visible episode AXButton exposes AXScrollDownByPage as an AX action, and
+        # performing it reliably scrolls the list by one viewport.
+        #
+        # After each scroll we compare row titles to count exactly how many rows
+        # scrolled off the top (some overlap rows stay in the AX tree at negative y
+        # coordinates), so the adjusted BFS target is always precise.
         if out.startswith("ERROR:episode_not_found"):
-            import re as _re
-            # Multi-step scroll loop.
-            # After a scroll the BFS resets its counter from 1 (not from episode 1
-            # overall), so we must give it an *adjusted* target: how many more rows
-            # to count after the rows we already scrolled past.
-            # Each iteration scrolls past (seen_n - 1) rows and lowers the target
-            # by the same amount; the 1-row overlap keeps us from overshooting.
-            import re as _re2
-            seen_m = _re.search(r"seen=(\d+)", out)
-            seen_n = int(seen_m.group(1)) if seen_m else 0
-            total_skipped = 0
-            row_h_est = 115  # observed episode row height in px
-            # Scroll target coordinates: within the episode list content area.
-            # x≈880 is the horizontal centre of episode rows (470 + 823/2).
-            # y≈800 is safely inside the scrollable episode list (rows start ~y=660).
-            scroll_cx, scroll_cy = 880, 800
-            for _scroll_attempt in range(30):
-                if seen_n == 0 or seen_n >= video_no - total_skipped:
-                    break
-                # Each Page Down scrolls one viewport height with 1-row overlap,
-                # so net rows skipped = seen_n - 1.  Always scroll exactly 1 page
-                # per attempt; the loop handles reaching any episode.
-                rows_to_skip = max(1, seen_n - 1)
-                total_skipped += rows_to_skip
+            try:
+                from ApplicationServices import (  # type: ignore[import]
+                    AXUIElementCreateApplication,
+                    AXUIElementCopyElementAtPosition,
+                    AXUIElementPerformAction,
+                )
+                _pid = int(subprocess.run(
+                    ["osascript", "-e",
+                     'tell application "System Events" to return unix id of process "Podcasts"'],
+                    capture_output=True, text=True, timeout=5,
+                ).stdout.strip())
+                _ax_app = AXUIElementCreateApplication(_pid)
+
+                def _ep_titles_from_nodes(nds):
+                    """Short title keys for episode rows — used to detect scroll-off."""
+                    return [
+                        text[:60] for role, text, x, y, w, h in nds
+                        if role == "AXButton" and h > 60 and w > 400
+                    ]  # already y-sorted by _ax_nodes DFS order in practice; sort by y below
+
+                def _ep_titles_sorted(nds):
+                    rows_yt = sorted(
+                        [(y, text[:60]) for role, text, x, y, w, h in nds
+                         if role == "AXButton" and h > 60 and w > 400],
+                        key=lambda r: r[0],
+                    )
+                    return [t for _, t in rows_yt]
+
+                prev_titles = _ep_titles_sorted(self._ax_nodes())
+                total_skipped = 0
+
+                for _sa in range(30):
+                    # Stop if episode is within the current visible set.
+                    adjusted_target = video_no - total_skipped
+                    if 1 <= adjusted_target <= len(prev_titles):
+                        break
+
+                    # Find any visible episode button to perform the scroll on.
+                    _scroll_el = None
+                    for role, text, x, y, w, h in self._ax_nodes():
+                        if role == "AXButton" and h > 60 and w > 400:
+                            err_el, _scroll_el = AXUIElementCopyElementAtPosition(
+                                _ax_app, float(x + w // 2), float(y + h // 2), None
+                            )
+                            if err_el == 0 and _scroll_el:
+                                break
+                            _scroll_el = None
+
+                    if _scroll_el is None:
+                        break
+
+                    err_sc = AXUIElementPerformAction(_scroll_el, "AXScrollDownByPage")
+                    if err_sc != 0:
+                        break
+                    time.sleep(0.5)
+
+                    new_titles = _ep_titles_sorted(self._ax_nodes())
+                    new_set = set(new_titles)
+                    scrolled_off = sum(1 for t in prev_titles if t not in new_set)
+
+                    self.logger.log(
+                        f"Download episode {video_no}: AXScrollDownByPage #{_sa + 1} "
+                        f"scrolled_off={scrolled_off} → total_skipped={total_skipped + scrolled_off}",
+                        step="13",
+                    )
+
+                    if scrolled_off == 0:
+                        break  # end of list, no further progress
+
+                    total_skipped += scrolled_off
+                    prev_titles = new_titles
+
                 adjusted_target = video_no - total_skipped
+                if 1 <= adjusted_target <= len(prev_titles):
+                    adj_script = script.replace(
+                        f"set targetN to {video_no}",
+                        f"set targetN to {adjusted_target}",
+                    )
+                    out = run_osascript(
+                        adj_script, timeout=90,
+                        label=f"find episode {video_no} (AX scroll adjusted_target={adjusted_target})",
+                    )
+                    self.logger.log(
+                        f"Download episode {video_no}: AX scroll result → {out[:80]}",
+                        step="13",
+                    )
+
+            except Exception as _exc:
                 self.logger.log(
-                    f"Download episode {video_no}: seen={seen_n} → "
-                    f"Page Down, adjusted target={adjusted_target}",
+                    f"Download episode {video_no}: AX scroll fallback error: {_exc}",
                     step="13",
                 )
-                # Page Down via osascript (consistent with scroll_to_top which uses
-                # CMD+Up the same way).  CGEventCreateScrollWheelEvent is NOT used
-                # here because Mac Catalyst ignores synthetic scroll-wheel events —
-                # the list never moves and the BFS finds the wrong row.
-                # key code 121 = Page Down
-                try:
-                    run_osascript(
-                        'tell application "System Events" to tell process "Podcasts"'
-                        ' to key code 121',
-                        timeout=5, label=f"Page Down for episode {video_no}",
-                    )
-                except AutomationError:
-                    pass
-                time.sleep(0.5)
-                adj_script = script.replace(
-                    f"set targetN to {video_no}",
-                    f"set targetN to {adjusted_target}",
-                )
-                out = run_osascript(
-                    adj_script, timeout=90,
-                    label=f"find episode {video_no} (scroll {_scroll_attempt + 1})",
-                )
-                if not out.startswith("ERROR:episode_not_found"):
-                    break
-                seen_m2 = _re2.search(r"seen=(\d+)", out)
-                seen_n = int(seen_m2.group(1)) if seen_m2 else 0
 
         if out.startswith("ERROR:"):
             self.logger.log(f"Download episode {video_no}: {out}", step="13")
@@ -2857,18 +2900,39 @@ class PodcastsController:
                 scroll_cy = win_y + win_h // 2
                 self.logger.log(
                     f"Episode {video_no}: row bottom {row_bottom} near/below window bottom "
-                    f"{win_bottom} — scrolling {extra_px}px to bring into view",
+                    f"{win_bottom} — nudging with AXScrollDownByPage to bring into view",
                     step="13",
                 )
-                ev = Quartz.CGEventCreateScrollWheelEvent(
-                    None, Quartz.kCGScrollEventUnitPixel, 1, -extra_px
-                )
-                Quartz.CGEventSetLocation(ev, Quartz.CGPointMake(scroll_cx, scroll_cy))
-                Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
-                time.sleep(0.4)
-                # Adjust stored coordinates by the scroll amount (scroll moves rows up)
-                row_y -= extra_px
-                more_y -= extra_px
+                # CGEventCreateScrollWheelEvent is ignored by Mac Catalyst.
+                # Perform one partial scroll via AX: AXScrollDownByPage on the row itself.
+                try:
+                    from ApplicationServices import (  # type: ignore[import]
+                        AXUIElementCreateApplication,
+                        AXUIElementCopyElementAtPosition,
+                        AXUIElementPerformAction,
+                    )
+                    _pid2 = int(subprocess.run(
+                        ["osascript", "-e",
+                         'tell application "System Events" to return '
+                         'unix id of process "Podcasts"'],
+                        capture_output=True, text=True, timeout=5,
+                    ).stdout.strip())
+                    _ax2 = AXUIElementCreateApplication(_pid2)
+                    _err2, _el2 = AXUIElementCopyElementAtPosition(
+                        _ax2, float(scroll_cx), float(scroll_cy), None
+                    )
+                    if _err2 == 0 and _el2:
+                        AXUIElementPerformAction(_el2, "AXScrollDownByPage")
+                        time.sleep(0.4)
+                        # Re-read the row's new position after the scroll.
+                        new_nodes = self._ax_nodes()
+                        for _r, _t, _x, _y, _w, _h in new_nodes:
+                            if _r == "AXButton" and _w == row_w and abs(_h - row_h) <= 5:
+                                row_y = _y
+                                more_y = _y + _h // 2
+                                break
+                except Exception:
+                    pass
 
         row_cx = row_x + row_w // 2
         row_cy = row_y + row_h // 2
