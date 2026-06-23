@@ -3667,6 +3667,43 @@ class PodcastsController:
             self.logger.log(f"AX dump failed ({label}): {exc}", step="AX")
             return ""
 
+    def _has_back_button(self) -> bool:
+        """Return True if a 'Back' nav button is visible — indicates we're on a show
+        detail page inside the Downloads section, NOT on the top-level Downloads grid."""
+        nodes = self._ax_nodes()
+        win_y = 0
+        for role, _t, x, y, w, h in nodes:
+            if role == "AXWindow" and w > 400 and h > 400:
+                win_y = y
+                break
+        for role, text, x, y, w, h in nodes:
+            if role == "AXButton" and "Back" in text and w < 60 and y < win_y + 140:
+                return True
+        return False
+
+    def _click_back_button(self) -> None:
+        """Click the Back navigation button to return to the Downloads grid."""
+        nodes = self._ax_nodes()
+        win_y = 0
+        for role, _t, x, y, w, h in nodes:
+            if role == "AXWindow" and w > 400 and h > 400:
+                win_y = y
+                break
+        for role, text, x, y, w, h in nodes:
+            if role == "AXButton" and "Back" in text and w < 60 and y < win_y + 140:
+                cx, cy = x + w // 2, y + h // 2
+                try:
+                    import Quartz as _Q
+                    pt = _Q.CGPointMake(cx, cy)
+                    for kind in (_Q.kCGEventMouseMoved, _Q.kCGEventLeftMouseDown, _Q.kCGEventLeftMouseUp):
+                        ev = _Q.CGEventCreateMouseEvent(None, kind, pt, _Q.kCGMouseButtonLeft)
+                        _Q.CGEventPost(_Q.kCGHIDEventTap, ev)
+                        import time as _t; _t.sleep(0.05)
+                    self.logger.log(f"Clicked Back button at ({cx},{cy})", step="14")
+                except Exception as exc:
+                    self.logger.log(f"Back button click failed: {exc}", step="14")
+                return
+
     def _find_downloaded_card_frame(self) -> tuple[int, int, int, int] | None:
         """Find the first show card on the Downloaded tab via the native AX walk (~1s).
 
@@ -3676,18 +3713,22 @@ class PodcastsController:
         System Events walk (~30s) if the native walk finds none.
         """
         nodes = self._ax_nodes()
-        win_x = win_w = 0
+        win_x = win_y = win_w = 0
         for role, _t, x, y, w, h in nodes:
             if role == "AXWindow" and w > 400 and h > 400:
-                win_x, win_w = x, w
+                win_x, win_y, win_w = x, y, w
                 break
         if win_w == 0:
             return self._find_downloaded_card_frame_sysevents()
         content_left = win_x + 240  # conservative: sidebar can be wider than 180px on some displays
+        content_top = win_y + 60    # below control bar; rejects nav-bar artwork near window top
         cards = [
             (x, y, w, h) for role, _t, x, y, w, h in nodes
-            if x > content_left and 80 <= w <= 800 and 80 <= h <= 900
-            and w * 4 > h and h * 4 > w and w < win_w - 100
+            if x > content_left and y > content_top
+            and 80 <= w <= 800 and 80 <= h <= 900
+            and h > w               # Downloads grid cards are portrait (taller than wide)
+            and h < w * 4           # but not an impossibly thin strip
+            and w < win_w - 100
         ]
         if cards:
             cards.sort(key=lambda c: (c[1], c[0]))  # top-left-most first
@@ -3736,14 +3777,12 @@ class PodcastsController:
                         set eW to (item 1 of eSz) as integer
                         set eH to (item 2 of eSz) as integer
                     end try
-                    -- Card criteria: in content area, reasonable size.
-                    -- Podcasts show cards are portrait-oriented (artwork + title + subtitle),
-                    -- typically 100–700 px wide and 150–800 px tall. No strict aspect-ratio
-                    -- filter — the card height can be up to 3× the width.
-                    -- No class filter — Mac Catalyst exposes cards under various roles.
-                    if eX > contentLeft and eW >= 80 and eH >= 80 and eW <= 800 and eH <= 900 then
-                        -- Must not be a very thin strip (toolbar/separator) or near-full-width element
-                        if eW * 4 > eH and eH * 4 > eW then
+                    -- Card criteria: in content area, portrait orientation (h > w),
+                    -- and below the control bar (y > wY+60) so nav-bar artwork is excluded.
+                    -- Downloads grid cards are always taller than wide (artwork square + title strip).
+                    if eX > contentLeft and eY > wY + 60 and eW >= 80 and eH >= 80 and eW <= 800 and eH <= 900 then
+                        -- Portrait: card must be taller than wide (excludes landscape nav-bar elements)
+                        if eH > eW then
                             -- Exclude elements that span the full window width (containers, scroll areas)
                             if eW < wW - 100 then
                                 return "CARD:" & eX & "," & eY & "," & eW & "," & eH & "|WIN:" & wX & "," & wY & "," & wW & "," & wH
@@ -4735,7 +4774,6 @@ class PodcastsController:
                 break
 
             # Re-navigate each iteration — card removal may shift view focus.
-            # (navigate_to_downloaded_tab already waits for the click to settle.)
             nav = self.navigate_to_downloaded_tab()
             if nav != "navigated":
                 self.logger.log(f"Downloads cleanup: nav failed ({nav})", step="14")
@@ -4744,9 +4782,24 @@ class PodcastsController:
 
             frame = self._find_downloaded_card_frame()
             if frame is None:
-                # Retry once with extra wait (card might still be rendering)
+                # Retry once — card may still be rendering after navigation.
                 time.sleep(0.5)
                 frame = self._find_downloaded_card_frame()
+            if frame is None:
+                # No card found — determine whether the grid is empty or we landed on
+                # a show's episode page instead of the Downloads grid.  The episode page
+                # has a "Back" button in the nav bar; the grid does not.
+                if self._has_back_button():
+                    self.logger.log(
+                        "Downloads cleanup: on show page — clicking Back to reach grid",
+                        step="14",
+                    )
+                    self._click_back_button()
+                    time.sleep(0.8)
+                    frame = self._find_downloaded_card_frame()
+                    if frame is None:
+                        time.sleep(0.5)
+                        frame = self._find_downloaded_card_frame()
             if frame is None:
                 self.logger.log(
                     f"Downloads cleanup: no more show cards after {iteration} removal(s)",
@@ -4756,17 +4809,23 @@ class PodcastsController:
                 break
 
             card_x, card_y, card_w, card_h = frame
-            card_cx = card_x + card_w // 2
-            card_cy = card_y + card_h // 2
+            # Artwork on Downloads grid cards is always a square whose side equals
+            # the card width.  The ⋯ button appears at the lower-right of the artwork
+            # square (not the lower-right of the full card which includes the title strip
+            # below the artwork).
+            artwork_h = card_w
+            three_x = card_x + card_w - 20       # 20 px inside right edge of artwork
+            three_y = card_y + artwork_h - 20     # 20 px above bottom of artwork square
+            artwork_cx = card_x + card_w // 2
+            artwork_cy = card_y + artwork_h // 2
 
             self.logger.log(
                 f"Downloads cleanup card {iteration + 1}: ({card_x},{card_y},{card_w},{card_h}) "
-                f"center=({card_cx},{card_cy})",
+                f"artwork_cx=({artwork_cx},{artwork_cy}) three_dots=({three_x},{three_y})",
                 step="14",
             )
 
-            # Bring Podcasts to front explicitly — without this, warp events can land
-            # on a different window that slid in front during the AX card search.
+            # Bring Podcasts to front explicitly before any mouse/key events.
             try:
                 run_osascript(
                     'tell application "Podcasts" to activate',
@@ -4776,13 +4835,6 @@ class PodcastsController:
             except AutomationError:
                 pass
 
-            # Warp the real hardware cursor onto the card center, then right-click.
-            # Right-click with the cursor physically over the card opens the same
-            # context menu as the hover-revealed ⋯ button, without needing to know
-            # the exact ⋯ pixel position (which varies by Mac/Podcasts version).
-            # Plain synthetic right-click events (without warp) are ignored by Mac
-            # Catalyst's hit-testing on some Macs — warp guarantees the cursor IS
-            # over the element before the event fires.
             def _warp(x: int, y: int) -> None:
                 pt_w = Quartz.CGPoint(x=float(x), y=float(y))
                 Quartz.CGWarpMouseCursorPosition(pt_w)
@@ -4792,22 +4844,30 @@ class PodcastsController:
                 Quartz.CGEventPost(Quartz.kCGHIDEventTap, mv)
                 time.sleep(0.05)
 
-            _warp(card_cx, card_cy)
-            time.sleep(0.5)   # let hover/tracking area register before right-click
-            Quartz.CGAssociateMouseAndMouseCursorPosition(True)
-            pt_rc = Quartz.CGPoint(x=float(card_cx), y=float(card_cy))
-            ev_rd = Quartz.CGEventCreateMouseEvent(
-                None, Quartz.kCGEventRightMouseDown, pt_rc, Quartz.kCGMouseButtonRight
-            )
-            Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev_rd)
-            time.sleep(0.05)
-            ev_ru = Quartz.CGEventCreateMouseEvent(
-                None, Quartz.kCGEventRightMouseUp, pt_rc, Quartz.kCGMouseButtonRight
-            )
-            Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev_ru)
-            time.sleep(1.2)  # Mac Catalyst context menu render time
+            def _key(vk: int, down: bool) -> None:
+                ev = Quartz.CGEventCreateKeyboardEvent(None, vk, down)
+                Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+                time.sleep(0.07)
 
-            # AX click ('Remove from Library' contains 'Remove' → matched if accessible)
+            def _open_three_dots_menu() -> None:
+                """Hover artwork center → move to ⋯ → left-click to open context menu."""
+                _warp(artwork_cx, artwork_cy)
+                time.sleep(0.8)    # hover so the ⋯ button renders
+                _warp(three_x, three_y)
+                time.sleep(0.3)
+                Quartz.CGAssociateMouseAndMouseCursorPosition(True)
+                pt_td = Quartz.CGPoint(x=float(three_x), y=float(three_y))
+                for kind in (Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp):
+                    ev_td = Quartz.CGEventCreateMouseEvent(
+                        None, kind, pt_td, Quartz.kCGMouseButtonLeft
+                    )
+                    Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev_td)
+                    time.sleep(0.05)
+                time.sleep(1.2)   # Mac Catalyst context menu render time
+
+            _open_three_dots_menu()
+
+            # AX click ('Remove from Library' / 'Remove Downloads' — matched if accessible)
             ax_ok = self._click_remove_menu_item_ax()
             confirm = "no_sheet"
             actual_removed = False
@@ -4817,21 +4877,21 @@ class PodcastsController:
                 confirm = self._click_confirmation_remove()
                 actual_removed = True
             else:
-                # Keyboard fallback — "Remove from Library" position varies by Podcasts
-                # version: position 3 on older builds (3-item menu) and position 4 on
-                # newer builds that added "Go to Latest Episode" at item 1.
-                # Try both counts and verify success via the confirmation sheet:
-                # Remove from Library always requires one; navigation/mark-played do not.
-                for n_down in (3, 4):
-                    down_script = "\n".join(
-                        ["tell application \"System Events\" to key code 125",
-                         "delay 0.3"] * n_down
-                    ) + "\ntell application \"System Events\" to key code 36"
-                    subprocess.run(
-                        ["osascript", "-e", down_script],
-                        timeout=10, check=False,
-                    )
-                    # Quick 1.2s poll: sheet appears immediately if the right item fired.
+                # Keyboard fallback using direct Quartz key events.
+                # IMPORTANT: osascript / System Events key codes are NOT used here because
+                # routing keys through System Events yields focus away from the Mac Catalyst
+                # context menu popover, causing it to close before the item fires.
+                # Quartz CGEvent keys go directly to the focused process without focus change.
+                #
+                # Menu item order (observed on Podcasts Downloads grid):
+                #   1 Follow Show  2 Report a Concern  3 Remove…  4 Play Next  …
+                # "Remove…" opens a confirmation sheet; other items do not.
+                # Try Down×3 first (most common), then Down×2 if no sheet appeared.
+                for n_down in (3, 2):
+                    for _ in range(n_down):
+                        _key(0x7D, True); _key(0x7D, False)   # Down arrow  (kVK 0x7D)
+                        time.sleep(0.25)
+                    _key(0x24, True); _key(0x24, False)        # Return/Enter (kVK 0x24)
                     time.sleep(0.3)
                     confirm = self._click_confirmation_remove(max_attempts=3)
                     if "clicked" in confirm:
@@ -4842,29 +4902,29 @@ class PodcastsController:
                             step="14",
                         )
                         break
-                    # Wrong item selected (navigated away or mark-played).
-                    # Press Escape to dismiss whatever opened, then re-navigate and
-                    # re-right-click before trying the next Down count.
-                    subprocess.run(
-                        ["osascript", "-e",
-                         "tell application \"System Events\" to key code 53"],
-                        timeout=3, check=False,
-                    )
+                    # Wrong item or menu closed — press Escape, re-navigate, retry.
+                    _key(0x35, True); _key(0x35, False)        # Escape (kVK 0x35)
                     time.sleep(0.5)
-                    if n_down < 4:
+                    if n_down > 2:
                         _nav_r = self.navigate_to_downloaded_tab()
                         if _nav_r != "navigated":
                             break
+                        # If navigation landed on show page, click Back first
+                        if self._has_back_button():
+                            self._click_back_button()
+                            time.sleep(0.5)
                         time.sleep(0.3)
                         _rf = self._find_downloaded_card_frame()
                         if _rf is None:
-                            # Card gone without a sheet — edge case (e.g. "Remove Download"
-                            # on a show with no library entry).
+                            # Card gone without confirmation sheet (edge case).
                             actual_removed = True
                             break
                         card_x, card_y, card_w, card_h = _rf
-                        card_cx = card_x + card_w // 2
-                        card_cy = card_y + card_h // 2
+                        artwork_h = card_w
+                        three_x = card_x + card_w - 20
+                        three_y = card_y + artwork_h - 20
+                        artwork_cx = card_x + card_w // 2
+                        artwork_cy = card_y + artwork_h // 2
                         try:
                             run_osascript(
                                 'tell application "Podcasts" to activate',
@@ -4873,20 +4933,7 @@ class PodcastsController:
                             time.sleep(0.3)
                         except AutomationError:
                             pass
-                        _warp(card_cx, card_cy)
-                        time.sleep(0.5)
-                        Quartz.CGAssociateMouseAndMouseCursorPosition(True)
-                        _pt_rc2 = Quartz.CGPoint(x=float(card_cx), y=float(card_cy))
-                        for _kind2, _btn2 in (
-                            (Quartz.kCGEventRightMouseDown, Quartz.kCGMouseButtonRight),
-                            (Quartz.kCGEventRightMouseUp,   Quartz.kCGMouseButtonRight),
-                        ):
-                            _ev2 = Quartz.CGEventCreateMouseEvent(
-                                None, _kind2, _pt_rc2, _btn2
-                            )
-                            Quartz.CGEventPost(Quartz.kCGHIDEventTap, _ev2)
-                            time.sleep(0.05)
-                        time.sleep(1.2)
+                        _open_three_dots_menu()
 
             method = "ax" if ax_ok else "keyboard"
             result_label = (f"removed:{method}" if actual_removed
