@@ -6,9 +6,9 @@
     "location": "United States",
     "require_provider_in_org": false,
     "calibration": {
-      "connect_offset_from_right": 49,
-      "header_height": 57,
-      "row_height": 32
+      "connect_offset_from_right": 56,
+      "header_height": 64,
+      "row_height": 28
     }
   },
   "tabs": [
@@ -16,7 +16,7 @@
       "tab": 1,
       "videos": [
         1,
-        2
+        9
       ]
     }
   ],

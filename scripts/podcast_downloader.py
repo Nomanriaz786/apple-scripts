@@ -2517,11 +2517,27 @@ class PodcastsController:
         # scrolled off the top (some overlap rows stay in the AX tree at negative y
         # coordinates), so the adjusted BFS target is always precise.
         if out.startswith("ERROR:episode_not_found"):
+            # Mac Catalyst ignores CGEventCreateScrollWheelEvent and all synthetic
+            # Page Down inputs.  Strategy: walk the AX tree to get a direct element
+            # reference for an episode AXButton, perform AXScrollDownByPage on it
+            # (NOT via AXUIElementCopyElementAtPosition which returns the innermost
+            # child — an AXImage/AXStaticText — that lacks the scroll action), then
+            # accumulate rows until we reach video_no.
             try:
                 from ApplicationServices import (  # type: ignore[import]
                     AXUIElementCreateApplication,
-                    AXUIElementCopyElementAtPosition,
+                    AXUIElementCopyAttributeValue,
+                    AXValueGetValue,
                     AXUIElementPerformAction,
+                    kAXChildrenAttribute,
+                    kAXRoleAttribute,
+                    kAXPositionAttribute,
+                    kAXSizeAttribute,
+                    kAXDescriptionAttribute,
+                    kAXValueAttribute,
+                    kAXTitleAttribute,
+                    kAXValueCGPointType,
+                    kAXValueCGSizeType,
                 )
                 _pid = int(subprocess.run(
                     ["osascript", "-e",
@@ -2530,77 +2546,126 @@ class PodcastsController:
                 ).stdout.strip())
                 _ax_app = AXUIElementCreateApplication(_pid)
 
-                def _ep_titles_from_nodes(nds):
-                    """Short title keys for episode rows — used to detect scroll-off."""
-                    return [
-                        text[:60] for role, text, x, y, w, h in nds
-                        if role == "AXButton" and h > 60 and w > 400
-                    ]  # already y-sorted by _ax_nodes DFS order in practice; sort by y below
+                def _ax_attr(el, a):
+                    try:
+                        err, val = AXUIElementCopyAttributeValue(el, a, None)
+                        return val if err == 0 else None
+                    except Exception:
+                        return None
 
-                def _ep_titles_sorted(nds):
-                    rows_yt = sorted(
-                        [(y, text[:60]) for role, text, x, y, w, h in nds
-                         if role == "AXButton" and h > 60 and w > 400],
-                        key=lambda r: r[0],
-                    )
-                    return [t for _, t in rows_yt]
+                def _ep_button_walk(root):
+                    """DFS walk — yields (el_ref, y, x, w, h, text) for episode AXButtons."""
+                    stack = [root]; seen = 0
+                    while stack and seen < 15000:
+                        el = stack.pop(); seen += 1
+                        role = _ax_attr(el, kAXRoleAttribute)
+                        if role == "AXButton":
+                            pv = _ax_attr(el, kAXPositionAttribute)
+                            sv = _ax_attr(el, kAXSizeAttribute)
+                            if pv and sv:
+                                _, pt = AXValueGetValue(pv, kAXValueCGPointType, None)
+                                _, sz = AXValueGetValue(sv, kAXValueCGSizeType, None)
+                                w2, h2 = int(sz.width), int(sz.height)
+                                if h2 > 60 and w2 > 400:
+                                    txt = ""
+                                    for _a in (kAXDescriptionAttribute, kAXValueAttribute,
+                                               kAXTitleAttribute):
+                                        v = _ax_attr(el, _a)
+                                        if isinstance(v, str) and v:
+                                            txt = v; break
+                                    yield (el, int(pt.y), int(pt.x), w2, h2, txt[:60])
+                        ch = _ax_attr(el, kAXChildrenAttribute)
+                        if ch:
+                            stack.extend(ch)
 
-                prev_titles = _ep_titles_sorted(self._ax_nodes())
-                total_skipped = 0
+                def _ep_rows_sorted():
+                    return sorted(_ep_button_walk(_ax_app), key=lambda r: r[1])
+
+                # Reset to top so accumulation starts from episode 1.
+                self.scroll_to_top()
+                time.sleep(0.3)
+
+                # Get win_y / win_h for _click_download_at.
+                _win_y = _win_h = 0
+                for _r, _t, _x, _y, _w, _h in self._ax_nodes():
+                    if _r == "AXWindow" and _w > 400 and _h > 400:
+                        _win_y, _win_h = _y, _h
+                        break
+
+                # Accumulate unique episode rows in scroll order.
+                # Each row stores (y, x, w, h) from the scan where it FIRST appeared.
+                # We stop once we have ≥ video_no rows; the target row is from the
+                # most-recent scan, so its y coordinate is its current on-screen position.
+                accumulated: list[tuple[int, int, int, int]] = []
+                seen_titles: set[str] = set()
+
+                def _absorb_walk():
+                    added = 0
+                    for _el, _y, _x, _w, _h, _title in _ep_rows_sorted():
+                        if _title not in seen_titles:
+                            seen_titles.add(_title)
+                            accumulated.append((_y, _x, _w, _h))
+                            added += 1
+                    return added
+
+                _absorb_walk()
+                self.logger.log(
+                    f"Download episode {video_no}: AX scroll start — "
+                    f"{len(accumulated)} initial rows visible",
+                    step="13",
+                )
 
                 for _sa in range(30):
-                    # Stop if episode is within the current visible set.
-                    adjusted_target = video_no - total_skipped
-                    if 1 <= adjusted_target <= len(prev_titles):
+                    if len(accumulated) >= video_no:
                         break
 
-                    # Find any visible episode button to perform the scroll on.
+                    # Get the first episode AXButton element reference directly from
+                    # the AX walk (not via CopyElementAtPosition which returns a child).
                     _scroll_el = None
-                    for role, text, x, y, w, h in self._ax_nodes():
-                        if role == "AXButton" and h > 60 and w > 400:
-                            err_el, _scroll_el = AXUIElementCopyElementAtPosition(
-                                _ax_app, float(x + w // 2), float(y + h // 2), None
-                            )
-                            if err_el == 0 and _scroll_el:
-                                break
-                            _scroll_el = None
+                    for _el, _y, _x, _w, _h, _title in _ep_rows_sorted():
+                        _scroll_el = _el
+                        break
 
                     if _scroll_el is None:
+                        self.logger.log(
+                            f"Download episode {video_no}: AX scroll #{_sa + 1} "
+                            "— no scroll element found",
+                            step="13",
+                        )
                         break
 
-                    err_sc = AXUIElementPerformAction(_scroll_el, "AXScrollDownByPage")
-                    if err_sc != 0:
-                        break
+                    _err_sc = AXUIElementPerformAction(_scroll_el, "AXScrollDownByPage")
                     time.sleep(0.5)
-
-                    new_titles = _ep_titles_sorted(self._ax_nodes())
-                    new_set = set(new_titles)
-                    scrolled_off = sum(1 for t in prev_titles if t not in new_set)
+                    _added = _absorb_walk()
 
                     self.logger.log(
                         f"Download episode {video_no}: AXScrollDownByPage #{_sa + 1} "
-                        f"scrolled_off={scrolled_off} → total_skipped={total_skipped + scrolled_off}",
+                        f"err={_err_sc} new_rows={_added} total={len(accumulated)}",
                         step="13",
                     )
 
-                    if scrolled_off == 0:
-                        break  # end of list, no further progress
+                    if _added == 0:
+                        break  # end of list
 
-                    total_skipped += scrolled_off
-                    prev_titles = new_titles
-
-                adjusted_target = video_no - total_skipped
-                if 1 <= adjusted_target <= len(prev_titles):
-                    adj_script = script.replace(
-                        f"set targetN to {video_no}",
-                        f"set targetN to {adjusted_target}",
-                    )
-                    out = run_osascript(
-                        adj_script, timeout=90,
-                        label=f"find episode {video_no} (AX scroll adjusted_target={adjusted_target})",
-                    )
+                if len(accumulated) >= video_no:
+                    _row_y, _row_x, _row_w, _row_h = accumulated[video_no - 1]
+                    _more_x = _row_x + _row_w - 47
+                    _more_y = _row_y + _row_h // 2
                     self.logger.log(
-                        f"Download episode {video_no}: AX scroll result → {out[:80]}",
+                        f"Download episode {video_no}: AX scroll located row at "
+                        f"({_row_x},{_row_y},{_row_w},{_row_h})",
+                        step="13",
+                    )
+                    return self._click_download_at(
+                        _win_y, _win_h,
+                        _row_x, _row_y, _row_w, _row_h,
+                        _more_x, _more_y,
+                        video_no,
+                    )
+                else:
+                    self.logger.log(
+                        f"Download episode {video_no}: AX scroll collected only "
+                        f"{len(accumulated)} rows (need {video_no})",
                         step="13",
                     )
 
