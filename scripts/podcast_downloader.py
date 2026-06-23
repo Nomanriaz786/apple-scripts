@@ -3370,6 +3370,12 @@ class PodcastsController:
         tell application "System Events"
             tell process "Podcasts"
                 if not (exists window 1) then return "ERROR:no_window"
+                set wPos to position of window 1
+                set wX to (item 1 of wPos) as integer
+                -- Sidebar nav items sit in the left ~260px of the window.
+                -- Episode "Downloaded" badges appear in the content area (right side)
+                -- and must not be mistaken for the nav item.
+                set sidebarRight to wX + 260
                 set q to {window 1}
                 set deadline to (current date) + 20
                 repeat 600 times
@@ -3388,12 +3394,14 @@ class PodcastsController:
                     -- Exact match to avoid matching episode-row descriptions that
                     -- contain "Downloaded" as a suffix.
                     if dd is "Downloaded" then
-                        set cl to class of elem as string
-                        if cl is "UI element" then
-                            set sz to size of elem
-                            -- Sidebar nav item is ~180×28px; skip small episode-row labels
-                            if (item 1 of sz) > 100 then
-                                set pos to position of elem
+                        set sz to size of elem
+                        -- Sidebar nav item is ~180×28px; skip small episode-row labels.
+                        if (item 1 of sz) > 100 then
+                            set pos to position of elem
+                            -- Guard: only match elements on the left (sidebar) side of the
+                            -- window. Episode-row "Downloaded" labels live in the content
+                            -- area (right side) and would navigate to the wrong page.
+                            if (item 1 of pos) < sidebarRight then
                                 set cx to ((item 1 of pos) + (item 1 of sz) / 2) as integer
                                 set cy to ((item 2 of pos) + (item 2 of sz) / 2) as integer
                                 return "CENTER:" & cx & "," & cy
@@ -3675,7 +3683,7 @@ class PodcastsController:
                 break
         if win_w == 0:
             return self._find_downloaded_card_frame_sysevents()
-        content_left = win_x + 180
+        content_left = win_x + 240  # conservative: sidebar can be wider than 180px on some displays
         cards = [
             (x, y, w, h) for role, _t, x, y, w, h in nodes
             if x > content_left and 80 <= w <= 800 and 80 <= h <= 900
@@ -3986,11 +3994,14 @@ class PodcastsController:
 
         return "three_dots_clicked"
 
-    def _click_confirmation_remove(self) -> str:
+    def _click_confirmation_remove(self, max_attempts: int = 20) -> str:
         """Click the destructive Remove button in the confirmation sheet.
 
         After the context menu's Remove item is activated, Podcasts shows a native
         macOS sheet (accessible via AX) with a Remove From Library button.
+
+        max_attempts: how many 0.4s polls to run (default 20 = 8s).  Pass a smaller
+        value (e.g. 3) for a quick 1.2s probe when retrying keyboard nav.
         """
         script = """
         tell application "System Events"
@@ -4020,7 +4031,7 @@ class PodcastsController:
         # the old 20×1.5s loop burned a flat 30s on every removal that produced no
         # confirmation sheet at all, which dominated per-show removal time.
         out = "no_sheet"
-        for _attempt in range(20):
+        for _attempt in range(max_attempts):
             out = run_osascript(script, timeout=5, label="click Remove in confirmation sheet")
             if out != "no_sheet":
                 break
@@ -4769,29 +4780,74 @@ class PodcastsController:
 
             # AX click ('Remove from Library' contains 'Remove' → matched if accessible)
             ax_ok = self._click_remove_menu_item_ax()
-            if not ax_ok:
-                # Keyboard fallback: menu order is Go to Show (1), Mark Played (2),
-                # Remove from Library (3). Down×3 + Enter selects the third item.
-                subprocess.run(
-                    ["osascript", "-e",
-                     'tell application "System Events" to key code 125\n'
-                     'delay 0.3\n'
-                     'tell application "System Events" to key code 125\n'
-                     'delay 0.3\n'
-                     'tell application "System Events" to key code 125\n'
-                     'delay 0.3\n'
-                     'tell application "System Events" to key code 36'],
-                    timeout=8, check=False,
-                )
+            confirm = "no_sheet"
+            actual_removed = False
 
-            # Podcasts shows a "Remove all episodes…?" sheet after "Remove from
-            # Library" is activated. _click_confirmation_remove() now polls quickly
-            # for it to render, so only a short settle is needed here.
-            time.sleep(0.4)
-            confirm = self._click_confirmation_remove()
+            if ax_ok:
+                time.sleep(0.4)
+                confirm = self._click_confirmation_remove()
+                actual_removed = True
+            else:
+                # Keyboard fallback — "Remove from Library" position varies by Podcasts
+                # version: position 3 on older builds (3-item menu) and position 4 on
+                # newer builds that added "Go to Latest Episode" at item 1.
+                # Try both counts and verify success via the confirmation sheet:
+                # Remove from Library always requires one; navigation/mark-played do not.
+                for n_down in (3, 4):
+                    down_script = "\n".join(
+                        ["tell application \"System Events\" to key code 125",
+                         "delay 0.3"] * n_down
+                    ) + "\ntell application \"System Events\" to key code 36"
+                    subprocess.run(
+                        ["osascript", "-e", down_script],
+                        timeout=10, check=False,
+                    )
+                    # Quick 1.2s poll: sheet appears immediately if the right item fired.
+                    time.sleep(0.3)
+                    confirm = self._click_confirmation_remove(max_attempts=3)
+                    if "clicked" in confirm:
+                        actual_removed = True
+                        self.logger.log(
+                            f"Downloads cleanup card {iteration + 1}: "
+                            f"keyboard Down×{n_down}+Enter → confirmed",
+                            step="14",
+                        )
+                        break
+                    # Wrong item selected (navigated away or mark-played).
+                    # Press Escape to dismiss whatever opened, then re-navigate and
+                    # re-right-click before trying the next Down count.
+                    subprocess.run(
+                        ["osascript", "-e",
+                         "tell application \"System Events\" to key code 53"],
+                        timeout=3, check=False,
+                    )
+                    time.sleep(0.5)
+                    if n_down < 4:
+                        _nav_r = self.navigate_to_downloaded_tab()
+                        if _nav_r != "navigated":
+                            break
+                        time.sleep(0.3)
+                        _rf = self._find_downloaded_card_frame()
+                        if _rf is None:
+                            # Card gone without a sheet — edge case (e.g. "Remove Download"
+                            # on a show with no library entry).
+                            actual_removed = True
+                            break
+                        card_x, card_y, card_w, card_h = _rf
+                        card_cx = card_x + card_w // 2
+                        card_cy = card_y + card_h // 2
+                        _pt2 = Quartz.CGPointMake(card_cx, card_cy)
+                        for _kind2 in (Quartz.kCGEventRightMouseDown, Quartz.kCGEventRightMouseUp):
+                            _ev2 = Quartz.CGEventCreateMouseEvent(
+                                None, _kind2, _pt2, Quartz.kCGMouseButtonRight
+                            )
+                            Quartz.CGEventPost(Quartz.kCGHIDEventTap, _ev2)
+                            time.sleep(0.05)
+                        time.sleep(0.5)
 
             method = "ax" if ax_ok else "keyboard"
-            result_label = f"removed:{method}"
+            result_label = (f"removed:{method}" if actual_removed
+                            else f"remove_failed:{method}")
             if confirm not in ("no_sheet",):
                 result_label += f"+confirmed:{confirm}"
 
@@ -4799,7 +4855,8 @@ class PodcastsController:
                 f"Downloads cleanup card {iteration + 1}: {result_label}", step="14"
             )
             results.append({"iteration": iteration + 1, "result": result_label})
-            removed += 1
+            if actual_removed:
+                removed += 1
             # No settle here — move straight on to the next show. (The card finder
             # below retries if the next card hasn't rendered yet.)
 
