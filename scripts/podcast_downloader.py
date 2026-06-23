@@ -611,17 +611,28 @@ class VPNController:
         if not servers:
             discovered = self.state.data.setdefault("discovered_servers_by_location", {})
             cached = discovered.get(vpn_cfg.location, [])
-            if cached:
+            # Use the cache only if it has >1 server.  A single-server cache means
+            # the previous discovery run was incomplete (ProtonVPN's US list has many
+            # servers); with only 1 server the rotation index never advances and the
+            # same IP is used on every cycle.  Treat it as stale and re-discover.
+            if cached and len(cached) > 1:
                 servers = list(cached)
                 self.logger.log(
                     f"Using cached server list for {vpn_cfg.location} ({len(servers)} servers)",
                     step="06", location=vpn_cfg.location, source="cache",
                 )
             else:
-                self.logger.log(
-                    f"No cached servers for {vpn_cfg.location}; running discovery in {vpn_cfg.app}",
-                    step="06", location=vpn_cfg.location, app=vpn_cfg.app,
-                )
+                if cached:
+                    self.logger.log(
+                        f"Cached server list for {vpn_cfg.location} has only {len(cached)} "
+                        f"server — treating as stale, re-discovering",
+                        step="06", location=vpn_cfg.location,
+                    )
+                else:
+                    self.logger.log(
+                        f"No cached servers for {vpn_cfg.location}; running discovery in {vpn_cfg.app}",
+                        step="06", location=vpn_cfg.location, app=vpn_cfg.app,
+                    )
                 if not self._open_provider_app(vpn_cfg.app):
                     raise AutomationError(
                         f"{vpn_cfg.app} app not found. Install and sign in first."
@@ -2515,46 +2526,46 @@ class PodcastsController:
             # x≈880 is the horizontal centre of episode rows (470 + 823/2).
             # y≈800 is safely inside the scrollable episode list (rows start ~y=660).
             scroll_cx, scroll_cy = 880, 800
-            try:
-                import Quartz as _Q  # type: ignore[import]
-                for _scroll_attempt in range(30):
-                    if seen_n == 0 or seen_n >= video_no - total_skipped:
-                        break
-                    # On first attempt jump as far as needed in one shot;
-                    # on later attempts use smaller increments for fine adjustment.
-                    rows_remaining = video_no - total_skipped - seen_n
-                    if _scroll_attempt == 0 and rows_remaining > seen_n:
-                        rows_to_skip = rows_remaining - 3   # jump most of the way, leave 3-row cushion
-                    else:
-                        rows_to_skip = max(1, seen_n - 1)   # standard incremental step
-                    total_skipped += rows_to_skip
-                    scroll_px = rows_to_skip * row_h_est
-                    self.logger.log(
-                        f"Download episode {video_no}: seen={seen_n} → "
-                        f"scroll {scroll_px}px, adjusted target={video_no - total_skipped}",
-                        step="13",
+            for _scroll_attempt in range(30):
+                if seen_n == 0 or seen_n >= video_no - total_skipped:
+                    break
+                # Each Page Down scrolls one viewport height with 1-row overlap,
+                # so net rows skipped = seen_n - 1.  Always scroll exactly 1 page
+                # per attempt; the loop handles reaching any episode.
+                rows_to_skip = max(1, seen_n - 1)
+                total_skipped += rows_to_skip
+                adjusted_target = video_no - total_skipped
+                self.logger.log(
+                    f"Download episode {video_no}: seen={seen_n} → "
+                    f"Page Down, adjusted target={adjusted_target}",
+                    step="13",
+                )
+                # Page Down via osascript (consistent with scroll_to_top which uses
+                # CMD+Up the same way).  CGEventCreateScrollWheelEvent is NOT used
+                # here because Mac Catalyst ignores synthetic scroll-wheel events —
+                # the list never moves and the BFS finds the wrong row.
+                # key code 121 = Page Down
+                try:
+                    run_osascript(
+                        'tell application "System Events" to tell process "Podcasts"'
+                        ' to key code 121',
+                        timeout=5, label=f"Page Down for episode {video_no}",
                     )
-                    ev = _Q.CGEventCreateScrollWheelEvent(
-                        None, _Q.kCGScrollEventUnitPixel, 1, -scroll_px
-                    )
-                    _Q.CGEventSetLocation(ev, _Q.CGPointMake(scroll_cx, scroll_cy))
-                    _Q.CGEventPost(_Q.kCGHIDEventTap, ev)
-                    time.sleep(0.5)
-                    adjusted_target = video_no - total_skipped
-                    adj_script = script.replace(
-                        f"set targetN to {video_no}",
-                        f"set targetN to {adjusted_target}",
-                    )
-                    out = run_osascript(
-                        adj_script, timeout=90,
-                        label=f"find episode {video_no} (scroll {_scroll_attempt + 1})",
-                    )
-                    if not out.startswith("ERROR:episode_not_found"):
-                        break
-                    seen_m2 = _re2.search(r"seen=(\d+)", out)
-                    seen_n = int(seen_m2.group(1)) if seen_m2 else 0
-            except ImportError:
-                pass
+                except AutomationError:
+                    pass
+                time.sleep(0.5)
+                adj_script = script.replace(
+                    f"set targetN to {video_no}",
+                    f"set targetN to {adjusted_target}",
+                )
+                out = run_osascript(
+                    adj_script, timeout=90,
+                    label=f"find episode {video_no} (scroll {_scroll_attempt + 1})",
+                )
+                if not out.startswith("ERROR:episode_not_found"):
+                    break
+                seen_m2 = _re2.search(r"seen=(\d+)", out)
+                seen_n = int(seen_m2.group(1)) if seen_m2 else 0
 
         if out.startswith("ERROR:"):
             self.logger.log(f"Download episode {video_no}: {out}", step="13")
