@@ -4758,21 +4758,31 @@ class PodcastsController:
             card_x, card_y, card_w, card_h = frame
             card_cx = card_x + card_w // 2
             card_cy = card_y + card_h // 2
-            # ⋯ button sits at the bottom-right corner of the card (hover-only).
-            three_dots_x = card_x + card_w - 30
-            three_dots_y = card_y + card_h - 25
 
             self.logger.log(
                 f"Downloads cleanup card {iteration + 1}: ({card_x},{card_y},{card_w},{card_h}) "
-                f"⋯=({three_dots_x},{three_dots_y})",
+                f"center=({card_cx},{card_cy})",
                 step="14",
             )
 
-            # Warp the real cursor to the card center so Mac Catalyst's NSTrackingArea
-            # registers hover and the ⋯ button appears, then slide to ⋯ and click it.
-            # Plain synthetic kCGEventMouseMoved events do not reliably enter the tracking
-            # area on all Macs (same issue as ProtonVPN's Connect button). CGWarp moves
-            # the actual hardware cursor, which guarantees the hover fires.
+            # Bring Podcasts to front explicitly — without this, warp events can land
+            # on a different window that slid in front during the AX card search.
+            try:
+                run_osascript(
+                    'tell application "Podcasts" to activate',
+                    timeout=5, label="activate Podcasts before cleanup click",
+                )
+                time.sleep(0.3)
+            except AutomationError:
+                pass
+
+            # Warp the real hardware cursor onto the card center, then right-click.
+            # Right-click with the cursor physically over the card opens the same
+            # context menu as the hover-revealed ⋯ button, without needing to know
+            # the exact ⋯ pixel position (which varies by Mac/Podcasts version).
+            # Plain synthetic right-click events (without warp) are ignored by Mac
+            # Catalyst's hit-testing on some Macs — warp guarantees the cursor IS
+            # over the element before the event fires.
             def _warp(x: int, y: int) -> None:
                 pt_w = Quartz.CGPoint(x=float(x), y=float(y))
                 Quartz.CGWarpMouseCursorPosition(pt_w)
@@ -4782,14 +4792,19 @@ class PodcastsController:
                 Quartz.CGEventPost(Quartz.kCGHIDEventTap, mv)
                 time.sleep(0.05)
 
-            _warp(card_cx, card_cy)       # enter card — ⋯ should render
-            time.sleep(0.4)
-            _warp(three_dots_x, three_dots_y)  # move onto ⋯ button
-            time.sleep(0.3)
+            _warp(card_cx, card_cy)
+            time.sleep(0.5)   # let hover/tracking area register before right-click
             Quartz.CGAssociateMouseAndMouseCursorPosition(True)
-            _mouse(Quartz.kCGEventLeftMouseDown, three_dots_x, three_dots_y)
-            time.sleep(0.1)
-            _mouse(Quartz.kCGEventLeftMouseUp, three_dots_x, three_dots_y)
+            pt_rc = Quartz.CGPoint(x=float(card_cx), y=float(card_cy))
+            ev_rd = Quartz.CGEventCreateMouseEvent(
+                None, Quartz.kCGEventRightMouseDown, pt_rc, Quartz.kCGMouseButtonRight
+            )
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev_rd)
+            time.sleep(0.05)
+            ev_ru = Quartz.CGEventCreateMouseEvent(
+                None, Quartz.kCGEventRightMouseUp, pt_rc, Quartz.kCGMouseButtonRight
+            )
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev_ru)
             time.sleep(1.2)  # Mac Catalyst context menu render time
 
             # AX click ('Remove from Library' contains 'Remove' → matched if accessible)
@@ -4850,16 +4865,27 @@ class PodcastsController:
                         card_x, card_y, card_w, card_h = _rf
                         card_cx = card_x + card_w // 2
                         card_cy = card_y + card_h // 2
-                        three_dots_x = card_x + card_w - 30
-                        three_dots_y = card_y + card_h - 25
+                        try:
+                            run_osascript(
+                                'tell application "Podcasts" to activate',
+                                timeout=5, label="activate Podcasts before retry click",
+                            )
+                            time.sleep(0.3)
+                        except AutomationError:
+                            pass
                         _warp(card_cx, card_cy)
-                        time.sleep(0.4)
-                        _warp(three_dots_x, three_dots_y)
-                        time.sleep(0.3)
+                        time.sleep(0.5)
                         Quartz.CGAssociateMouseAndMouseCursorPosition(True)
-                        _mouse(Quartz.kCGEventLeftMouseDown, three_dots_x, three_dots_y)
-                        time.sleep(0.1)
-                        _mouse(Quartz.kCGEventLeftMouseUp, three_dots_x, three_dots_y)
+                        _pt_rc2 = Quartz.CGPoint(x=float(card_cx), y=float(card_cy))
+                        for _kind2, _btn2 in (
+                            (Quartz.kCGEventRightMouseDown, Quartz.kCGMouseButtonRight),
+                            (Quartz.kCGEventRightMouseUp,   Quartz.kCGMouseButtonRight),
+                        ):
+                            _ev2 = Quartz.CGEventCreateMouseEvent(
+                                None, _kind2, _pt_rc2, _btn2
+                            )
+                            Quartz.CGEventPost(Quartz.kCGHIDEventTap, _ev2)
+                            time.sleep(0.05)
                         time.sleep(1.2)
 
             method = "ax" if ax_ok else "keyboard"
