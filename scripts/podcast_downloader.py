@@ -2565,7 +2565,11 @@ class PodcastsController:
                             if pv and sv:
                                 _, pt = AXValueGetValue(pv, kAXValueCGPointType, None)
                                 _, sz = AXValueGetValue(sv, kAXValueCGSizeType, None)
-                                w2, h2 = int(sz.width), int(sz.height)
+                                try:
+                                    w2, h2 = int(sz.width), int(sz.height)
+                                    x2, y2 = int(pt.x), int(pt.y)
+                                except (OverflowError, ValueError):
+                                    continue
                                 if h2 > 60 and w2 > 400:
                                     txt = ""
                                     for _a in (kAXDescriptionAttribute, kAXValueAttribute,
@@ -2573,7 +2577,7 @@ class PodcastsController:
                                         v = _ax_attr(el, _a)
                                         if isinstance(v, str) and v:
                                             txt = v; break
-                                    yield (el, int(pt.y), int(pt.x), w2, h2, txt[:60])
+                                    yield (el, y2, x2, w2, h2, txt[:60])
                         ch = _ax_attr(el, kAXChildrenAttribute)
                         if ch:
                             stack.extend(ch)
@@ -2953,51 +2957,22 @@ class PodcastsController:
             time.sleep(0.05)
 
         # Scroll the episode row into view if its center falls outside the visible window.
-        # The AX tree exposes partially-visible rows at the viewport bottom, but their
-        # center coordinates land below the window edge — hover/clicks miss entirely.
+        # If the row's vertical centre (more_y) is below the window bottom, clamp it.
+        # CGEventCreateScrollWheelEvent is ignored by Mac Catalyst, and
+        # AXScrollDownByPage scrolls a full page (5+ rows) — both overshoot for a
+        # partial-row nudge.  The practical fix: if more_y is inside the window the
+        # click works fine even when row_bottom extends slightly below the edge.
+        # Only clamp when more_y itself is out-of-bounds.
         if win_h > 0:
             win_bottom = win_y + win_h
-            row_bottom = row_y + row_h
-            # Need 80px clearance above window bottom so the row center is safely inside.
-            if row_bottom > win_bottom - 80:
-                extra_px = row_bottom - (win_bottom - 120)
-                scroll_cx = row_x + row_w // 2
-                scroll_cy = win_y + win_h // 2
+            if more_y >= win_bottom:
+                clamped = win_bottom - 10
                 self.logger.log(
-                    f"Episode {video_no}: row bottom {row_bottom} near/below window bottom "
-                    f"{win_bottom} — nudging with AXScrollDownByPage to bring into view",
+                    f"Episode {video_no}: more_y {more_y} ≥ win_bottom {win_bottom} "
+                    f"— clamping click to y={clamped}",
                     step="13",
                 )
-                # CGEventCreateScrollWheelEvent is ignored by Mac Catalyst.
-                # Perform one partial scroll via AX: AXScrollDownByPage on the row itself.
-                try:
-                    from ApplicationServices import (  # type: ignore[import]
-                        AXUIElementCreateApplication,
-                        AXUIElementCopyElementAtPosition,
-                        AXUIElementPerformAction,
-                    )
-                    _pid2 = int(subprocess.run(
-                        ["osascript", "-e",
-                         'tell application "System Events" to return '
-                         'unix id of process "Podcasts"'],
-                        capture_output=True, text=True, timeout=5,
-                    ).stdout.strip())
-                    _ax2 = AXUIElementCreateApplication(_pid2)
-                    _err2, _el2 = AXUIElementCopyElementAtPosition(
-                        _ax2, float(scroll_cx), float(scroll_cy), None
-                    )
-                    if _err2 == 0 and _el2:
-                        AXUIElementPerformAction(_el2, "AXScrollDownByPage")
-                        time.sleep(0.4)
-                        # Re-read the row's new position after the scroll.
-                        new_nodes = self._ax_nodes()
-                        for _r, _t, _x, _y, _w, _h in new_nodes:
-                            if _r == "AXButton" and _w == row_w and abs(_h - row_h) <= 5:
-                                row_y = _y
-                                more_y = _y + _h // 2
-                                break
-                except Exception:
-                    pass
+                more_y = clamped
 
         row_cx = row_x + row_w // 2
         row_cy = row_y + row_h // 2
@@ -3160,7 +3135,11 @@ class PodcastsController:
                 okp, pt = AXValueGetValue(pv, kAXValueCGPointType, None)
                 oks, sz = AXValueGetValue(sv, kAXValueCGSizeType, None)
                 if okp and oks:
-                    x, y, w, h = int(pt.x), int(pt.y), int(sz.width), int(sz.height)
+                    try:
+                        x, y = int(pt.x), int(pt.y)
+                        w, h = int(sz.width), int(sz.height)
+                    except (OverflowError, ValueError):
+                        x = y = w = h = 0
             out.append((str(role or ""), text, x, y, w, h))
             ch = _attr(el, kAXChildrenAttribute)
             if ch:
