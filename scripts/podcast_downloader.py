@@ -2585,9 +2585,35 @@ class PodcastsController:
                 def _ep_rows_sorted():
                     return sorted(_ep_button_walk(_ax_app), key=lambda r: r[1])
 
-                # Reset to top so accumulation starts from episode 1.
+                # Reset to true top so accumulation starts from episode 1.
+                # CMD+Up alone may not fully reset Mac Catalyst's list when it was
+                # previously scrolled for an earlier episode (AX tree retains old rows).
+                # AXScrollUpByPage loop ensures we reach the actual beginning.
                 self.scroll_to_top()
-                time.sleep(0.3)
+                time.sleep(0.5)
+                # Scroll up until ep1 is stably at the content-area top (y ≈ 157).
+                # We stop when the topmost AX element has y >= 130 — that element
+                # must be ep1 because any earlier element would also be in the tree.
+                # We call AXScrollUpByPage on the first VISIBLE element (y >= 100)
+                # because calling it on an off-screen element (y < 0) barely moves.
+                _su_top_y: int = -9999
+                for _su in range(20):
+                    _top_scan = list(_ep_rows_sorted())
+                    if not _top_scan:
+                        break
+                    _su_top_y = _top_scan[0][1]
+                    if _su_top_y >= 130:
+                        break  # ep1 is at the content-area top — truly at the beginning
+                    # Use first visible element for effective scrolling
+                    _scroll_el = None
+                    for _su_el, _su_y, _su_x, _su_w, _su_h, _ in _top_scan:
+                        if _su_y >= 100:
+                            _scroll_el = _su_el
+                            break
+                    if _scroll_el is None:
+                        _scroll_el = _top_scan[0][0]
+                    AXUIElementPerformAction(_scroll_el, "AXScrollUpByPage")
+                    time.sleep(0.4)
 
                 # Get win_y / win_h for _click_download_at.
                 _win_y = _win_h = 0
@@ -2596,11 +2622,11 @@ class PodcastsController:
                         _win_y, _win_h = _y, _h
                         break
 
-                # Accumulate unique episode rows in scroll order.
+                # Accumulate unique episode rows in order from the top.
                 # Each row stores (y, x, w, h) from the scan where it FIRST appeared.
-                # We stop once we have ≥ video_no rows; the target row is from the
-                # most-recent scan, so its y coordinate is its current on-screen position.
-                accumulated: list[tuple[int, int, int, int]] = []
+                # We stop once we have ≥ video_no rows; the target row was just added
+                # in the most-recent scan so its y is its current on-screen position.
+                accumulated: list[tuple[int, int, int, int, str]] = []
                 seen_titles: set[str] = set()
 
                 def _absorb_walk():
@@ -2608,14 +2634,14 @@ class PodcastsController:
                     for _el, _y, _x, _w, _h, _title in _ep_rows_sorted():
                         if _title not in seen_titles:
                             seen_titles.add(_title)
-                            accumulated.append((_y, _x, _w, _h))
+                            accumulated.append((_y, _x, _w, _h, _title))
                             added += 1
                     return added
 
                 _absorb_walk()
                 self.logger.log(
                     f"Download episode {video_no}: AX scroll start — "
-                    f"{len(accumulated)} initial rows visible",
+                    f"{len(accumulated)} initial rows (top={_su_top_y})",
                     step="13",
                 )
 
@@ -2652,9 +2678,36 @@ class PodcastsController:
                         break  # end of list
 
                 if len(accumulated) >= video_no:
-                    _row_y, _row_x, _row_w, _row_h = accumulated[video_no - 1]
+                    _row_y, _row_x, _row_w, _row_h, _row_title = accumulated[video_no - 1]
                     _more_x = _row_x + _row_w - 47
                     _more_y = _row_y + _row_h // 2
+
+                    # If the target row's click point is below the window bottom,
+                    # the row entered the AX tree but isn't yet in the viewport.
+                    # One extra AXScrollDownByPage brings it into view; then we
+                    # refresh its y-coordinate by looking it up by title.
+                    _win_bottom = _win_y + _win_h if _win_h > 0 else 9999
+                    if _more_y >= _win_bottom:
+                        _vis_rows = list(_ep_rows_sorted())
+                        _extra_el = next(
+                            (_el for _el, _y, _x, _w, _h, _ in _vis_rows if _y >= 100),
+                            _vis_rows[0][0] if _vis_rows else None,
+                        )
+                        if _extra_el is not None:
+                            AXUIElementPerformAction(_extra_el, "AXScrollDownByPage")
+                            time.sleep(0.5)
+                            for _el, _y, _x, _w, _h, _t in _ep_rows_sorted():
+                                if _t == _row_title:
+                                    _row_x, _row_y, _row_w, _row_h = _x, _y, _w, _h
+                                    _more_x = _row_x + _row_w - 47
+                                    _more_y = _row_y + _row_h // 2
+                                    self.logger.log(
+                                        f"Download episode {video_no}: extra scroll — "
+                                        f"row refreshed to ({_row_x},{_row_y},{_row_w},{_row_h})",
+                                        step="13",
+                                    )
+                                    break
+
                     self.logger.log(
                         f"Download episode {video_no}: AX scroll located row at "
                         f"({_row_x},{_row_y},{_row_w},{_row_h})",
@@ -3832,18 +3885,21 @@ class PodcastsController:
         System Events walk (~30s) if the native walk finds none.
         """
         nodes = self._ax_nodes()
-        win_x = win_y = win_w = 0
+        win_x = win_y = win_w = win_h = 0
         for role, _t, x, y, w, h in nodes:
             if role == "AXWindow" and w > 400 and h > 400:
-                win_x, win_y, win_w = x, y, w
+                win_x, win_y, win_w, win_h = x, y, w, h
                 break
         if win_w == 0:
             return self._find_downloaded_card_frame_sysevents()
         content_left = win_x + 240  # conservative: sidebar can be wider than 180px on some displays
         content_top = win_y + 60    # below control bar; rejects nav-bar artwork near window top
+        win_right = win_x + win_w
+        win_bottom = win_y + win_h
         cards = [
             (x, y, w, h) for role, _t, x, y, w, h in nodes
             if x > content_left and y > content_top
+            and x < win_right and y < win_bottom   # must be inside the actual window
             and 80 <= w <= 800 and 80 <= h <= 900
             and h > w               # Downloads grid cards are portrait (taller than wide)
             and h < w * 4           # but not an impossibly thin strip
@@ -3897,9 +3953,9 @@ class PodcastsController:
                         set eH to (item 2 of eSz) as integer
                     end try
                     -- Card criteria: in content area, portrait orientation (h > w),
-                    -- and below the control bar (y > wY+60) so nav-bar artwork is excluded.
-                    -- Downloads grid cards are always taller than wide (artwork square + title strip).
-                    if eX > contentLeft and eY > wY + 60 and eW >= 80 and eH >= 80 and eW <= 800 and eH <= 900 then
+                    -- below the control bar (y > wY+60), and within window bounds.
+                    -- Phantom AX elements can have x/y coordinates far off-screen (e.g. 21523).
+                    if eX > contentLeft and eX < wX + wW and eY > wY + 60 and eY < wY + wH and eW >= 80 and eH >= 80 and eW <= 800 and eH <= 900 then
                         -- Portrait: card must be taller than wide (excludes landscape nav-bar elements)
                         if eH > eW then
                             -- Exclude elements that span the full window width (containers, scroll areas)
