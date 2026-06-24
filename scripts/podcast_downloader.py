@@ -2390,6 +2390,54 @@ class PodcastsController:
         # so AX only exposes the currently visible rows. Without this, the row
         # counter is relative to the current scroll position, not the episode number.
         self.scroll_to_top()
+        # CMD+Up alone is unreliable when a prior download used AXScrollDownByPage
+        # (Mac Catalyst's synthetic scroll), so supplement with AXScrollUpByPage until
+        # the topmost visible button reaches y >= 130 (ep1 at the list head).
+        try:
+            from ApplicationServices import (  # type: ignore[import]
+                AXUIElementCreateApplication, AXUIElementCopyAttributeValue,
+                AXUIElementPerformAction, kAXChildrenAttribute, kAXRoleAttribute,
+                kAXPositionAttribute, kAXSizeAttribute, AXValueGetValue,
+                kAXValueCGPointType, kAXValueCGSizeType,
+            )
+            _top_pid = int(subprocess.run(
+                ["osascript", "-e",
+                 'tell application "System Events" to return unix id of process "Podcasts"'],
+                capture_output=True, text=True, timeout=5,
+            ).stdout.strip())
+            _top_ax = AXUIElementCreateApplication(_top_pid)
+
+            def _scan_ep_btns(root):
+                stack = [root]; seen = 0
+                while stack and seen < 8000:
+                    el = stack.pop(); seen += 1
+                    _, role = AXUIElementCopyAttributeValue(el, kAXRoleAttribute, None)
+                    if role == "AXButton":
+                        _, pv = AXUIElementCopyAttributeValue(el, kAXPositionAttribute, None)
+                        _, sv = AXUIElementCopyAttributeValue(el, kAXSizeAttribute, None)
+                        if pv and sv:
+                            _, pt = AXValueGetValue(pv, kAXValueCGPointType, None)
+                            _, sz = AXValueGetValue(sv, kAXValueCGSizeType, None)
+                            try:
+                                if int(sz.height) > 60 and int(sz.width) > 400:
+                                    yield el, int(pt.y)
+                            except (OverflowError, ValueError):
+                                pass
+                    _, ch = AXUIElementCopyAttributeValue(el, kAXChildrenAttribute, None)
+                    if ch: stack.extend(ch)
+
+            time.sleep(0.3)
+            for _ in range(20):
+                _rows = sorted(_scan_ep_btns(_top_ax), key=lambda r: r[1])
+                if not _rows:
+                    break
+                if _rows[0][1] >= 130:
+                    break
+                _up_el = next((el for el, ey in _rows if ey >= 100), _rows[0][0])
+                AXUIElementPerformAction(_up_el, "AXScrollUpByPage")
+                time.sleep(0.4)
+        except Exception:
+            pass
 
         # Phase 1: AppleScript BFS — locate the Nth episode and its more-button center.
         script = f"""
