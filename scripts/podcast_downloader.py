@@ -3009,23 +3009,77 @@ class PodcastsController:
             Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
             time.sleep(0.05)
 
-        # Scroll the episode row into view if its center falls outside the visible window.
-        # If the row's vertical centre (more_y) is below the window bottom, clamp it.
-        # CGEventCreateScrollWheelEvent is ignored by Mac Catalyst, and
-        # AXScrollDownByPage scrolls a full page (5+ rows) — both overshoot for a
-        # partial-row nudge.  The practical fix: if more_y is inside the window the
-        # click works fine even when row_bottom extends slightly below the edge.
-        # Only clamp when more_y itself is out-of-bounds.
-        if win_h > 0:
-            win_bottom = win_y + win_h
-            if more_y >= win_bottom:
-                clamped = win_bottom - 10
-                self.logger.log(
-                    f"Episode {video_no}: more_y {more_y} ≥ win_bottom {win_bottom} "
-                    f"— clamping click to y={clamped}",
-                    step="13",
+        # If the target row's click center is below the window viewport, scroll the
+        # list down one page via AX so the row comes into view, then re-locate it by
+        # scanning for the button closest to the estimated post-scroll y coordinate.
+        # CGEventCreateScrollWheelEvent is ignored by Mac Catalyst, so we use
+        # AXUIElementPerformAction("AXScrollDownByPage") on a visible episode button.
+        # After the download click we undo the extra scroll (AXScrollUpByPage) so that
+        # subsequent per-episode BFS searches start from the correct list position.
+        _scrolled_into_view = False
+        _ax_app2 = None
+        if win_h > 0 and more_y >= win_y + win_h:
+            try:
+                from ApplicationServices import (  # type: ignore[import]
+                    AXUIElementCreateApplication, AXUIElementCopyAttributeValue,
+                    AXUIElementPerformAction, kAXChildrenAttribute, kAXRoleAttribute,
+                    kAXPositionAttribute, kAXSizeAttribute, AXValueGetValue,
+                    kAXValueCGPointType, kAXValueCGSizeType,
                 )
-                more_y = clamped
+
+                _ax_pid = int(subprocess.run(
+                    ["osascript", "-e",
+                     'tell application "System Events" to return unix id of process "Podcasts"'],
+                    capture_output=True, text=True, timeout=5,
+                ).stdout.strip())
+                _ax_app2 = AXUIElementCreateApplication(_ax_pid)
+
+                def _ep_btns(root):
+                    stack = [root]; seen = 0
+                    while stack and seen < 8000:
+                        el = stack.pop(); seen += 1
+                        err, role = AXUIElementCopyAttributeValue(el, kAXRoleAttribute, None)
+                        if role == "AXButton":
+                            err, pv = AXUIElementCopyAttributeValue(el, kAXPositionAttribute, None)
+                            err, sv = AXUIElementCopyAttributeValue(el, kAXSizeAttribute, None)
+                            if pv and sv:
+                                _, pt = AXValueGetValue(pv, kAXValueCGPointType, None)
+                                _, sz = AXValueGetValue(sv, kAXValueCGSizeType, None)
+                                try:
+                                    if int(sz.height) > 60 and int(sz.width) > 400:
+                                        yield el, int(pt.y), int(pt.x), int(sz.width), int(sz.height)
+                                except (OverflowError, ValueError):
+                                    pass
+                        err, ch = AXUIElementCopyAttributeValue(el, kAXChildrenAttribute, None)
+                        if ch: stack.extend(ch)
+
+                _btns = sorted(_ep_btns(_ax_app2), key=lambda r: r[1])
+                _vis_el = next((el for el, ey, *_ in _btns if ey >= 100), None)
+                if _vis_el is not None:
+                    AXUIElementPerformAction(_vis_el, "AXScrollDownByPage")
+                    time.sleep(0.5)
+                    # Row moved ~602px up; find the button closest to estimated new y
+                    _est_y = row_y - 600
+                    _btns2 = list(_ep_btns(_ax_app2))
+                    if _btns2:
+                        _best = min(_btns2, key=lambda r: abs(r[1] - _est_y))
+                        _, _by, _bx, _bw, _bh = _best
+                        row_x, row_y, row_w, row_h = _bx, _by, _bw, _bh
+                        more_x = row_x + row_w - 47
+                        more_y = row_y + row_h // 2
+                        self.logger.log(
+                            f"Episode {video_no}: below-window scroll — "
+                            f"row refreshed to ({row_x},{row_y},{row_w},{row_h})",
+                            step="13",
+                        )
+                        _scrolled_into_view = True
+            except Exception as _exc:
+                self.logger.log(
+                    f"Episode {video_no}: below-window scroll error: {_exc}", step="13"
+                )
+            if not _scrolled_into_view:
+                # Last-resort clamp (click may miss — AX scroll failed)
+                more_y = win_y + win_h - 10
 
         row_cx = row_x + row_w // 2
         row_cy = row_y + row_h // 2
@@ -3077,6 +3131,23 @@ class PodcastsController:
                 step="13",
             )
             return "already_downloaded_popup_dismissed"
+
+        # Undo the extra below-window scroll so subsequent BFS searches count from
+        # ep1, not from the shifted position.  One AXScrollUpByPage is the inverse of
+        # the one AXScrollDownByPage we did above.
+        if _scrolled_into_view and _ax_app2 is not None:
+            try:
+                _btns_r = sorted(_ep_btns(_ax_app2), key=lambda r: r[1])
+                _restore_el = next((el for el, ey, *_ in _btns_r if ey >= 100), None)
+                if _restore_el is not None:
+                    AXUIElementPerformAction(_restore_el, "AXScrollUpByPage")
+                    time.sleep(0.4)
+                    self.logger.log(
+                        f"Episode {video_no}: restored list scroll after below-window click",
+                        step="13",
+                    )
+            except Exception:
+                pass
 
         return "download_clicked"
 
