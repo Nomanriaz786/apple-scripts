@@ -946,7 +946,7 @@ class VPNController:
             time.sleep(0.5)
             _dkey(0x09, True,  Quartz.kCGEventFlagMaskCommand)   # Cmd+V
             _dkey(0x09, False, Quartz.kCGEventFlagMaskCommand)
-            time.sleep(1.5)
+            time.sleep(2.5)  # wait for ProtonVPN to filter + auto-expand the country row
             self.logger.log(f"Discovery: search filter pasted '{location}'", step="06")
         finally:
             subprocess.run(["pbcopy"], input=old_clip, check=False)
@@ -1043,14 +1043,10 @@ class VPNController:
         )
         time.sleep(0.2)
 
+        # ProtonVPN auto-expands the country row after searching — no expand click needed.
         self.logger.log(
             f"Discovery: p3 expanded={is_expanded_p3}", step="06",
         )
-
-        if not is_expanded_p3:
-            _dmouse(Quartz.kCGEventLeftMouseDown, expand_x, expand_y)
-            _dmouse(Quartz.kCGEventLeftMouseUp,   expand_x, expand_y)
-            time.sleep(0.8)
 
         # ── Count server rows ─────────────────────────────────────────────────
         # Primary: AX row count (fast on the *filtered* table, ~50-100 rows max).
@@ -1330,7 +1326,7 @@ class VPNController:
             # Cmd+V to paste the location string.
             _key(0x09, True,  Quartz.kCGEventFlagMaskCommand)   # Cmd+V down
             _key(0x09, False, Quartz.kCGEventFlagMaskCommand)   # Cmd+V up
-            time.sleep(1.5)  # wait for ProtonVPN to apply the filter
+            time.sleep(2.5)  # wait for ProtonVPN to filter + auto-expand the country row
 
             self.logger.log(f"Search filter pasted: '{location}'", step="06")
         finally:
@@ -1496,16 +1492,11 @@ class VPNController:
         _mouse(Quartz.kCGEventMouseMoved, w_x + w_w // 2, expand_y - 30)
         time.sleep(0.2)
 
-        # Expansion uses a single authoritative signal from Phase 3 (EXP flag).
-        # Click expand at most once — it's a toggle, and the geometry is tied to
-        # the same flag, so a double-click would re-collapse and misplace the click.
-        if already_expanded:
-            self.logger.log("State list already expanded (AX) — skipping expand click", step="06")
-        else:
-            self.logger.log("State list collapsed (AX) — clicking expand once", step="06")
-            _mouse(Quartz.kCGEventLeftMouseDown, expand_x, expand_y)
-            _mouse(Quartz.kCGEventLeftMouseUp,   expand_x, expand_y)
-            time.sleep(1.2)
+        # ProtonVPN auto-expands the country row after searching — no expand click needed.
+        self.logger.log(
+            f"State list already_expanded={already_expanded} (auto-expand after search)",
+            step="06",
+        )
 
         # Bring the target state into view by setting the AX scroll-bar value.
         # ProtonVPN's Mac Catalyst list ignores synthetic scroll-wheel events;
