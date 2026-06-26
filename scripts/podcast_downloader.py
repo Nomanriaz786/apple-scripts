@@ -2143,7 +2143,7 @@ class PodcastsController:
             cands = sorted(
                 ((x + w // 2, y + h // 2) for role, t, x, y, w, h in nodes
                  if role in ("AXButton", "AXRadioButton", "AXTab", "AXCell") and w > 0
-                 and t.strip() in ("Episodes", "All Episodes")),
+                 and t.startswith(("Episodes", "All Episodes"))),
                 key=lambda c: c[1],
             )
             if cands:
@@ -3642,80 +3642,35 @@ class PodcastsController:
     def navigate_to_downloaded_tab(self) -> str:
         """Navigate to the Downloaded section in the Podcasts sidebar.
 
-        The Downloaded nav item is a UI element (NOT a button) in the AX tree.
-        Use BFS to find its pixel center then Quartz-click it.
+        Uses the fast ApplicationServices AX walk (_ax_nodes) to find the
+        'Downloaded' sidebar item (AXStaticText, x<400, w>100) and Quartz-click it.
         """
-        script = """
-        tell application "System Events"
-            set frontmost of process "Podcasts" to true
-        end tell
-        delay 0.3
-        tell application "System Events"
-            tell process "Podcasts"
-                if not (exists window 1) then return "ERROR:no_window"
-                set wPos to position of window 1
-                set wX to (item 1 of wPos) as integer
-                -- Sidebar nav items sit in the left ~320px of the window.
-                -- Episode "Downloaded" badges appear in the content area (right side)
-                -- and must not be mistaken for the nav item.
-                set sidebarRight to wX + 320
-                set q to {window 1}
-                set deadline to (current date) + 20
-                repeat 600 times
-                    if (count of q) = 0 then exit repeat
-                    if (current date) > deadline then return "ERROR:deadline"
-                    set elem to item 1 of q
-                    if (count of q) > 1 then
-                        set q to items 2 thru -1 of q
-                    else
-                        set q to {}
-                    end if
-                    set dd to ""
-                    try
-                        set dd to description of elem as string
-                    end try
-                    if dd is "Downloaded" then
-                        set sz to size of elem
-                        -- Sidebar nav item is ~180×28px; skip small episode-row labels.
-                        if (item 1 of sz) > 100 then
-                            set pos to position of elem
-                            -- Guard: only match elements on the left (sidebar) side of the
-                            -- window. Episode-row "Downloaded" labels live in the content
-                            -- area (right side) and would navigate to the wrong page.
-                            if (item 1 of pos) < sidebarRight then
-                                set cx to ((item 1 of pos) + (item 1 of sz) / 2) as integer
-                                set cy to ((item 2 of pos) + (item 2 of sz) / 2) as integer
-                                return "CENTER:" & cx & "," & cy
-                            end if
-                        end if
-                    end if
-                    try
-                        repeat with ch in UI elements of elem
-                            set end of q to ch
-                        end repeat
-                    end try
-                end repeat
-                return "ERROR:not_found"
-            end tell
-        end tell
-        """
-        out = run_osascript(script, timeout=30, label="find Downloaded nav item")
-        if out.startswith("ERROR:"):
-            self.logger.log(f"navigate_to_downloaded_tab: {out}", step="14")
-            return "not_found"
-
-        try:
-            cx, cy = (int(v) for v in out.replace("CENTER:", "").split(","))
-        except ValueError:
-            return "not_found"
-
         try:
             import Quartz  # type: ignore[import]
         except ImportError:
             return "quartz_unavailable"
 
-        def _mouse(kind, x, y):
-            pt = Quartz.CGPointMake(x, y)
+        try:
+            run_osascript('tell application "Podcasts" to activate',
+                          timeout=5, label="activate before Downloaded nav")
+        except AutomationError:
+            pass
+        time.sleep(0.3)
+
+        nodes = self._ax_nodes()
+        cx = cy = 0
+        for role, t, x, y, w, h in nodes:
+            if t == "Downloaded" and x < 400 and w > 100 and h > 0:
+                cx = x + w // 2
+                cy = y + h // 2
+                break
+
+        if not cx:
+            self.logger.log("navigate_to_downloaded_tab: ERROR:not_found", step="14")
+            return "not_found"
+
+        def _mouse(kind, px, py):
+            pt = Quartz.CGPointMake(px, py)
             ev = Quartz.CGEventCreateMouseEvent(None, kind, pt, Quartz.kCGMouseButtonLeft)
             Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
             time.sleep(0.05)
