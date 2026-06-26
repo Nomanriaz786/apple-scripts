@@ -969,54 +969,40 @@ class VPNController:
                 -- Do NOT reset scroll bar — it clears the search filter.
                 if not (exists UI element 1 of sc) then return "ERROR:no_outer_list"
                 set outerList to UI element 1 of sc
-                set targetLoc to "{location}"
+                set wPos to position of window 1
+                set wSz to size of window 1
+                -- Case A: filter active + country expanded — outerList IS the state list.
+                set outerDD to ""
+                try
+                    set outerDD to description of outerList as text
+                end try
+                if outerDD is "list" then
+                    if not (exists UI element 1 of outerList) then return "ERROR:empty_state_list"
+                    set firstElem to UI element 1 of outerList
+                    set fPos to position of firstElem
+                    return "R2:" & (item 2 of fPos) & "|W:" & (item 1 of wPos) & "," & (item 2 of wPos) & "," & (item 1 of wSz) & "," & (item 2 of wSz) & "|EXP:1"
+                end if
+                -- Case B: collapsed or unfiltered — walk children.
                 set stateList to missing value
                 set headerY to 0
-                set pastTarget to false
                 repeat with c in UI elements of outerList
                     set cdd to ""
                     try
                         set cdd to description of c as text
                     end try
-                    if (class of c as text) is "button" and not pastTarget then
+                    if (class of c as text) is "button" and headerY = 0 then
                         try
                             set csz to size of c
                             if (item 1 of csz) > 100 then
-                                if cdd contains targetLoc then
-                                    set cpos to position of c
-                                    set headerY to (item 2 of cpos) as integer
-                                    set pastTarget to true
-                                end if
+                                set cpos to position of c
+                                set headerY to (item 2 of cpos) as integer
                             end if
                         end try
                     end if
-                    if cdd is "list" and pastTarget and stateList is missing value then
+                    if cdd is "list" and stateList is missing value then
                         set stateList to c
                     end if
                 end repeat
-                -- Fallback: use first wide button + first list
-                if headerY = 0 then
-                    repeat with c in UI elements of outerList
-                        set cdd to ""
-                        try
-                            set cdd to description of c as text
-                        end try
-                        if (class of c as text) is "button" and headerY = 0 then
-                            try
-                                set csz to size of c
-                                if (item 1 of csz) > 100 then
-                                    set cpos to position of c
-                                    set headerY to (item 2 of cpos) as integer
-                                end if
-                            end try
-                        end if
-                        if cdd is "list" and stateList is missing value then
-                            set stateList to c
-                        end if
-                    end repeat
-                end if
-                set wPos to position of window 1
-                set wSz to size of window 1
                 if stateList is missing value then
                     return "R2:" & headerY & "|W:" & (item 1 of wPos) & "," & (item 2 of wPos) & "," & (item 1 of wSz) & "," & (item 2 of wSz) & "|EXP:0"
                 end if
@@ -1382,63 +1368,54 @@ class VPNController:
                 -- filtered result (e.g. "United States").
                 if not (exists UI element 1 of sc) then return "ERROR:no_outer_list"
                 set outerList to UI element 1 of sc
-                set targetLoc to "{location}"
-                set stateList to missing value
-                set headerY to 0
-                set pastTarget to false
-                -- First pass: find the target country button by name, then its state list.
-                -- Works whether the search filter is active or not.
-                repeat with c in UI elements of outerList
-                    set cdd to ""
-                    try
-                        set cdd to description of c as text
-                    end try
-                    if (class of c as text) is "button" and not pastTarget then
-                        try
-                            set csz to size of c
-                            if (item 1 of csz) > 100 then
-                                if cdd contains targetLoc then
-                                    set cpos to position of c
-                                    set headerY to (item 2 of cpos) as integer
-                                    set pastTarget to true
-                                end if
-                            end if
-                        end try
-                    end if
-                    if cdd is "list" and pastTarget and stateList is missing value then
-                        set stateList to c
-                    end if
-                end repeat
-                -- Fallback: location not found by name (filter may have collapsed list to
-                -- exactly one entry without a name we can match). Use first wide button.
-                if headerY = 0 then
-                    repeat with c in UI elements of outerList
-                        set cdd to ""
-                        try
-                            set cdd to description of c as text
-                        end try
-                        if (class of c as text) is "button" and headerY = 0 then
-                            try
-                                set csz to size of c
-                                if (item 1 of csz) > 100 then
-                                    set cpos to position of c
-                                    set headerY to (item 2 of cpos) as integer
-                                end if
-                            end try
-                        end if
-                        if cdd is "list" and stateList is missing value then
-                            set stateList to c
-                        end if
-                    end repeat
-                end if
                 set wPos to position of window 1
                 set wSz to size of window 1
                 set wX to (item 1 of wPos) as integer
                 set wY to (item 2 of wPos) as integer
                 set wW to (item 1 of wSz) as integer
                 set wH to (item 2 of wSz) as integer
+                -- Case A: filter active + country already expanded.
+                -- outerList itself IS the state list (description="list"); its children
+                -- are the per-state buttons directly (no extra nesting).
+                set outerDD to ""
+                try
+                    set outerDD to description of outerList as text
+                end try
+                if outerDD is "list" then
+                    if not (exists UI element 1 of outerList) then return "ERROR:empty_state_list"
+                    set firstElem to UI element 1 of outerList
+                    set fPos to position of firstElem
+                    set fSz to size of firstElem
+                    set firstY to (item 2 of fPos) as integer
+                    set rowH to (item 2 of fSz) as integer
+                    set stateCount to (count of UI elements of outerList) div 2
+                    if stateCount < 1 then set stateCount to 1
+                    return "R2:0," & firstY & "|W:" & wX & "," & wY & "," & wW & "," & wH & "|EXP:1|RH:" & rowH & "|SC:" & stateCount
+                end if
+                -- Case B: filter active + country collapsed, OR filter not applied.
+                -- Walk outerList children: find country header button (first wide button)
+                -- and optional nested state list (dd="list").
+                set stateList to missing value
+                set headerY to 0
+                repeat with c in UI elements of outerList
+                    set cdd to ""
+                    try
+                        set cdd to description of c as text
+                    end try
+                    if (class of c as text) is "button" and headerY = 0 then
+                        try
+                            set csz to size of c
+                            if (item 1 of csz) > 100 then
+                                set cpos to position of c
+                                set headerY to (item 2 of cpos) as integer
+                            end if
+                        end try
+                    end if
+                    if cdd is "list" and stateList is missing value then
+                        set stateList to c
+                    end if
+                end repeat
                 if stateList is missing value then
-                    -- US collapsed; return header y for expand click. SC:0 = unknown count.
                     return "R2:0," & headerY & "|W:" & wX & "," & wY & "," & wW & "," & wH & "|EXP:0|RH:44|SC:0"
                 end if
                 if not (exists UI element 1 of stateList) then return "ERROR:empty_state_list"
@@ -1447,9 +1424,7 @@ class VPNController:
                 set fSz to size of firstElem
                 set firstY to (item 2 of fPos) as integer
                 set rowH to (item 2 of fSz) as integer
-                -- Each state has 2 elements (name button + three-dot button)
-                set elemCount to count of UI elements of stateList
-                set stateCount to elemCount div 2
+                set stateCount to (count of UI elements of stateList) div 2
                 if stateCount < 1 then set stateCount to 1
                 return "R2:0," & firstY & "|W:" & wX & "," & wY & "," & wW & "," & wH & "|EXP:1|RH:" & rowH & "|SC:" & stateCount
             end tell
