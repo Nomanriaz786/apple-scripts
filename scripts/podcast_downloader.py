@@ -1574,6 +1574,14 @@ class VPNController:
         _mouse(Quartz.kCGEventLeftMouseDown, connect_x, server_y)
         time.sleep(0.1)
         _mouse(Quartz.kCGEventLeftMouseUp,   connect_x, server_y)
+
+        # ProtonVPN UI: clicking the ⋯ button opens a per-state IP popup.
+        # Down selects the first IP in the list; Enter connects to it.
+        time.sleep(0.8)
+        _key(0x7D, True); _key(0x7D, False)   # Down → first IP
+        time.sleep(0.35)
+        _key(0x24, True); _key(0x24, False)   # Enter → connect
+        time.sleep(0.5)
         return "connect_button_clicked"
 
     def _record_ip(self, ip: str | None) -> None:
@@ -2145,11 +2153,11 @@ class PodcastsController:
                     win_x = x
                     break
             content_left = win_x + 180
+            # Podcasts shows an "Episodes" button to navigate to the full episode list.
             cands = sorted(
                 ((x + w // 2, y + h // 2) for role, t, x, y, w, h in nodes
-                 if w > 0 and not role.startswith("AXMenu")
-                 and (x + w // 2) > content_left
-                 and ("See All" in t or "Show All" in t)),
+                 if role in ("AXButton", "AXRadioButton", "AXTab", "AXCell") and w > 0
+                 and t.strip() in ("Episodes", "All Episodes")),
                 key=lambda c: c[1],
             )
             if cands:
@@ -2189,11 +2197,9 @@ class PodcastsController:
                 return false
             end try
             if t is "" then return false
-            if t is "See All" then return true
-            if t is "Show All" then return true
-            if t is "See all" then return true
-            if t contains "See All" then return true
-            if t contains "Show All" then return true
+            if t is "Episodes" then return true
+            if t is "All Episodes" then return true
+            if t contains "Episodes" then return true
             return false
         end matchesSeeAll
 
@@ -3663,10 +3669,10 @@ class PodcastsController:
                 if not (exists window 1) then return "ERROR:no_window"
                 set wPos to position of window 1
                 set wX to (item 1 of wPos) as integer
-                -- Sidebar nav items sit in the left ~260px of the window.
+                -- Sidebar nav items sit in the left ~320px of the window.
                 -- Episode "Downloaded" badges appear in the content area (right side)
                 -- and must not be mistaken for the nav item.
-                set sidebarRight to wX + 260
+                set sidebarRight to wX + 320
                 set q to {window 1}
                 set deadline to (current date) + 20
                 repeat 600 times
@@ -3682,8 +3688,6 @@ class PodcastsController:
                     try
                         set dd to description of elem as string
                     end try
-                    -- Exact match to avoid matching episode-row descriptions that
-                    -- contain "Downloaded" as a suffix.
                     if dd is "Downloaded" then
                         set sz to size of elem
                         -- Sidebar nav item is ~180×28px; skip small episode-row labels.
@@ -4878,56 +4882,36 @@ class PodcastsController:
         return None
 
     def _click_remove_menu_item_ax(self) -> bool:
-        """Try to click a 'Remove' menu item via Accessibility. Returns True on success.
+        """Click the 'Remove…' context menu item via ApplicationServices AX walk + Quartz.
 
-        Looks in:
-          1. Any floating window whose role contains 'menu' or 'AXMenu'.
-          2. menus of window 1.
-        """
-        script = """
-        tell application "System Events"
-            tell process "Podcasts"
-                -- Check all windows for a floating context menu
-                repeat with w in windows
-                    set wRole to ""
-                    try
-                        set wRole to role of w as string
-                    end try
-                    if wRole contains "AXMenu" then
-                        repeat with mi in menu items of w
-                            set mName to ""
-                            try
-                                set mName to name of mi as string
-                            end try
-                            if mName contains "Remove" or mName contains "Delete" then
-                                click mi
-                                return "ax_clicked"
-                            end if
-                        end repeat
-                    end if
-                end repeat
-                -- Also check menus attached to window 1
-                repeat with m in menus of window 1
-                    repeat with mi in menu items of m
-                        set mName to ""
-                        try
-                            set mName to name of mi as string
-                        end try
-                        if mName contains "Remove" or mName contains "Delete" then
-                            click mi
-                            return "ax_clicked"
-                        end if
-                    end repeat
-                end repeat
-                return "menu_not_found"
-            end tell
-        end tell
+        The Podcasts Downloads card context menu exposes its items as AXButton elements
+        readable via ApplicationServices (kAXDescriptionAttribute / kAXTitleAttribute).
+        Locate the small button (h < 40) whose text contains 'Remove' or 'Delete' and
+        click its pixel centre with Quartz.
         """
         try:
-            result = run_osascript(script, timeout=5, label="AX Remove menu item")
-            return result == "ax_clicked"
-        except AutomationError:
+            import Quartz  # type: ignore[import]
+        except ImportError:
             return False
+
+        nodes = self._ax_nodes()
+        for role, text, x, y, w, h in nodes:
+            if (role == "AXButton" and h > 0 and h < 40
+                    and ("Remove" in text or "Delete" in text)):
+                cx = x + w // 2
+                cy = y + h // 2
+                pt = Quartz.CGPoint(x=float(cx), y=float(cy))
+                for kind in (Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp):
+                    ev = Quartz.CGEventCreateMouseEvent(
+                        None, kind, pt, Quartz.kCGMouseButtonLeft)
+                    Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+                    time.sleep(0.05)
+                self.logger.log(
+                    f"_click_remove_menu_item_ax: clicked '{text}' at ({cx},{cy})",
+                    step="14",
+                )
+                return True
+        return False
 
     # ── Generic card-based cleanup (fallback when show names not captured) ───
 
@@ -5161,77 +5145,24 @@ class PodcastsController:
 
             _open_three_dots_menu()
 
-            # AX click ('Remove from Library' / 'Remove Downloads' — matched if accessible)
+            # AX click on the 'Remove…' menu item via ApplicationServices + Quartz.
             ax_ok = self._click_remove_menu_item_ax()
             confirm = "no_sheet"
             actual_removed = False
 
-            if ax_ok:
-                time.sleep(0.4)
-                confirm = self._click_confirmation_remove()
-                actual_removed = True
-            else:
-                # Keyboard fallback using direct Quartz key events.
-                # IMPORTANT: osascript / System Events key codes are NOT used here because
-                # routing keys through System Events yields focus away from the Mac Catalyst
-                # context menu popover, causing it to close before the item fires.
-                # Quartz CGEvent keys go directly to the focused process without focus change.
-                #
-                # Menu item order (observed on Podcasts Downloads grid):
-                #   1 Follow Show  2 Report a Concern  3 Remove…  4 Play Next  …
-                # "Remove…" opens a confirmation sheet; other items do not.
-                # Try Down×3 first (most common), then Down×2 if no sheet appeared.
-                for n_down in (3, 2):
-                    for _ in range(n_down):
-                        _key(0x7D, True); _key(0x7D, False)   # Down arrow  (kVK 0x7D)
-                        time.sleep(0.25)
-                    _key(0x24, True); _key(0x24, False)        # Return/Enter (kVK 0x24)
-                    time.sleep(0.3)
-                    confirm = self._click_confirmation_remove(max_attempts=3)
-                    if "clicked" in confirm:
-                        actual_removed = True
-                        self.logger.log(
-                            f"Downloads cleanup card {iteration + 1}: "
-                            f"keyboard Down×{n_down}+Enter → confirmed",
-                            step="14",
-                        )
-                        break
-                    # Wrong item or menu closed — press Escape, re-navigate, retry.
-                    _key(0x35, True); _key(0x35, False)        # Escape (kVK 0x35)
-                    time.sleep(0.5)
-                    if n_down > 2:
-                        _nav_r = self.navigate_to_downloaded_tab()
-                        if _nav_r != "navigated":
-                            break
-                        # If navigation landed on show page, click Back first
-                        if self._has_back_button():
-                            self._click_back_button()
-                            time.sleep(0.5)
-                        time.sleep(0.3)
-                        _rf = self._find_downloaded_card_frame()
-                        if _rf is None:
-                            # Card gone without confirmation sheet (edge case).
-                            actual_removed = True
-                            break
-                        card_x, card_y, card_w, card_h = _rf
-                        artwork_h = card_w
-                        three_x = card_x + card_w - 20
-                        three_y = card_y + artwork_h - 20
-                        artwork_cx = card_x + card_w // 2
-                        artwork_cy = card_y + artwork_h // 2
-                        try:
-                            run_osascript(
-                                'tell application "Podcasts" to activate',
-                                timeout=5, label="activate Podcasts before retry click",
-                            )
-                            time.sleep(0.3)
-                        except AutomationError:
-                            pass
-                        _open_three_dots_menu()
+            if not ax_ok:
+                self.logger.log(
+                    f"Downloads cleanup card {iteration + 1}: Remove item not found via AX",
+                    step="14",
+                )
+                results.append({"iteration": iteration + 1, "result": "remove_not_found"})
+                break
 
-            method = "ax" if ax_ok else "keyboard"
-            result_label = (f"removed:{method}" if actual_removed
-                            else f"remove_failed:{method}")
+            time.sleep(0.4)
+            confirm = self._click_confirmation_remove()
+            actual_removed = True
+
+            result_label = "removed:ax"
             if confirm not in ("no_sheet",):
                 result_label += f"+confirmed:{confirm}"
 
