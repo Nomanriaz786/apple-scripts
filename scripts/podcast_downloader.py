@@ -966,32 +966,55 @@ class VPNController:
                 if not (exists group 1 of window 1) then return "ERROR:no_group"
                 if not (exists scroll area 1 of group 1 of window 1) then return "ERROR:no_scroll"
                 set sc to scroll area 1 of group 1 of window 1
-                try
-                    set value of scroll bar 1 of sc to 0
-                    delay 0.3
-                end try
+                -- Do NOT reset scroll bar — it clears the search filter.
                 if not (exists UI element 1 of sc) then return "ERROR:no_outer_list"
                 set outerList to UI element 1 of sc
+                set targetLoc to "{location}"
                 set stateList to missing value
                 set headerY to 0
+                set pastTarget to false
                 repeat with c in UI elements of outerList
                     set cdd to ""
                     try
                         set cdd to description of c as text
                     end try
-                    if cdd is "list" then
-                        set stateList to c
-                    end if
-                    if (class of c as text) is "button" and headerY = 0 then
+                    if (class of c as text) is "button" and not pastTarget then
                         try
                             set csz to size of c
                             if (item 1 of csz) > 100 then
-                                set cpos to position of c
-                                set headerY to (item 2 of cpos) as integer
+                                if cdd contains targetLoc then
+                                    set cpos to position of c
+                                    set headerY to (item 2 of cpos) as integer
+                                    set pastTarget to true
+                                end if
                             end if
                         end try
                     end if
+                    if cdd is "list" and pastTarget and stateList is missing value then
+                        set stateList to c
+                    end if
                 end repeat
+                -- Fallback: use first wide button + first list
+                if headerY = 0 then
+                    repeat with c in UI elements of outerList
+                        set cdd to ""
+                        try
+                            set cdd to description of c as text
+                        end try
+                        if (class of c as text) is "button" and headerY = 0 then
+                            try
+                                set csz to size of c
+                                if (item 1 of csz) > 100 then
+                                    set cpos to position of c
+                                    set headerY to (item 2 of cpos) as integer
+                                end if
+                            end try
+                        end if
+                        if cdd is "list" and stateList is missing value then
+                            set stateList to c
+                        end if
+                    end repeat
+                end if
                 set wPos to position of window 1
                 set wSz to size of window 1
                 if stateList is missing value then
@@ -1354,35 +1377,60 @@ class VPNController:
                 if not (exists group 1 of window 1) then return "ERROR:no_group"
                 if not (exists scroll area 1 of group 1 of window 1) then return "ERROR:no_scroll_area"
                 set sc to scroll area 1 of group 1 of window 1
-                try
-                    set value of scroll bar 1 of sc to 0
-                    delay 0.3
-                end try
+                -- Do NOT reset scroll bar here — setting its value clears ProtonVPN's
+                -- search filter, causing all 147 countries to reappear instead of the
+                -- filtered result (e.g. "United States").
                 if not (exists UI element 1 of sc) then return "ERROR:no_outer_list"
                 set outerList to UI element 1 of sc
-                -- Walk outer list: find inner state list (dd="list") and US header y
+                set targetLoc to "{location}"
                 set stateList to missing value
                 set headerY to 0
+                set pastTarget to false
+                -- First pass: find the target country button by name, then its state list.
+                -- Works whether the search filter is active or not.
                 repeat with c in UI elements of outerList
                     set cdd to ""
                     try
                         set cdd to description of c as text
                     end try
-                    if cdd is "list" then
-                        set stateList to c
-                    end if
-                    -- Use first WIDE button (w>100) as the US row expand button.
-                    -- Narrow buttons (e.g. info icon w=16) are skipped.
-                    if (class of c as text) is "button" and headerY = 0 then
+                    if (class of c as text) is "button" and not pastTarget then
                         try
                             set csz to size of c
                             if (item 1 of csz) > 100 then
-                                set cpos to position of c
-                                set headerY to (item 2 of cpos) as integer
+                                if cdd contains targetLoc then
+                                    set cpos to position of c
+                                    set headerY to (item 2 of cpos) as integer
+                                    set pastTarget to true
+                                end if
                             end if
                         end try
                     end if
+                    if cdd is "list" and pastTarget and stateList is missing value then
+                        set stateList to c
+                    end if
                 end repeat
+                -- Fallback: location not found by name (filter may have collapsed list to
+                -- exactly one entry without a name we can match). Use first wide button.
+                if headerY = 0 then
+                    repeat with c in UI elements of outerList
+                        set cdd to ""
+                        try
+                            set cdd to description of c as text
+                        end try
+                        if (class of c as text) is "button" and headerY = 0 then
+                            try
+                                set csz to size of c
+                                if (item 1 of csz) > 100 then
+                                    set cpos to position of c
+                                    set headerY to (item 2 of cpos) as integer
+                                end if
+                            end try
+                        end if
+                        if cdd is "list" and stateList is missing value then
+                            set stateList to c
+                        end if
+                    end repeat
+                end if
                 set wPos to position of window 1
                 set wSz to size of window 1
                 set wX to (item 1 of wPos) as integer
