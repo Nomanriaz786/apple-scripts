@@ -951,7 +951,7 @@ class VPNController:
         finally:
             subprocess.run(["pbcopy"], input=old_clip, check=False)
 
-        # ── Phase 3: scroll to top, get row-2 position ───────────────────────
+        # ── Phase 3: scroll to top, get first-state position ─────────────────
         p3_script = f"""
         tell application "System Events"
             set procName to ""
@@ -963,20 +963,41 @@ class VPNController:
             end repeat
             if procName is "" then return "ERROR:no_process"
             tell process procName
-                if not (exists scroll area 1 of window 1) then return "ERROR:no_scroll"
-                if not (exists table 1 of scroll area 1 of window 1) then return "ERROR:no_table"
-                set sc to scroll area 1 of window 1
+                if not (exists group 1 of window 1) then return "ERROR:no_group"
+                if not (exists scroll area 1 of group 1 of window 1) then return "ERROR:no_scroll"
+                set sc to scroll area 1 of group 1 of window 1
                 try
                     set value of scroll bar 1 of sc to 0
                     delay 0.3
                 end try
-                if not (exists row 2 of table 1 of sc) then return "ERROR:no_row2"
-                set r2Pos to position of row 2 of table 1 of sc
+                if not (exists UI element 1 of sc) then return "ERROR:no_outer_list"
+                set outerList to UI element 1 of sc
+                set stateList to missing value
+                set headerY to 0
+                repeat with c in UI elements of outerList
+                    set cdd to ""
+                    try
+                        set cdd to description of c as text
+                    end try
+                    if cdd is "list" then
+                        set stateList to c
+                    end if
+                    if (class of c as text) is "button" and headerY = 0 then
+                        try
+                            set cpos to position of c
+                            set headerY to (item 2 of cpos) as integer
+                        end try
+                    end if
+                end repeat
                 set wPos to position of window 1
                 set wSz to size of window 1
-                return "R2:" & (item 2 of r2Pos) & ¬
-                       "|W:" & (item 1 of wPos) & "," & (item 2 of wPos) & "," & ¬
-                               (item 1 of wSz)  & "," & (item 2 of wSz)
+                if stateList is missing value then
+                    return "R2:" & headerY & "|W:" & (item 1 of wPos) & "," & (item 2 of wPos) & "," & (item 1 of wSz) & "," & (item 2 of wSz) & "|EXP:0"
+                end if
+                if not (exists UI element 1 of stateList) then return "ERROR:empty_state_list"
+                set firstElem to UI element 1 of stateList
+                set fPos to position of firstElem
+                return "R2:" & (item 2 of fPos) & "|W:" & (item 1 of wPos) & "," & (item 2 of wPos) & "," & (item 1 of wSz) & "," & (item 2 of wSz) & "|EXP:1"
             end tell
         end tell
         """
@@ -991,6 +1012,7 @@ class VPNController:
             return _fallback()
 
         r2_top = 0
+        is_expanded_p3 = False
         for chunk in p3.split("|"):
             if chunk.startswith("R2:"):
                 try:
@@ -1001,17 +1023,19 @@ class VPNController:
                 parts = chunk[2:].split(",")
                 if len(parts) == 4:
                     w_x, w_y, w_w, w_h = (int(p) for p in parts)
+            elif chunk.startswith("EXP:"):
+                is_expanded_p3 = chunk[4:].strip() == "1"
 
         if r2_top == 0:
             self.logger.log(f"Discovery p3 bad data: {p3!r} — using 5 slots", step="06")
             return _fallback()
 
-        US_HEADER_H = 48
-        SERVER_ROW_H = 48
+        # New Mac: row height = 44px; US header height ≈ row height.
+        SERVER_ROW_H = 44
         expand_x = w_x + w_w // 2
-        expand_y = r2_top + US_HEADER_H // 2
+        expand_y = r2_top + SERVER_ROW_H // 2
 
-        # ── Phase 4: expand if needed, then count server rows ────────────────
+        # ── Phase 4: expand if needed, then count state rows ─────────────────
         subprocess.run(
             ["osascript", "-e",
              f'tell application "System Events" to set frontmost of process "ProtonVPN" to true'],
@@ -1019,27 +1043,11 @@ class VPNController:
         )
         time.sleep(0.2)
 
-        def _sample_brightness(sx, sy, sw=40, sh=20) -> int:
-            rect = Quartz.CGRectMake(sx, sy, sw, sh)
-            img = Quartz.CGWindowListCreateImage(
-                rect, Quartz.kCGWindowListOptionOnScreenOnly,
-                Quartz.kCGNullWindowID, Quartz.kCGWindowImageDefault,
-            )
-            if img is None:
-                return 0
-            dp = Quartz.CGDataProviderCopyData(Quartz.CGImageGetDataProvider(img))
-            if not dp or len(dp) < 4:
-                return 0
-            return max(dp[i] + dp[i + 1] + dp[i + 2] for i in range(0, len(dp) - 3, 4))
-
-        first_server_y = r2_top + US_HEADER_H + SERVER_ROW_H // 2
-        bright = _sample_brightness(w_x + 10, first_server_y - 10)
-        is_expanded = bright > 270
         self.logger.log(
-            f"Discovery: expansion brightness={bright} expanded={is_expanded}", step="06",
+            f"Discovery: p3 expanded={is_expanded_p3}", step="06",
         )
 
-        if not is_expanded:
+        if not is_expanded_p3:
             _dmouse(Quartz.kCGEventLeftMouseDown, expand_x, expand_y)
             _dmouse(Quartz.kCGEventLeftMouseUp,   expand_x, expand_y)
             time.sleep(0.8)
@@ -1059,14 +1067,27 @@ class VPNController:
             end repeat
             if procName is "" then return "ERROR:no_process"
             tell process procName
-                if not (exists table 1 of scroll area 1 of window 1) then return "ERROR:no_table"
-                set tbl to table 1 of scroll area 1 of window 1
-                set totalRows to count of rows of tbl
-                -- Row 1 = "All locations" header (32px), Row 2 = country header (48px)
-                -- Rows 3+ = individual server rows
-                set srvCount to totalRows - 2
-                if srvCount < 1 then set srvCount to 1
-                return srvCount as text
+                if not (exists scroll area 1 of group 1 of window 1) then return "ERROR:no_scroll"
+                set sc to scroll area 1 of group 1 of window 1
+                if not (exists UI element 1 of sc) then return "ERROR:no_outer_list"
+                set outerList to UI element 1 of sc
+                set stateList to missing value
+                repeat with c in UI elements of outerList
+                    set cdd to ""
+                    try
+                        set cdd to description of c as text
+                    end try
+                    if cdd is "list" then
+                        set stateList to c
+                        exit repeat
+                    end if
+                end repeat
+                if stateList is missing value then return "ERROR:no_state_list"
+                -- Each state has 2 elements (name button + three-dot button)
+                set elemCount to count of UI elements of stateList
+                set stateCount to elemCount div 2
+                if stateCount < 1 then set stateCount to 1
+                return stateCount as text
             end tell
         end tell
         """
@@ -1077,33 +1098,19 @@ class VPNController:
             if not cr.startswith("ERROR:"):
                 server_count = int(cr)
                 self.logger.log(
-                    f"Discovery: AX row count → {server_count} servers for {location}",
+                    f"Discovery: AX element count → {server_count} states for {location}",
                     step="06",
                 )
         except (AutomationError, ValueError) as exc:
             self.logger.log(
-                f"Discovery: AX count failed ({exc}) — falling back to pixel sampling",
+                f"Discovery: AX count failed ({exc}) — defaulting to 10 states",
                 step="06",
             )
 
-        # Fallback: pixel brightness sampling down from first server row
         if server_count <= 0:
-            n, misses = 0, 0
-            max_slots = min(200, (w_h - (r2_top + US_HEADER_H)) // SERVER_ROW_H + 20)
-            while n < max_slots and misses < 3:
-                slot_y = r2_top + US_HEADER_H + n * SERVER_ROW_H + SERVER_ROW_H // 2
-                if slot_y > w_y + w_h:
-                    break
-                b = _sample_brightness(w_x + 10, slot_y)
-                if b > 200:
-                    n += 1
-                    misses = 0
-                else:
-                    misses += 1
-                    n += 1
-            server_count = max(n - misses, 1)
+            server_count = 10
             self.logger.log(
-                f"Discovery: pixel sampling → {server_count} visible slots for {location}",
+                f"Discovery: AX count returned 0 — using default {server_count} states",
                 step="06",
             )
 
@@ -1330,7 +1337,9 @@ class VPNController:
             # Restore original clipboard.
             subprocess.run(["pbcopy"], input=old_clip, check=False)
 
-        # ── Phase 3: scroll to top, read row-2 position ──────────────────────────────
+        # ── Phase 3: scroll to top, read state-list position ────────────────────────────
+        # New Mac AX structure: scroll area is inside group 1 (not a direct window child).
+        # The list uses nested UI elements instead of a table with rows.
         phase3_script = f"""
         tell application "System Events"
             set procName to ""
@@ -1342,49 +1351,54 @@ class VPNController:
             end repeat
             if procName is "" then return "ERROR:vpn_process_not_found"
             tell process procName
-                if not (exists scroll area 1 of window 1) then return "ERROR:no_scroll_area"
-                if not (exists table 1 of scroll area 1 of window 1) then return "ERROR:no_table"
-                set sc to scroll area 1 of window 1
-                set tbl to table 1 of sc
+                if not (exists group 1 of window 1) then return "ERROR:no_group"
+                if not (exists scroll area 1 of group 1 of window 1) then return "ERROR:no_scroll_area"
+                set sc to scroll area 1 of group 1 of window 1
                 try
                     set value of scroll bar 1 of sc to 0
                     delay 0.3
                 end try
-                if not (exists row 1 of tbl) then return "ERROR:no_rows_after_search"
-                -- Row 2 is the US country header when the list is collapsed.
-                -- When already expanded, row 2 is the first individual server.
-                -- Detect: if row 3 exists AND is within 60px of row 2, the list
-                -- is already expanded (servers are already showing as rows).
-                set cRow to missing value
-                set alreadyExpanded to false
-                if exists row 2 of tbl then
-                    set cRow to row 2 of tbl
-                    if exists row 3 of tbl then
-                        set r2p to position of row 2 of tbl
-                        set r3p to position of row 3 of tbl
-                        set r2y to (item 2 of r2p) as integer
-                        set r3y to (item 2 of r3p) as integer
-                        -- If rows 2 and 3 are within 60px, the US list is already expanded
-                        -- and row 2 is actually the first server, not the US header.
-                        if (r3y - r2y) < 60 then
-                            set alreadyExpanded to true
-                        end if
+                if not (exists UI element 1 of sc) then return "ERROR:no_outer_list"
+                set outerList to UI element 1 of sc
+                -- Walk outer list: find inner state list (dd="list") and US header y
+                set stateList to missing value
+                set headerY to 0
+                repeat with c in UI elements of outerList
+                    set cdd to ""
+                    try
+                        set cdd to description of c as text
+                    end try
+                    if cdd is "list" then
+                        set stateList to c
                     end if
-                else
-                    set cRow to row 1 of tbl
-                end if
-                set r2Pos to position of cRow
-                set r2X to (item 1 of r2Pos) as integer
-                set r2Top to (item 2 of r2Pos) as integer
+                    if (class of c as text) is "button" and headerY = 0 then
+                        try
+                            set cpos to position of c
+                            set headerY to (item 2 of cpos) as integer
+                        end try
+                    end if
+                end repeat
                 set wPos to position of window 1
                 set wSz to size of window 1
                 set wX to (item 1 of wPos) as integer
                 set wY to (item 2 of wPos) as integer
                 set wW to (item 1 of wSz) as integer
                 set wH to (item 2 of wSz) as integer
-                set expandedFlag to "0"
-                if alreadyExpanded then set expandedFlag to "1"
-                return "R2:" & r2X & "," & r2Top & "|W:" & wX & "," & wY & "," & wW & "," & wH & "|EXP:" & expandedFlag
+                if stateList is missing value then
+                    -- US states not expanded yet; return header y for expansion click
+                    return "R2:0," & headerY & "|W:" & wX & "," & wY & "," & wW & "," & wH & "|EXP:0|RH:44|SC:1"
+                end if
+                if not (exists UI element 1 of stateList) then return "ERROR:empty_state_list"
+                set firstElem to UI element 1 of stateList
+                set fPos to position of firstElem
+                set fSz to size of firstElem
+                set firstY to (item 2 of fPos) as integer
+                set rowH to (item 2 of fSz) as integer
+                -- Each state has 2 elements (name button + three-dot button)
+                set elemCount to count of UI elements of stateList
+                set stateCount to elemCount div 2
+                if stateCount < 1 then set stateCount to 1
+                return "R2:0," & firstY & "|W:" & wX & "," & wY & "," & wW & "," & wH & "|EXP:1|RH:" & rowH & "|SC:" & stateCount
             end tell
         end tell
         """
@@ -1403,6 +1417,8 @@ class VPNController:
         r2_x = r2_top = 0
         w_x2 = w_y2 = w_w2 = w_h2 = 0
         already_expanded = False
+        row_h_from_p3 = 0
+        state_count_from_p3 = 0
         for chunk in p3.split("|"):
             if chunk.startswith("R2:"):
                 nums = chunk[3:].split(",")
@@ -1418,6 +1434,16 @@ class VPNController:
                     w_x2, w_y2, w_w2 = int(nums[0]), int(nums[1]), int(nums[2])
             elif chunk.startswith("EXP:"):
                 already_expanded = chunk[4:].strip() == "1"
+            elif chunk.startswith("RH:"):
+                try:
+                    row_h_from_p3 = int(chunk[3:])
+                except ValueError:
+                    pass
+            elif chunk.startswith("SC:"):
+                try:
+                    state_count_from_p3 = int(chunk[3:])
+                except ValueError:
+                    pass
 
         # Use phase3 window coords if available (most current), fall back to phase1.
         w_h = w_h2  # window height (phase1 does not capture it; 0 disables scroll)
@@ -1428,109 +1454,73 @@ class VPNController:
             self.logger.log(f"Bad phase3 data: {p3!r}", step="06")
             return "bad_anchor_data"
 
-        # Per-device geometry (calibrate.py overrides these via vpn.calibration).
-        US_HEADER_H = calibration.header_height   # US country header row height
-        SERVER_ROW_H = calibration.row_height     # individual server row height
+        # Row height comes from Phase 3 AX measurement; calibration is the fallback.
+        SERVER_ROW_H = row_h_from_p3 if row_h_from_p3 > 0 else calibration.row_height
+
+        # Wrap slot_num within the actual state count so rotation always lands on
+        # a real state (state_count_from_p3=0 means not yet known — use slot as-is).
+        total_slots = state_count_from_p3 or len(
+            self.state.data.get("discovered_servers_by_location", {}).get(location, [])
+        ) or slot_num
+        effective_slot = ((slot_num - 1) % total_slots) + 1 if total_slots > 1 else slot_num
 
         connect_x = w_x + w_w - calibration.connect_offset_from_right
 
         if already_expanded:
-            # Row 2 is already the first server — no header offset needed.
-            # server_y points directly to the Nth server row from r2_top.
-            expand_y = r2_top - US_HEADER_H // 2  # US header is one row above r2
-            server_y = r2_top + (slot_num - 1) * SERVER_ROW_H + SERVER_ROW_H // 2
+            # r2_top is the first state's y; US header is one row_h above it.
+            expand_y = r2_top - SERVER_ROW_H // 2
+            server_y = r2_top + (effective_slot - 1) * SERVER_ROW_H + SERVER_ROW_H // 2
         else:
-            # Row 2 is the US country header — need to expand it first.
-            expand_y = r2_top + US_HEADER_H // 2
-            server_y = r2_top + US_HEADER_H + (slot_num - 1) * SERVER_ROW_H + SERVER_ROW_H // 2
+            # r2_top is the US header button's y; first state is one row_h below.
+            expand_y = r2_top + SERVER_ROW_H // 2
+            server_y = r2_top + SERVER_ROW_H + (effective_slot - 1) * SERVER_ROW_H + SERVER_ROW_H // 2
 
         expand_x = w_x + w_w // 2
 
         self.logger.log(
-            f"Slot {slot_num}: r2=({r2_x},{r2_top}) w=({w_x},{w_y},{w_w}) "
+            f"Slot {slot_num} (eff {effective_slot}/{total_slots}): r2=({r2_x},{r2_top}) "
+            f"w=({w_x},{w_y},{w_w}) row_h={SERVER_ROW_H} "
             f"already_expanded={already_expanded} expand=({expand_x},{expand_y}) "
-            f"server_y={server_y} connect_x={connect_x} "
-            f"cal=(right={calibration.connect_offset_from_right},"
-            f"hdr={calibration.header_height},row={calibration.row_height})",
+            f"server_y={server_y}",
             step="06", slot=slot_num,
         )
 
-        # ── Phase 4: ensure expanded (single AX signal) → hover → click Connect ──────
+        # ── Phase 4: ensure expanded → click three-dot button ───────────────────────────
 
-        # Raise ProtonVPN so it receives hover events.
         subprocess.run(
             ["osascript", "-e",
              'tell application "System Events" to set frontmost of process "ProtonVPN" to true'],
             timeout=4, check=False,
         )
         time.sleep(0.3)
-        # Seed the cursor inside the window's safe zone (above the server rows,
-        # below any nav bar) with a MOVE — not a click — so ProtonVPN starts
-        # tracking the cursor without risking activating a nav button.
-        # w_y + 12 (the old "title bar click") can land inside ProtonVPN's
-        # Mac Catalyst nav bar when the window is near the top of the screen
-        # (w_y ≈ 41 on mac8), which dismisses the search view.  A mouse-moved
-        # event to a neutral area is enough to prime hover-event delivery.
         _mouse(Quartz.kCGEventMouseMoved, w_x + w_w // 2, expand_y - 30)
         time.sleep(0.2)
 
-        # Expansion is driven by ONE authoritative signal: the AX row-2/row-3
-        # spacing already computed in phase 3 (`already_expanded`), which is the
-        # same flag that drives the `server_y` geometry above.
-        #
-        # The old code split this decision in two — the AX flag drove the
-        # geometry while an independent pixel-brightness check drove whether to
-        # click expand — and the two could disagree (a highlighted row reads as
-        # "expanded" via brightness while AX reads "collapsed"). When they split,
-        # the geometry assumed one layout while the list was in the other, so the
-        # Connect click landed on empty space and no tunnel ever came up. Geometry
-        # and the expand decision now use the same flag, and the expand click is
-        # verified via AX (and retried) instead of being a blind toggle that could
-        # re-collapse an already-open list.
-        # The expand click is a TOGGLE, so it must fire exactly once and only when
-        # the list is closed — clicking an already-open list re-collapses it, and
-        # clicking twice (e.g. a "verify then retry" loop) toggles it shut again.
-        # We also can't re-read state to confirm: once the country expands to 6000+
-        # rows, `position of row N` is no longer coercible via AX, so any post-expand
-        # AX check returns garbage. So we trust the single authoritative phase-3
-        # signal and click at most once.
+        # Expansion uses a single authoritative signal from Phase 3 (EXP flag).
+        # Click expand at most once — it's a toggle, and the geometry is tied to
+        # the same flag, so a double-click would re-collapse and misplace the click.
         if already_expanded:
-            # Row 2 is the first server — the list is already open. Leave it alone.
-            self.logger.log("Server list already expanded (AX) — skipping expand click", step="06")
+            self.logger.log("State list already expanded (AX) — skipping expand click", step="06")
         else:
-            # Row 2 is the US country header — the list is closed. Expand it once.
-            self.logger.log("Server list collapsed (AX) — clicking expand once", step="06")
+            self.logger.log("State list collapsed (AX) — clicking expand once", step="06")
             _mouse(Quartz.kCGEventLeftMouseDown, expand_x, expand_y)
             _mouse(Quartz.kCGEventLeftMouseUp,   expand_x, expand_y)
-            time.sleep(1.2)  # extra headroom for slow machines / animation lag
+            time.sleep(1.2)
 
-        # Bring the target server into view by setting the AX scroll-bar value.
-        # ProtonVPN's Mac Catalyst list IGNORES synthetic pixel scroll-wheel events
-        # (verified live: the rows never move, so the Connect click lands on the
-        # pinned header / empty space and nothing connects — the "stuck after the
-        # first ~5 servers" symptom). Setting `value of scroll bar 1` DOES work and is
-        # precise (verified live: 0.25 → mid-list). The "United States" header stays
-        # pinned at the top while servers scroll beneath it, so once we scroll slot N
-        # to the top of the server area we hover the FIRST visible server row (the
-        # slot-1 position) — which is now slot N.
-        total_slots = len(
-            self.state.data.get("discovered_servers_by_location", {}).get(location, [])
-        ) or slot_num
-        # Position needed once slot_num is past the first visible page. The first
-        # visible server sits at the slot-1 row position; rows below it are visible up
-        # to the window bottom.
+        # Bring the target state into view by setting the AX scroll-bar value.
+        # ProtonVPN's Mac Catalyst list ignores synthetic scroll-wheel events;
+        # setting `value of scroll bar 1` is the only reliable way to scroll.
+        # After scrolling, effective_slot is at the first visible row position.
         first_server_y = (
             r2_top + SERVER_ROW_H // 2 if already_expanded
-            else r2_top + US_HEADER_H + SERVER_ROW_H // 2
+            else r2_top + SERVER_ROW_H + SERVER_ROW_H // 2
         )
         visible_rows = max(1, (w_y + w_h - first_server_y) // SERVER_ROW_H) if w_h > 0 else 12
-        if slot_num > visible_rows and total_slots > 1:
-            # Fraction of the list scroll range that puts slot_num at the top of the
-            # server area (scroll-bar value is linear in row index).
-            frac = min(1.0, max(0.0, (slot_num - 1) / float(total_slots)))
+        if effective_slot > visible_rows and total_slots > 1:
+            frac = min(1.0, max(0.0, (effective_slot - 1) / float(total_slots)))
             self.logger.log(
-                f"Slot {slot_num}: scrolling list via scroll bar to {frac:.5f} "
-                f"(of {total_slots} servers), then hovering first visible row",
+                f"Slot {slot_num} (eff {effective_slot}): scrolling to {frac:.5f} "
+                f"({total_slots} states)",
                 step="06", slot=slot_num,
             )
             set_scroll = f"""
@@ -1539,7 +1529,7 @@ class VPNController:
                     if exists process (candidate as text) then
                         tell process (candidate as text)
                             try
-                                set value of scroll bar 1 of scroll area 1 of window 1 to {frac:.6f}
+                                set value of scroll bar 1 of scroll area 1 of group 1 of window 1 to {frac:.6f}
                             end try
                         end tell
                         exit repeat
@@ -1550,30 +1540,23 @@ class VPNController:
             run_osascript(set_scroll, timeout=10,
                           label=f"scroll to slot {slot_num} (frac {frac:.4f})")
             time.sleep(0.6)
-            # slot_num is now the first visible server — hover that fixed row position.
+            # effective_slot is now the first visible state
             server_y = first_server_y
 
-        # Hover the target server row so its Connect button renders, then click it.
-        # Warp the REAL cursor (not just synthetic moves): enter the row from just
-        # above it (forces a fresh mouseEntered on the tracking area), settle on the
-        # row, slide right to the Connect button, dwell so it finishes painting,
-        # then click.  This is what makes the button actually appear on machines
-        # where plain synthetic moves don't trigger Catalyst hover tracking.
-        hover_x = w_x + w_w // 2
-        _warp(hover_x, server_y - SERVER_ROW_H)   # approach from above the row
-        time.sleep(0.15)
-        _warp(hover_x, server_y)                  # settle on the row center
-        time.sleep(0.35)
-        for x in range(hover_x + 20, connect_x, 20):
-            _warp(x, server_y)                    # slide toward the Connect button
-        _warp(connect_x, server_y)
-        time.sleep(0.5)                           # let the button finish rendering
-        # Re-couple cursor + mouse so the click registers at the warped position.
+        # New Mac: the three-dot (⋯) button is always visible — no hover dance needed.
+        # The state-name button is 255px wide; three-dot spans the full 303px row
+        # width. Clicking 60px from the window's right edge lands in the zone
+        # exclusive to the three-dot button (past the state-name portion).
+        three_dot_x = w_x + w_w - 60
         Quartz.CGAssociateMouseAndMouseCursorPosition(True)
-
-        _mouse(Quartz.kCGEventLeftMouseDown, connect_x, server_y)
+        _mouse(Quartz.kCGEventLeftMouseDown, three_dot_x, server_y)
         time.sleep(0.1)
-        _mouse(Quartz.kCGEventLeftMouseUp,   connect_x, server_y)
+        _mouse(Quartz.kCGEventLeftMouseUp, three_dot_x, server_y)
+        self.logger.log(
+            f"Slot {slot_num} (eff {effective_slot}): clicked three-dot at "
+            f"({three_dot_x},{server_y})",
+            step="06", slot=slot_num,
+        )
 
         # ProtonVPN UI: clicking the ⋯ button opens a per-state IP popup.
         # Down selects the first IP in the list; Enter connects to it.
