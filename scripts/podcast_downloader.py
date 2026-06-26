@@ -984,8 +984,11 @@ class VPNController:
                     end if
                     if (class of c as text) is "button" and headerY = 0 then
                         try
-                            set cpos to position of c
-                            set headerY to (item 2 of cpos) as integer
+                            set csz to size of c
+                            if (item 1 of csz) > 100 then
+                                set cpos to position of c
+                                set headerY to (item 2 of cpos) as integer
+                            end if
                         end try
                     end if
                 end repeat
@@ -1043,10 +1046,11 @@ class VPNController:
         )
         time.sleep(0.2)
 
-        # ProtonVPN auto-expands the country row after searching — no expand click needed.
-        self.logger.log(
-            f"Discovery: p3 expanded={is_expanded_p3}", step="06",
-        )
+        self.logger.log(f"Discovery: p3 expanded={is_expanded_p3}", step="06")
+        if not is_expanded_p3:
+            _dmouse(Quartz.kCGEventLeftMouseDown, expand_x, expand_y)
+            _dmouse(Quartz.kCGEventLeftMouseUp,   expand_x, expand_y)
+            time.sleep(1.5)
 
         # ── Count server rows ─────────────────────────────────────────────────
         # Primary: AX row count (fast on the *filtered* table, ~50-100 rows max).
@@ -1367,10 +1371,15 @@ class VPNController:
                     if cdd is "list" then
                         set stateList to c
                     end if
+                    -- Use first WIDE button (w>100) as the US row expand button.
+                    -- Narrow buttons (e.g. info icon w=16) are skipped.
                     if (class of c as text) is "button" and headerY = 0 then
                         try
-                            set cpos to position of c
-                            set headerY to (item 2 of cpos) as integer
+                            set csz to size of c
+                            if (item 1 of csz) > 100 then
+                                set cpos to position of c
+                                set headerY to (item 2 of cpos) as integer
+                            end if
                         end try
                     end if
                 end repeat
@@ -1381,8 +1390,8 @@ class VPNController:
                 set wW to (item 1 of wSz) as integer
                 set wH to (item 2 of wSz) as integer
                 if stateList is missing value then
-                    -- US states not expanded yet; return header y for expansion click
-                    return "R2:0," & headerY & "|W:" & wX & "," & wY & "," & wW & "," & wH & "|EXP:0|RH:44|SC:1"
+                    -- US collapsed; return header y for expand click. SC:0 = unknown count.
+                    return "R2:0," & headerY & "|W:" & wX & "," & wY & "," & wW & "," & wH & "|EXP:0|RH:44|SC:0"
                 end if
                 if not (exists UI element 1 of stateList) then return "ERROR:empty_state_list"
                 set firstElem to UI element 1 of stateList
@@ -1492,11 +1501,14 @@ class VPNController:
         _mouse(Quartz.kCGEventMouseMoved, w_x + w_w // 2, expand_y - 30)
         time.sleep(0.2)
 
-        # ProtonVPN auto-expands the country row after searching — no expand click needed.
-        self.logger.log(
-            f"State list already_expanded={already_expanded} (auto-expand after search)",
-            step="06",
-        )
+        # If the state list isn't visible yet, click the expand arrow on the US row.
+        if already_expanded:
+            self.logger.log("State list already expanded (AX) — skipping expand click", step="06")
+        else:
+            self.logger.log("State list collapsed (AX) — clicking expand arrow", step="06")
+            _mouse(Quartz.kCGEventLeftMouseDown, expand_x, expand_y)
+            _mouse(Quartz.kCGEventLeftMouseUp,   expand_x, expand_y)
+            time.sleep(1.5)  # wait for expansion animation
 
         # Bring the target state into view by setting the AX scroll-bar value.
         # ProtonVPN's Mac Catalyst list ignores synthetic scroll-wheel events;
