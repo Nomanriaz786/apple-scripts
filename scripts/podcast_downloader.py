@@ -79,9 +79,10 @@ class VPNCalibration:
     (the window's right edge and the US country-header row position `r2_top`), so
     they stay correct even when the window is moved between runs.
     """
-    connect_offset_from_right: int = 38   # window_right_edge - Connect_button_x
+    connect_offset_from_right: int = 38   # window_right_edge - IP_click_x (in popup)
     header_height: int = 48               # US country-header row height
     row_height: int = 48                  # individual server row height
+    ip_y_delta: int = 0                   # y offset from server row centre to IP in popup
 
 
 @dataclass(frozen=True)
@@ -137,6 +138,7 @@ def _parse_vpn(raw_vpn: Any) -> VPNConfig:
                                                   defaults.connect_offset_from_right)),
         header_height=int(cal_raw.get("header_height", defaults.header_height)),
         row_height=int(cal_raw.get("row_height", defaults.row_height)),
+        ip_y_delta=int(cal_raw.get("ip_y_delta", defaults.ip_y_delta)),
     )
 
     return VPNConfig(
@@ -931,25 +933,45 @@ class VPNController:
             self.logger.log(f"Discovery p1 bad data: {p1!r} — using 5 slots", step="06")
             return _fallback()
 
-        # ── Phase 2: paste search filter ──────────────────────────────────────
+        # ── Phase 2: type the search filter character by character ────────────────────
         sf_cx, sf_cy = sf_x + sf_w // 2, sf_y + sf_h // 2
-        old_clip = subprocess.run(["pbpaste"], capture_output=True).stdout
-        try:
-            subprocess.run(["pbcopy"], input=location.encode(), check=True)
-            _dmouse(Quartz.kCGEventLeftMouseDown, sf_cx, sf_cy)
-            _dmouse(Quartz.kCGEventLeftMouseUp,   sf_cx, sf_cy)
-            time.sleep(0.4)
-            _dkey(0x00, True,  Quartz.kCGEventFlagMaskCommand)   # Cmd+A
-            _dkey(0x00, False, Quartz.kCGEventFlagMaskCommand)
-            time.sleep(0.1)
-            _dkey(0x33, True); _dkey(0x33, False)                # Backspace
-            time.sleep(0.5)
-            _dkey(0x09, True,  Quartz.kCGEventFlagMaskCommand)   # Cmd+V
-            _dkey(0x09, False, Quartz.kCGEventFlagMaskCommand)
-            time.sleep(2.5)  # wait for ProtonVPN to filter + auto-expand the country row
-            self.logger.log(f"Discovery: search filter pasted '{location}'", step="06")
-        finally:
-            subprocess.run(["pbcopy"], input=old_clip, check=False)
+        _dmouse(Quartz.kCGEventLeftMouseDown, sf_cx, sf_cy)
+        _dmouse(Quartz.kCGEventLeftMouseUp,   sf_cx, sf_cy)
+        time.sleep(0.4)
+        _dkey(0x00, True,  Quartz.kCGEventFlagMaskCommand)   # Cmd+A
+        _dkey(0x00, False, Quartz.kCGEventFlagMaskCommand)
+        time.sleep(0.1)
+        _dkey(0x33, True); _dkey(0x33, False)                # Delete
+        time.sleep(0.3)
+        _dvk = {
+            'a': 0x00, 's': 0x01, 'd': 0x02, 'f': 0x03, 'h': 0x04,
+            'g': 0x05, 'z': 0x06, 'x': 0x07, 'c': 0x08, 'v': 0x09,
+            'b': 0x0B, 'q': 0x0C, 'w': 0x0D, 'e': 0x0E, 'r': 0x0F,
+            'y': 0x10, 't': 0x11, 'u': 0x20, 'i': 0x22, 'o': 0x1F,
+            'p': 0x23, 'l': 0x25, 'j': 0x26, 'k': 0x28, 'n': 0x2D,
+            'm': 0x2E, ' ': 0x31,
+        }
+        unmapped_d = [c for c in location if c.lower() not in _dvk]
+        if not unmapped_d:
+            for char in location:
+                lc = char.lower()
+                flags = Quartz.kCGEventFlagMaskShift if char != lc else 0
+                _dkey(_dvk[lc], True,  flags)
+                _dkey(_dvk[lc], False, 0)
+            self.logger.log(f"Discovery: search filter typed '{location}'", step="06")
+        else:
+            old_clip = subprocess.run(["pbpaste"], capture_output=True).stdout
+            try:
+                subprocess.run(["pbcopy"], input=location.encode(), check=True)
+                _dkey(0x09, True,  Quartz.kCGEventFlagMaskCommand)   # Cmd+V
+                _dkey(0x09, False, Quartz.kCGEventFlagMaskCommand)
+                self.logger.log(
+                    f"Discovery: search filter pasted (unmapped {unmapped_d}): '{location}'",
+                    step="06",
+                )
+            finally:
+                subprocess.run(["pbcopy"], input=old_clip, check=False)
+        time.sleep(2.5)  # wait for ProtonVPN to filter + auto-expand the country row
 
         # ── Phase 3: scroll to top, get first-state position ─────────────────
         p3_script = f"""
@@ -1310,41 +1332,57 @@ class VPNController:
             self.logger.log(f"Bad phase1 data: {p1!r}", step="06")
             return "bad_anchor_data"
 
-        # ── Phase 2: Quartz clipboard-paste to filter the server list ─────────────────
-        # AppleScript keystroke and Quartz Unicode-string injection are both silently
-        # ignored by ProtonVPN's Mac Catalyst text field.  Cmd+V paste IS accepted and
-        # also triggers the incremental search filter (rows collapse from ~181 → 2).
+        # ── Phase 2: type the search filter character by character ────────────────────
+        # Typing via real VK-code key events (same mechanism as the working Cmd+A and
+        # Delete above) mirrors actual keyboard input and reliably triggers ProtonVPN's
+        # incremental search filter via UITextField's insertText: / editingChanged path.
+        # Clipboard paste (Cmd+V) is kept only as a fallback for unmappable characters.
         sf_cx = sf_x + sf_w // 2
         sf_cy = sf_y + sf_h // 2
 
-        # Save clipboard so we can restore it afterwards.
-        old_clip = subprocess.run(["pbpaste"], capture_output=True).stdout
+        # Click search field to focus it.
+        _mouse(Quartz.kCGEventLeftMouseDown, sf_cx, sf_cy)
+        _mouse(Quartz.kCGEventLeftMouseUp,   sf_cx, sf_cy)
+        time.sleep(0.4)
 
-        try:
-            subprocess.run(["pbcopy"], input=location.encode(), check=True)
+        # Cmd+A + Delete to clear existing content.
+        _key(0x00, True,  Quartz.kCGEventFlagMaskCommand)   # Cmd+A
+        _key(0x00, False, Quartz.kCGEventFlagMaskCommand)
+        time.sleep(0.1)
+        _key(0x33, True); _key(0x33, False)                 # Delete
+        time.sleep(0.3)
 
-            # Click search field to focus it.
-            _mouse(Quartz.kCGEventLeftMouseDown, sf_cx, sf_cy)
-            _mouse(Quartz.kCGEventLeftMouseUp, sf_cx, sf_cy)
-            time.sleep(0.4)
+        # macOS US-layout virtual key codes for a–z and space.
+        _vk = {
+            'a': 0x00, 's': 0x01, 'd': 0x02, 'f': 0x03, 'h': 0x04,
+            'g': 0x05, 'z': 0x06, 'x': 0x07, 'c': 0x08, 'v': 0x09,
+            'b': 0x0B, 'q': 0x0C, 'w': 0x0D, 'e': 0x0E, 'r': 0x0F,
+            'y': 0x10, 't': 0x11, 'u': 0x20, 'i': 0x22, 'o': 0x1F,
+            'p': 0x23, 'l': 0x25, 'j': 0x26, 'k': 0x28, 'n': 0x2D,
+            'm': 0x2E, ' ': 0x31,
+        }
+        unmapped = [c for c in location if c.lower() not in _vk]
+        if not unmapped:
+            for char in location:
+                lc = char.lower()
+                flags = Quartz.kCGEventFlagMaskShift if char != lc else 0
+                _key(_vk[lc], True,  flags)
+                _key(_vk[lc], False, 0)
+            self.logger.log(f"Search filter typed: '{location}'", step="06")
+        else:
+            # Fallback: clipboard paste for locations with characters outside the VK map.
+            old_clip = subprocess.run(["pbpaste"], capture_output=True).stdout
+            try:
+                subprocess.run(["pbcopy"], input=location.encode(), check=True)
+                _key(0x09, True,  Quartz.kCGEventFlagMaskCommand)   # Cmd+V
+                _key(0x09, False, Quartz.kCGEventFlagMaskCommand)
+                self.logger.log(
+                    f"Search filter pasted (unmapped chars {unmapped}): '{location}'", step="06",
+                )
+            finally:
+                subprocess.run(["pbcopy"], input=old_clip, check=False)
 
-            # Cmd+A to select all existing text, then Delete to clear.
-            _key(0x00, True,  Quartz.kCGEventFlagMaskCommand)   # Cmd+A down
-            _key(0x00, False, Quartz.kCGEventFlagMaskCommand)   # Cmd+A up
-            time.sleep(0.1)
-            _key(0x33, True)   # Backspace down
-            _key(0x33, False)  # Backspace up
-            time.sleep(0.5)
-
-            # Cmd+V to paste the location string.
-            _key(0x09, True,  Quartz.kCGEventFlagMaskCommand)   # Cmd+V down
-            _key(0x09, False, Quartz.kCGEventFlagMaskCommand)   # Cmd+V up
-            time.sleep(2.5)  # wait for ProtonVPN to filter + auto-expand the country row
-
-            self.logger.log(f"Search filter pasted: '{location}'", step="06")
-        finally:
-            # Restore original clipboard.
-            subprocess.run(["pbcopy"], input=old_clip, check=False)
+        time.sleep(2.5)  # wait for ProtonVPN to filter + auto-expand the country row
 
         # ── Phase 3: scroll to top, read state-list position ────────────────────────────
         # New Mac AX structure: scroll area is inside group 1 (not a direct window child).
@@ -1513,7 +1551,11 @@ class VPNController:
             step="06", slot=slot_num,
         )
 
-        # ── Phase 4: ensure expanded → click three-dot button ───────────────────────────
+        # ── Phase 4: AX-press expand state1 → server three-dot → IP click ─────────────────
+        # Quartz mouse clicks on the ProtonVPN list exit search mode and show all 147
+        # countries — putting Afghanistan at y≈551 instead of the US server.
+        # Fix: use AppleScript AXPress to expand state1 (no mouse event → filter stays),
+        # read server y via AX, then click server three-dot + calibrated IP position.
 
         subprocess.run(
             ["osascript", "-e",
@@ -1521,75 +1563,124 @@ class VPNController:
             timeout=4, check=False,
         )
         time.sleep(0.3)
-        _mouse(Quartz.kCGEventMouseMoved, w_x + w_w // 2, expand_y - 30)
-        time.sleep(0.2)
 
-        # If the state list isn't visible yet, click the expand arrow on the US row.
-        if already_expanded:
-            self.logger.log("State list already expanded (AX) — skipping expand click", step="06")
-        else:
-            self.logger.log("State list collapsed (AX) — clicking expand arrow", step="06")
-            _mouse(Quartz.kCGEventLeftMouseDown, expand_x, expand_y)
-            _mouse(Quartz.kCGEventLeftMouseUp,   expand_x, expand_y)
-            time.sleep(1.5)  # wait for expansion animation
-
-        # Bring the target state into view by setting the AX scroll-bar value.
-        # ProtonVPN's Mac Catalyst list ignores synthetic scroll-wheel events;
-        # setting `value of scroll bar 1` is the only reliable way to scroll.
-        # After scrolling, effective_slot is at the first visible row position.
-        first_server_y = (
-            r2_top + SERVER_ROW_H // 2 if already_expanded
-            else r2_top + SERVER_ROW_H + SERVER_ROW_H // 2
-        )
-        visible_rows = max(1, (w_y + w_h - first_server_y) // SERVER_ROW_H) if w_h > 0 else 12
-        if effective_slot > visible_rows and total_slots > 1:
-            frac = min(1.0, max(0.0, (effective_slot - 1) / float(total_slots)))
-            self.logger.log(
-                f"Slot {slot_num} (eff {effective_slot}): scrolling to {frac:.5f} "
-                f"({total_slots} states)",
-                step="06", slot=slot_num,
-            )
-            set_scroll = f"""
-            tell application "System Events"
-                repeat with candidate in {{{process_list}}}
-                    if exists process (candidate as text) then
-                        tell process (candidate as text)
-                            try
-                                set value of scroll bar 1 of scroll area 1 of group 1 of window 1 to {frac:.6f}
-                            end try
-                        end tell
-                        exit repeat
-                    end if
-                end repeat
+        # Step A: AX-press the narrow (expand/name) button of state1.
+        # Both state buttons share the same top-y; the narrow one (w≤255) is the toggle.
+        ax_expand_script = f"""tell application "System Events"
+            set procName to ""
+            repeat with candidate in {{{process_list}}}
+                if exists process (candidate as text) then
+                    set procName to candidate as text
+                    exit repeat
+                end if
+            end repeat
+            if procName is "" then return "ERROR:no_proc"
+            tell process procName
+                if not (exists scroll area 1 of group 1 of window 1) then return "ERROR:no_sc"
+                set sc to scroll area 1 of group 1 of window 1
+                set outerList to UI element 1 of sc
+                set cnt to count UI elements of outerList
+                if cnt < 2 then return "ERROR:cnt=" & cnt
+                -- elem 1 = wide three-dot button, elem 2 = narrow expand/name button.
+                -- Try elem 2 (expand toggle) first; fall back to elem 1.
+                set pressedElems to ""
+                try
+                    perform action "AXPress" of (UI element 2 of outerList)
+                    set pressedElems to "2"
+                end try
+                delay 0.6
+                set didExpand to false
+                try
+                    set e3dd to description of (UI element 3 of outerList) as text
+                    if e3dd is "list" then set didExpand to true
+                end try
+                if not didExpand then
+                    try
+                        perform action "AXPress" of (UI element 1 of outerList)
+                        set pressedElems to pressedElems & "+1"
+                    end try
+                    delay 0.6
+                    try
+                        set e3dd to description of (UI element 3 of outerList) as text
+                        if e3dd is "list" then set didExpand to true
+                    end try
+                end if
+                if didExpand then
+                    return "expanded:pressed=" & pressedElems
+                else
+                    return "notexpanded:pressed=" & pressedElems
+                end if
             end tell
-            """
-            run_osascript(set_scroll, timeout=10,
-                          label=f"scroll to slot {slot_num} (frac {frac:.4f})")
-            time.sleep(0.6)
-            # effective_slot is now the first visible state
-            server_y = first_server_y
+        end tell"""
+        ax_r = subprocess.run(["osascript", "-e", ax_expand_script],
+                               capture_output=True, text=True, timeout=8)
+        ax_log = ax_r.stdout.strip() or ax_r.stderr.strip()
+        self.logger.log(f"Slot {slot_num}: AX expand → {ax_log}", step="06")
+        time.sleep(1.5)
 
-        # New Mac: the three-dot (⋯) button is always visible — no hover dance needed.
-        # The state-name button is 255px wide; three-dot spans the full 303px row
-        # width. Clicking 60px from the window's right edge lands in the zone
-        # exclusive to the three-dot button (past the state-name portion).
+        # Step B: read the first server row y after expansion via AX.
+        ax_srv_script = f"""tell application "System Events"
+            set procName to ""
+            repeat with candidate in {{{process_list}}}
+                if exists process (candidate as text) then
+                    set procName to candidate as text
+                    exit repeat
+                end if
+            end repeat
+            tell process procName
+                if not (exists scroll area 1 of group 1 of window 1) then return "0:no_sc"
+                set sc to scroll area 1 of group 1 of window 1
+                set outerList to UI element 1 of sc
+                if (count UI elements of outerList) < 3 then return "0:short"
+                set e3 to UI element 3 of outerList
+                set e3dd to ""
+                try
+                    set e3dd to description of e3 as text
+                end try
+                if e3dd is "list" then
+                    return (item 2 of (position of (UI element 1 of e3))) as integer
+                end if
+                return "0:e3dd=" & e3dd
+            end tell
+        end tell"""
+        srv_r = subprocess.run(["osascript", "-e", ax_srv_script],
+                                capture_output=True, text=True, timeout=8)
+        srv_log = srv_r.stdout.strip()
+        try:
+            re_srv_y = int(srv_log.split(":")[0])
+        except (ValueError, AttributeError, IndexError):
+            re_srv_y = 0
+        self.logger.log(f"Slot {slot_num}: AX srv_y={re_srv_y} ({srv_log})", step="06")
+
+        if re_srv_y > 0:
+            server_y = re_srv_y + SERVER_ROW_H // 2
+        else:
+            # Fallback: first server is one row below state1 center
+            server_y = r2_top + SERVER_ROW_H + SERVER_ROW_H // 2
+
+        # Step C: click three-dot on the server row (60 px from right = three-dot zone).
         three_dot_x = w_x + w_w - 60
         Quartz.CGAssociateMouseAndMouseCursorPosition(True)
+        _mouse(Quartz.kCGEventMouseMoved, three_dot_x, server_y - 30)
+        time.sleep(0.1)
         _mouse(Quartz.kCGEventLeftMouseDown, three_dot_x, server_y)
         time.sleep(0.1)
-        _mouse(Quartz.kCGEventLeftMouseUp, three_dot_x, server_y)
+        _mouse(Quartz.kCGEventLeftMouseUp,   three_dot_x, server_y)
         self.logger.log(
-            f"Slot {slot_num} (eff {effective_slot}): clicked three-dot at "
-            f"({three_dot_x},{server_y})",
-            step="06", slot=slot_num,
+            f"Slot {slot_num}: three-dot at ({three_dot_x},{server_y})", step="06", slot=slot_num,
         )
+        time.sleep(0.8)  # wait for IP popup
 
-        # ProtonVPN UI: clicking the ⋯ button opens a per-state IP popup.
-        # Down selects the first IP in the list; Enter connects to it.
-        time.sleep(0.8)
-        _key(0x7D, True); _key(0x7D, False)   # Down → first IP
-        time.sleep(0.35)
-        _key(0x24, True); _key(0x24, False)   # Enter → connect
+        # Step D: click the first IP in the popup (appears to the LEFT of ProtonVPN window).
+        # connect_x  = w_x + w_w - connect_offset_from_right  (calibrated)
+        # ip_y_delta = signed offset from server_y to IP entry y in popup (calibrated)
+        ip_y = server_y + calibration.ip_y_delta
+        _mouse(Quartz.kCGEventLeftMouseDown, connect_x, ip_y)
+        time.sleep(0.1)
+        _mouse(Quartz.kCGEventLeftMouseUp,   connect_x, ip_y)
+        self.logger.log(
+            f"Slot {slot_num}: clicked IP at ({connect_x},{ip_y})", step="06", slot=slot_num,
+        )
         time.sleep(0.5)
         return "connect_button_clicked"
 
