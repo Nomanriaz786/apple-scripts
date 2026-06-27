@@ -1,15 +1,15 @@
 {
-  "repeat": 1,
+  "repeat": 5,
   "vpn": {
     "enabled": true,
     "app": "ProtonVPN",
     "location": "United States",
     "require_provider_in_org": false,
+    "state_count": 20,
     "calibration": {
-      "connect_offset_from_right": 437,
+      "state_connect_offset_from_right": 110,
       "header_height": 64,
-      "row_height": 28,
-      "ip_y_delta": -85
+      "row_height": 28
     }
   },
   "tabs": [
@@ -17,11 +17,16 @@
       "tab": 1,
       "videos": [
         1,
-        2,
-        4,
+        5,
+        20
+      ]
+    },
+    {
+      "tab": 2,
+      "videos": [
+        1,
         7,
-        18,
-        21
+        10
       ]
     }
   ],

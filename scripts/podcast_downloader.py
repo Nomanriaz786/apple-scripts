@@ -79,10 +79,9 @@ class VPNCalibration:
     (the window's right edge and the US country-header row position `r2_top`), so
     they stay correct even when the window is moved between runs.
     """
-    connect_offset_from_right: int = 38   # window_right_edge - IP_click_x (in popup)
-    header_height: int = 48               # US country-header row height
-    row_height: int = 48                  # individual server row height
-    ip_y_delta: int = 0                   # y offset from server row centre to IP in popup
+    state_connect_offset_from_right: int = 110  # window_right_edge - Connect_btn_x on state row
+    header_height: int = 48                     # US country-header row height
+    row_height: int = 48                        # individual state/server row height
 
 
 @dataclass(frozen=True)
@@ -95,6 +94,7 @@ class VPNConfig:
     require_provider_in_org: bool = True
     verify_timeout: int = DEFAULT_VERIFY_TIMEOUT_SEC
     calibration: VPNCalibration = field(default_factory=VPNCalibration)
+    state_count: int = 0  # 0 = auto-discover; >0 overrides AX discovery count
 
 
 @dataclass(frozen=True)
@@ -134,11 +134,10 @@ def _parse_vpn(raw_vpn: Any) -> VPNConfig:
         raise ValueError("'vpn.calibration' must be an object (see scripts/calibrate.py)")
     defaults = VPNCalibration()
     calibration = VPNCalibration(
-        connect_offset_from_right=int(cal_raw.get("connect_offset_from_right",
-                                                  defaults.connect_offset_from_right)),
+        state_connect_offset_from_right=int(cal_raw.get(
+            "state_connect_offset_from_right", defaults.state_connect_offset_from_right)),
         header_height=int(cal_raw.get("header_height", defaults.header_height)),
         row_height=int(cal_raw.get("row_height", defaults.row_height)),
-        ip_y_delta=int(cal_raw.get("ip_y_delta", defaults.ip_y_delta)),
     )
 
     return VPNConfig(
@@ -150,6 +149,7 @@ def _parse_vpn(raw_vpn: Any) -> VPNConfig:
         require_provider_in_org=require,
         verify_timeout=int(raw_vpn.get("verify_timeout", DEFAULT_VERIFY_TIMEOUT_SEC)),
         calibration=calibration,
+        state_count=int(raw_vpn.get("state_count", 0)),
     )
 
 
@@ -656,6 +656,20 @@ class VPNController:
                     step="06", location=vpn_cfg.location, server_count=len(servers),
                 )
 
+        # If the user specified a fixed state count, regenerate the slot list with
+        # that count — overrides whatever AX discovery returned (AX lazy-renders only
+        # the visible rows, so it systematically undercounts scrollable lists).
+        if vpn_cfg.state_count > 0 and len(servers) != vpn_cfg.state_count:
+            lc = vpn_cfg.location_code.upper()
+            servers = [f"{lc}-SLOT-{i + 1}" for i in range(vpn_cfg.state_count)]
+            discovered = self.state.data.setdefault("discovered_servers_by_location", {})
+            discovered[vpn_cfg.location] = servers
+            self.state.save()
+            self.logger.log(
+                f"state_count override: {vpn_cfg.state_count} slots for {vpn_cfg.location}",
+                step="06", location=vpn_cfg.location, state_count=vpn_cfg.state_count,
+            )
+
         # Ensure app is open.
         if not self._open_provider_app(vpn_cfg.app):
             raise AutomationError(f"{vpn_cfg.app} app not found.")
@@ -721,6 +735,9 @@ class VPNController:
         last_exc: AutomationError | None = None
         slot_baseline_ip = baseline_ip  # refreshed per attempt
         slot_baseline_route = baseline_route  # refreshed per attempt
+        # Capture the VPN IP used in the previous *successful* cycle so we can skip states
+        # that are in the same server cluster (same IP) and advance to a fresh one.
+        prev_vpn_ip = self.state.data.get("last_vpn_ip")
 
         for attempt_i, target_server in enumerate(servers_to_try):
             if attempt_i > 0:
@@ -775,16 +792,38 @@ class VPNController:
                     baseline_route=slot_baseline_route,
                 )
                 if result == "connected_verified":
-                    self._record_server(target_server)
-                    # Record full verified session (slot name, not assumed real server name)
                     snap = self.net.snapshot()
+                    new_ip = snap.get("public_ip")
+                    # Skip this state if it landed on the same IP as the previous successful
+                    # cycle — that means it's in the same server cluster.  Disconnect and
+                    # advance to the next state rather than deliver a repeat address.
+                    if (new_ip and prev_vpn_ip
+                            and new_ip == prev_vpn_ip
+                            and prev_vpn_ip != baseline_ip):
+                        self.logger.log(
+                            f"IP {new_ip} repeats previous cycle — "
+                            f"disconnecting and skipping {target_server}",
+                            step="06", server=target_server, status="ip_repeat_skip",
+                        )
+                        self._click_disconnect(vpn_cfg.app)
+                        time.sleep(2.5)
+                        last_exc = AutomationError(
+                            f"IP {new_ip} repeated (prev={prev_vpn_ip}); "
+                            f"skipping {target_server}"
+                        )
+                        continue
+                    self._record_server(target_server)
+                    # Persist the VPN IP so the next cycle can detect repeats.
+                    if new_ip:
+                        self.state.data["last_vpn_ip"] = new_ip
+                    # Record full verified session (slot name, not assumed real server name)
                     sessions = self.state.data.setdefault("vpn_sessions", [])
                     sessions.append({
                         "cycle": cycle,
                         "slot": target_server,
                         "verified": True,
                         "utun": (snap.get("tunnel_interfaces") or [None])[0],
-                        "public_ip": snap.get("public_ip"),
+                        "public_ip": new_ip,
                         "country": snap.get("country"),
                         "verified_at": datetime.now().isoformat(),
                     })
@@ -1523,39 +1562,37 @@ class VPNController:
         # Row height comes from Phase 3 AX measurement; calibration is the fallback.
         SERVER_ROW_H = row_h_from_p3 if row_h_from_p3 > 0 else calibration.row_height
 
-        # Wrap slot_num within the actual state count so rotation always lands on
-        # a real state (state_count_from_p3=0 means not yet known — use slot as-is).
-        total_slots = state_count_from_p3 or len(
+        # Use discovered server count as the authoritative slot count.
+        # state_count_from_p3 is the number of visible STATE groups (e.g. New York, LA),
+        # not the number of individual servers within the expanded state — using it would
+        # cause incorrect wrapping (e.g. 2 states → every slot > 2 wraps back to 1/2).
+        cached_count = len(
             self.state.data.get("discovered_servers_by_location", {}).get(location, [])
-        ) or slot_num
+        )
+        total_slots = cached_count or state_count_from_p3 or slot_num
         effective_slot = ((slot_num - 1) % total_slots) + 1 if total_slots > 1 else slot_num
 
-        connect_x = w_x + w_w - calibration.connect_offset_from_right
-
+        # State N centre y — r2_top is the first state's y when already_expanded,
+        # or the country-header y when collapsed (states start one row_h below).
         if already_expanded:
-            # r2_top is the first state's y; US header is one row_h above it.
-            expand_y = r2_top - SERVER_ROW_H // 2
-            server_y = r2_top + (effective_slot - 1) * SERVER_ROW_H + SERVER_ROW_H // 2
+            state_y = r2_top + (effective_slot - 1) * SERVER_ROW_H + SERVER_ROW_H // 2
         else:
-            # r2_top is the US header button's y; first state is one row_h below.
-            expand_y = r2_top + SERVER_ROW_H // 2
-            server_y = r2_top + SERVER_ROW_H + (effective_slot - 1) * SERVER_ROW_H + SERVER_ROW_H // 2
+            state_y = r2_top + SERVER_ROW_H + (effective_slot - 1) * SERVER_ROW_H + SERVER_ROW_H // 2
 
-        expand_x = w_x + w_w // 2
+        # Connect button x: inside the ProtonVPN window, left of the three-dot (60 px from right).
+        state_connect_x = w_x + w_w - calibration.state_connect_offset_from_right
 
         self.logger.log(
             f"Slot {slot_num} (eff {effective_slot}/{total_slots}): r2=({r2_x},{r2_top}) "
             f"w=({w_x},{w_y},{w_w}) row_h={SERVER_ROW_H} "
-            f"already_expanded={already_expanded} expand=({expand_x},{expand_y}) "
-            f"server_y={server_y}",
+            f"already_expanded={already_expanded} state_y={state_y} connect_x={state_connect_x}",
             step="06", slot=slot_num,
         )
 
-        # ── Phase 4: AX-press expand state1 → server three-dot → IP click ─────────────────
-        # Quartz mouse clicks on the ProtonVPN list exit search mode and show all 147
-        # countries — putting Afghanistan at y≈551 instead of the US server.
-        # Fix: use AppleScript AXPress to expand state1 (no mouse event → filter stays),
-        # read server y via AX, then click server three-dot + calibrated IP position.
+        # ── Phase 4: hover state N → click its Connect button ────────────────────────────────
+        # State rows accept Quartz clicks without resetting the search filter (only clicking
+        # the search field or the scroll-area root resets it).  Hovering the row reveals the
+        # Connect button; we then click at the calibrated x position inside the window.
 
         subprocess.run(
             ["osascript", "-e",
@@ -1564,122 +1601,74 @@ class VPNController:
         )
         time.sleep(0.3)
 
-        # Step A: AX-press the narrow (expand/name) button of state1.
-        # Both state buttons share the same top-y; the narrow one (w≤255) is the toggle.
-        ax_expand_script = f"""tell application "System Events"
-            set procName to ""
-            repeat with candidate in {{{process_list}}}
-                if exists process (candidate as text) then
-                    set procName to candidate as text
-                    exit repeat
-                end if
-            end repeat
-            if procName is "" then return "ERROR:no_proc"
-            tell process procName
-                if not (exists scroll area 1 of group 1 of window 1) then return "ERROR:no_sc"
-                set sc to scroll area 1 of group 1 of window 1
-                set outerList to UI element 1 of sc
-                set cnt to count UI elements of outerList
-                if cnt < 2 then return "ERROR:cnt=" & cnt
-                -- elem 1 = wide three-dot button, elem 2 = narrow expand/name button.
-                -- Try elem 2 (expand toggle) first; fall back to elem 1.
-                set pressedElems to ""
-                try
-                    perform action "AXPress" of (UI element 2 of outerList)
-                    set pressedElems to "2"
-                end try
-                delay 0.6
-                set didExpand to false
-                try
-                    set e3dd to description of (UI element 3 of outerList) as text
-                    if e3dd is "list" then set didExpand to true
-                end try
-                if not didExpand then
-                    try
-                        perform action "AXPress" of (UI element 1 of outerList)
-                        set pressedElems to pressedElems & "+1"
-                    end try
-                    delay 0.6
-                    try
-                        set e3dd to description of (UI element 3 of outerList) as text
-                        if e3dd is "list" then set didExpand to true
-                    end try
-                end if
-                if didExpand then
-                    return "expanded:pressed=" & pressedElems
-                else
-                    return "notexpanded:pressed=" & pressedElems
-                end if
-            end tell
-        end tell"""
-        ax_r = subprocess.run(["osascript", "-e", ax_expand_script],
-                               capture_output=True, text=True, timeout=8)
-        ax_log = ax_r.stdout.strip() or ax_r.stderr.strip()
-        self.logger.log(f"Slot {slot_num}: AX expand → {ax_log}", step="06")
-        time.sleep(1.5)
-
-        # Step B: read the first server row y after expansion via AX.
-        ax_srv_script = f"""tell application "System Events"
-            set procName to ""
-            repeat with candidate in {{{process_list}}}
-                if exists process (candidate as text) then
-                    set procName to candidate as text
-                    exit repeat
-                end if
-            end repeat
-            tell process procName
-                if not (exists scroll area 1 of group 1 of window 1) then return "0:no_sc"
-                set sc to scroll area 1 of group 1 of window 1
-                set outerList to UI element 1 of sc
-                if (count UI elements of outerList) < 3 then return "0:short"
-                set e3 to UI element 3 of outerList
-                set e3dd to ""
-                try
-                    set e3dd to description of e3 as text
-                end try
-                if e3dd is "list" then
-                    return (item 2 of (position of (UI element 1 of e3))) as integer
-                end if
-                return "0:e3dd=" & e3dd
-            end tell
-        end tell"""
-        srv_r = subprocess.run(["osascript", "-e", ax_srv_script],
-                                capture_output=True, text=True, timeout=8)
-        srv_log = srv_r.stdout.strip()
-        try:
-            re_srv_y = int(srv_log.split(":")[0])
-        except (ValueError, AttributeError, IndexError):
-            re_srv_y = 0
-        self.logger.log(f"Slot {slot_num}: AX srv_y={re_srv_y} ({srv_log})", step="06")
-
-        if re_srv_y > 0:
-            server_y = re_srv_y + SERVER_ROW_H // 2
-        else:
-            # Fallback: first server is one row below state1 center
-            server_y = r2_top + SERVER_ROW_H + SERVER_ROW_H // 2
-
-        # Step C: click three-dot on the server row (60 px from right = three-dot zone).
-        three_dot_x = w_x + w_w - 60
         Quartz.CGAssociateMouseAndMouseCursorPosition(True)
-        _mouse(Quartz.kCGEventMouseMoved, three_dot_x, server_y - 30)
-        time.sleep(0.1)
-        _mouse(Quartz.kCGEventLeftMouseDown, three_dot_x, server_y)
-        time.sleep(0.1)
-        _mouse(Quartz.kCGEventLeftMouseUp,   three_dot_x, server_y)
-        self.logger.log(
-            f"Slot {slot_num}: three-dot at ({three_dot_x},{server_y})", step="06", slot=slot_num,
-        )
-        time.sleep(0.8)  # wait for IP popup
 
-        # Step D: click the first IP in the popup (appears to the LEFT of ProtonVPN window).
-        # connect_x  = w_x + w_w - connect_offset_from_right  (calibrated)
-        # ip_y_delta = signed offset from server_y to IP entry y in popup (calibrated)
-        ip_y = server_y + calibration.ip_y_delta
-        _mouse(Quartz.kCGEventLeftMouseDown, connect_x, ip_y)
+        # If the country row is not yet expanded, expand it first so state rows are visible.
+        if not already_expanded:
+            expand_x = w_x + w_w // 2
+            expand_y = r2_top + SERVER_ROW_H // 2
+            _mouse(Quartz.kCGEventLeftMouseDown, expand_x, expand_y)
+            _mouse(Quartz.kCGEventLeftMouseUp,   expand_x, expand_y)
+            time.sleep(1.5)
+            self.logger.log(
+                f"Slot {slot_num}: expanded country at ({expand_x},{expand_y})", step="06",
+            )
+
+        # Scroll so that state N is within the visible window area.
+        # w_h comes from Phase 3 (window height); if 0, skip scroll check.
+        # ProtonVPN (Mac Catalyst) routes scroll events by actual cursor position,
+        # so we _warp the cursor into the list first, then send small scroll chunks
+        # to avoid UIKit momentum overshoot.
+        row_center_x = w_x + w_w // 2
+        if w_h > 0:
+            # Target: bring state N to the vertical centre of the visible list area.
+            list_top    = r2_top                  # y of first state row (from Phase 3)
+            list_bottom = w_y + w_h - SERVER_ROW_H
+            list_center = (list_top + list_bottom) // 2
+
+            need_scroll = 0
+            if state_y > list_bottom:
+                need_scroll = state_y - list_center   # scroll DOWN (positive → negative delta)
+            elif state_y < list_top:
+                need_scroll = state_y - list_center   # scroll UP (negative → positive delta)
+
+            if need_scroll != 0:
+                # Warp cursor over the list so ProtonVPN's scroll area receives the events.
+                list_area_y = (list_top + list_bottom) // 2
+                _warp(row_center_x, list_area_y)
+                time.sleep(0.15)
+
+                # Send in row-sized chunks so UIKit processes each increment cleanly.
+                remaining = abs(need_scroll)
+                sign = -1 if need_scroll > 0 else 1   # negative = scroll down
+                while remaining > 0:
+                    chunk = min(SERVER_ROW_H, remaining)
+                    ev = Quartz.CGEventCreateScrollWheelEvent(
+                        None, Quartz.kCGScrollEventUnitPixel, 1, sign * chunk)
+                    Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+                    time.sleep(0.06)
+                    remaining -= chunk
+                time.sleep(0.5)   # let the list settle after scrolling
+
+                state_y -= need_scroll
+                self.logger.log(
+                    f"Slot {slot_num}: scrolled {need_scroll:+d}px → state_y now {state_y}",
+                    step="06", slot=slot_num,
+                )
+
+        # Hover over state N row to reveal the Connect button.
+        _warp(row_center_x, state_y - 20)   # approach from just above
+        time.sleep(0.15)
+        _warp(row_center_x, state_y)         # settle on row centre
+        time.sleep(0.5)                       # wait for Connect button to paint
+
+        # Click the Connect button.
+        _mouse(Quartz.kCGEventLeftMouseDown, state_connect_x, state_y)
         time.sleep(0.1)
-        _mouse(Quartz.kCGEventLeftMouseUp,   connect_x, ip_y)
+        _mouse(Quartz.kCGEventLeftMouseUp,   state_connect_x, state_y)
         self.logger.log(
-            f"Slot {slot_num}: clicked IP at ({connect_x},{ip_y})", step="06", slot=slot_num,
+            f"Slot {slot_num}: Connect clicked at ({state_connect_x},{state_y})",
+            step="06", slot=slot_num,
         )
         time.sleep(0.5)
         return "connect_button_clicked"
