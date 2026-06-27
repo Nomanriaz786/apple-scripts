@@ -2242,17 +2242,27 @@ class PodcastsController:
                     win_x = x
                     break
             content_left = win_x + 180
-            # Podcasts shows an "Episodes" button to navigate to the full episode list.
-            cands = sorted(
+            # Priority 1: the real "See All" button that loads the full episode list.
+            # It lives in the content area (x > content_left) and has exact text "See All"
+            # or "View All". The macOS menu bar's "Show All" is excluded by the x filter.
+            see_all_cands = sorted(
                 ((x + w // 2, y + h // 2) for role, t, x, y, w, h in nodes
-                 if role in ("AXButton", "AXRadioButton", "AXTab", "AXCell") and w > 0
-                 and t.startswith(("Episodes", "All Episodes"))),
+                 if role in ("AXButton", "AXLink") and x > content_left and w > 0
+                 and t.strip() in ("See All", "View All", "All Episodes")),
                 key=lambda c: c[1],
             )
+            # Priority 2: "Episodes" tab/radio-button — only use when there is no
+            # dedicated "See All" (some shows render the full list behind a tab).
+            episodes_tab_cands = sorted(
+                ((x + w // 2, y + h // 2) for role, t, x, y, w, h in nodes
+                 if role in ("AXRadioButton", "AXTab", "AXButton", "AXCell") and w > 0
+                 and t.startswith(("Episodes", "All Episodes"))
+                 and not t.strip().startswith("All Episodes")),   # avoid dup with p1
+                key=lambda c: c[1],
+            )
+            cands = see_all_cands or episodes_tab_cands
             if cands:
                 before = _episode_count(nodes)
-                # Only the TOPMOST See All — that's the episodes section; carousel
-                # 'See All's sit lower and would navigate away from the show.
                 cx, cy = cands[0]
                 _click(cx, cy)
                 time.sleep(1.2)
@@ -2286,6 +2296,8 @@ class PodcastsController:
                 return false
             end try
             if t is "" then return false
+            if t is "See All" then return true
+            if t is "View All" then return true
             if t is "Episodes" then return true
             if t is "All Episodes" then return true
             if t contains "Episodes" then return true
