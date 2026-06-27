@@ -6,9 +6,10 @@
     "location": "United States",
     "require_provider_in_org": false,
     "calibration": {
-      "connect_offset_from_right": 56,
+      "connect_offset_from_right": 437,
       "header_height": 64,
-      "row_height": 28
+      "row_height": 28,
+      "ip_y_delta": -85
     }
   },
   "tabs": [
