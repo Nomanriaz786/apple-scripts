@@ -5566,8 +5566,10 @@ end tell
         self.logger.log(f"Sign In (email) button: {result}", step="SIGNIN")
         time.sleep(2.5)
 
-        # Step 4: Enter password
-        password_escaped = self._as_str(password)
+        # Step 4: Enter password — put it in the clipboard then paste into the secure field.
+        # keystroke with special characters (@, $, etc.) causes AppleScript syntax errors
+        # when the password contains characters AppleScript misinterprets; pbcopy+Cmd+V is safe.
+        subprocess.run(["pbcopy"], input=password.encode("utf-8"), check=True)
         script = """
 tell application "System Events"
     tell process "Podcasts"
@@ -5580,9 +5582,9 @@ tell application "System Events"
                             set stf to first secure text field of w
                             set focused of stf to true
                             delay 0.2
-                            keystroke "a" using command down
+                            keystroke "a" using {command down}
                             delay 0.1
-                            keystroke "__PASS__"
+                            keystroke "v" using {command down}
                             return "password_entered"
                         end if
                     end try
@@ -5592,9 +5594,9 @@ tell application "System Events"
                                 set stf to first secure text field of s
                                 set focused of stf to true
                                 delay 0.2
-                                keystroke "a" using command down
+                                keystroke "a" using {command down}
                                 delay 0.1
-                                keystroke "__PASS__"
+                                keystroke "v" using {command down}
                                 return "password_entered_in_sheet"
                             end if
                         end repeat
@@ -5606,7 +5608,7 @@ tell application "System Events"
         return "password_field_not_found"
     end tell
 end tell
-""".replace("__PASS__", password_escaped)
+"""
         result = run_osascript(script, timeout=25, label="enter_password")
         self.logger.log(f"Password entry: {result}", step="SIGNIN")
         if "not_found" in result:

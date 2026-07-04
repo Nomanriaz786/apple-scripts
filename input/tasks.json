@@ -1,5 +1,5 @@
 {
-  "repeat": 5,
+  "repeat": 1,
   "vpn": {
     "enabled": true,
     "app": "ProtonVPN",
@@ -16,21 +16,23 @@
     {
       "tab": 1,
       "videos": [
-        1,
-        5,
-        20
-      ]
-    },
-    {
-      "tab": 2,
-      "videos": [
-        1,
-        7,
-        10
+        1
       ]
     }
   ],
   "cleanup": true,
   "cleanup_mode": "remove_download",
-  "clean_start": false
+  "clean_start": false,
+  "accounts": [
+    { "email": "hyena48568@mailshan.com",     "password": "SFg67@4567fec" },
+    { "email": "alpaca1186@flyzy.net",         "password": "Ryiu1@6f472fe" },
+    { "email": "boar76714@mailshan.com",       "password": "TYuigd6@31tgf" },
+    { "email": "fish4763@drivz.net",           "password": "TYuigd65@8q2gir" },
+    { "email": "barracuda79420@mixzu.net",     "password": "TYuigd65@5rqxtc" },
+    { "email": "horse31384@flyzy.net",         "password": "Tuni@20i6gt5c" },
+    { "email": "trout11734@flyzy.net",         "password": "Tuni@3f6765zx" },
+    { "email": "cottonmouth18689@driftz.net",  "password": "Ryiu1@7890-356ex" },
+    { "email": "mole9759@mailbai.com",         "password": "SFg67@4567zfuv" },
+    { "email": "gecko37235@spinly.net",        "password": "Ryiu1@09876vg" }
+  ]
 }
