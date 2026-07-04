@@ -98,6 +98,12 @@ class VPNConfig:
 
 
 @dataclass(frozen=True)
+class AccountEntry:
+    email: str
+    password: str
+
+
+@dataclass(frozen=True)
 class Config:
     repeat: int
     vpn: VPNConfig
@@ -106,6 +112,7 @@ class Config:
     check_downloads: bool = False
     clean_start: bool = False
     cleanup_mode: str = "remove_download"  # "remove_download" | "remove_from_library"
+    accounts: tuple["AccountEntry", ...] = ()
 
 
 def _parse_vpn(raw_vpn: Any) -> VPNConfig:
@@ -203,6 +210,16 @@ def load_config(path: Path) -> Config:
             f"cleanup_mode must be 'remove_download' or 'remove_from_library', got {cleanup_mode_raw!r}"
         )
 
+    accounts: list[AccountEntry] = []
+    for i, a in enumerate(raw.get("accounts", []), start=1):
+        if not isinstance(a, dict):
+            raise ValueError(f"accounts[{i}] must be an object with 'email' and 'password'")
+        email_a = str(a.get("email", "")).strip()
+        password_a = str(a.get("password", "")).strip()
+        if not email_a or not password_a:
+            raise ValueError(f"accounts[{i}] must have non-empty 'email' and 'password'")
+        accounts.append(AccountEntry(email=email_a, password=password_a))
+
     return Config(
         repeat=repeat,
         vpn=vpn,
@@ -211,6 +228,7 @@ def load_config(path: Path) -> Config:
         check_downloads=check_downloads,
         clean_start=clean_start,
         cleanup_mode=cleanup_mode_raw,
+        accounts=tuple(accounts),
     )
 
 
@@ -4969,6 +4987,33 @@ class PodcastsController:
                 return True
         return False
 
+    def _click_unfollow_show_menu_item_ax(self) -> bool:
+        """Click 'Unfollow Show' in the card context menu via AX walk + Quartz.
+
+        Retries up to 3 times with 0.5s gaps — the Mac Catalyst context menu can
+        take slightly longer than the nominal 1.2s wait to appear in the AX tree.
+        """
+        try:
+            import Quartz  # type: ignore[import]
+        except ImportError:
+            return False
+
+        for attempt in range(3):
+            nodes = self._ax_nodes()
+            for role, text, x, y, w, h in nodes:
+                if role == "AXButton" and h > 0 and h < 40 and text == "Unfollow Show":
+                    cx, cy = x + w // 2, y + h // 2
+                    pt = Quartz.CGPoint(x=float(cx), y=float(cy))
+                    for kind in (Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp):
+                        ev = Quartz.CGEventCreateMouseEvent(None, kind, pt, Quartz.kCGMouseButtonLeft)
+                        Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+                        time.sleep(0.05)
+                    self.logger.log(f"Clicked 'Unfollow Show' at ({cx},{cy})", step="14")
+                    return True
+            if attempt < 2:
+                time.sleep(0.5)
+        return False
+
     # ── Generic card-based cleanup (fallback when show names not captured) ───
 
     def cleanup_all_downloaded(self) -> list[dict[str, Any]]:
@@ -5201,24 +5246,27 @@ class PodcastsController:
 
             _open_three_dots_menu()
 
-            # AX click on the 'Remove…' menu item via ApplicationServices + Quartz.
-            ax_ok = self._click_remove_menu_item_ax()
+            # AX click on 'Unfollow Show' menu item via ApplicationServices + Quartz.
+            ax_ok = self._click_unfollow_show_menu_item_ax()
             confirm = "no_sheet"
             actual_removed = False
 
             if not ax_ok:
+                # Keyboard fallback: 'Unfollow Show' is first item → Down×1 + Enter
                 self.logger.log(
-                    f"Downloads cleanup card {iteration + 1}: Remove item not found via AX",
+                    f"Downloads cleanup card {iteration + 1}: Unfollow Show not found via AX — keyboard fallback",
                     step="14",
                 )
-                results.append({"iteration": iteration + 1, "result": "remove_not_found"})
-                break
+                _key(0x7D, True); _key(0x7D, False)
+                time.sleep(0.3)
+                _key(0x24, True); _key(0x24, False)
+                time.sleep(0.8)
 
             time.sleep(0.4)
             confirm = self._click_confirmation_remove()
             actual_removed = True
 
-            result_label = "removed:ax"
+            result_label = "unfollowed:ax" if ax_ok else "unfollowed:keyboard"
             if confirm not in ("no_sheet",):
                 result_label += f"+confirmed:{confirm}"
 
@@ -5232,6 +5280,584 @@ class PodcastsController:
             # below retries if the next card hasn't rendered yet.)
 
         return results
+
+    @staticmethod
+    def _as_str(value: str) -> str:
+        """Escape a Python string for safe embedding in an AppleScript string literal."""
+        return value.replace("\\", "\\\\").replace('"', '\\"')
+
+    def check_sign_in_state(self) -> str:
+        """Return 'signed_in', 'signed_out', or 'unknown'."""
+        script = """
+tell application "System Events"
+    tell process "Podcasts"
+        try
+            set acctItem to menu bar item "Account" of menu bar 1
+            click acctItem
+            delay 0.5
+            set mItems to {}
+            try
+                set mItems to name of every menu item of menu 1 of acctItem
+            end try
+            key code 53
+            delay 0.3
+            repeat with n in mItems
+                if n contains "Sign In" then return "signed_out"
+            end repeat
+            return "signed_in"
+        on error e
+            return "unknown"
+        end try
+    end tell
+end tell
+"""
+        try:
+            return run_osascript(script, timeout=15, label="check_sign_in_state").strip()
+        except Exception:
+            return "unknown"
+
+    def get_signed_in_email(self) -> str:
+        """Return the email shown in the Podcasts Account menu, or '' if not signed in."""
+        script = """
+tell application "System Events"
+    tell process "Podcasts"
+        try
+            set acctItem to menu bar item "Account" of menu bar 1
+            click acctItem
+            delay 0.5
+            set mItems to name of every menu item of menu 1 of acctItem
+            key code 53
+            delay 0.2
+            repeat with i from 1 to (count of mItems)
+                set thisItem to (item i of mItems) as string
+                if thisItem contains "@" then return thisItem
+            end repeat
+            return ""
+        on error e
+            return ""
+        end try
+    end tell
+end tell
+"""
+        try:
+            return run_osascript(script, timeout=12, label="get_signed_in_email").strip()
+        except Exception:
+            return ""
+
+    def _click_button_in_podcasts_windows(self, button_name: str) -> str:
+        """Click a named button anywhere in Podcasts windows or sheets."""
+        btn = self._as_str(button_name)
+        script = """
+tell application "System Events"
+    tell process "Podcasts"
+        try
+            repeat with w in windows
+                try
+                    if exists button "__BTN__" of w then
+                        click button "__BTN__" of w
+                        return "clicked"
+                    end if
+                end try
+                try
+                    repeat with s in sheets of w
+                        if exists button "__BTN__" of s then
+                            click button "__BTN__" of s
+                            return "clicked_in_sheet"
+                        end if
+                    end repeat
+                end try
+            end repeat
+            return "not_found"
+        on error e
+            return "error:" & e
+        end try
+    end tell
+end tell
+""".replace("__BTN__", btn)
+        try:
+            return run_osascript(script, timeout=10, label=f"click_button_{button_name}").strip()
+        except Exception as exc:
+            return f"error:{exc}"
+
+    def _wait_and_click_button(self, button_name: str, timeout: int = 30) -> str:
+        """Poll until a named button appears in Podcasts windows/sheets, then click it."""
+        btn = self._as_str(button_name)
+        script = """
+tell application "System Events"
+    tell process "Podcasts"
+        set deadline to (current date) + __TIMEOUT__
+        repeat while (current date) < deadline
+            try
+                repeat with w in windows
+                    try
+                        if exists button "__BTN__" of w then
+                            click button "__BTN__" of w
+                            return "clicked"
+                        end if
+                    end try
+                    try
+                        repeat with s in sheets of w
+                            if exists button "__BTN__" of s then
+                                click button "__BTN__" of s
+                                return "clicked_in_sheet"
+                            end if
+                        end repeat
+                    end try
+                end repeat
+            end try
+            delay 0.5
+        end repeat
+        return "timeout"
+    end tell
+end tell
+""".replace("__BTN__", btn).replace("__TIMEOUT__", str(timeout))
+        try:
+            return run_osascript(script, timeout=timeout + 10, label=f"wait_click_{button_name}").strip()
+        except Exception as exc:
+            return f"error:{exc}"
+
+    def _wait_for_sign_in_complete(self, timeout: int = 60) -> str:
+        """Poll Account menu until it shows user info (not Sign In). Returns 'signed_in' or 'timeout'."""
+        script = """
+tell application "System Events"
+    tell process "Podcasts"
+        set deadline to (current date) + __TIMEOUT__
+        repeat while (current date) < deadline
+            try
+                set acctItem to menu bar item "Account" of menu bar 1
+                click acctItem
+                delay 0.5
+                set mItems to {}
+                try
+                    set mItems to name of every menu item of menu 1 of acctItem
+                end try
+                key code 53
+                delay 0.3
+                set hasSignIn to false
+                repeat with n in mItems
+                    if n contains "Sign In" then
+                        set hasSignIn to true
+                        exit repeat
+                    end if
+                end repeat
+                if not hasSignIn and (count of mItems) > 0 then return "signed_in"
+            end try
+            delay 2
+        end repeat
+        return "timeout"
+    end tell
+end tell
+""".replace("__TIMEOUT__", str(timeout))
+        try:
+            return run_osascript(script, timeout=timeout + 15, label="wait_for_sign_in_complete").strip()
+        except Exception as exc:
+            return f"error:{exc}"
+
+    def sign_in_to_podcasts(self, email: str, password: str) -> str:
+        """Full sign-in flow for Apple Podcasts. Returns 'signed_in', 'already_signed_in_correct', or error string."""
+        self.activate()
+        time.sleep(0.5)
+
+        state = self.check_sign_in_state()
+        self.logger.log(f"Pre-sign-in state: {state}", step="SIGNIN")
+        if state == "signed_in":
+            current_email = self.get_signed_in_email()
+            self.logger.log(f"Currently signed in as: {current_email}", step="SIGNIN")
+            if email.lower() in current_email.lower() or current_email.lower() in email.lower():
+                self.logger.log(f"Already signed in with correct account ({email}) — skipping", step="SIGNIN")
+                return "already_signed_in_correct"
+            self.logger.log(f"Wrong account ({current_email} vs {email}); signing out", step="SIGNIN")
+            signout_result = self.sign_out_of_podcasts()
+            self.logger.log(f"Sign-out result: {signout_result}", step="SIGNIN")
+            deadline = time.time() + 20
+            while time.time() < deadline:
+                time.sleep(2.5)
+                post_state = self.check_sign_in_state()
+                self.logger.log(f"Post-signout state: {post_state}", step="SIGNIN")
+                if post_state != "signed_in":
+                    break
+            time.sleep(1.0)
+
+        # Step 1: Account menu → Sign In…
+        script = """
+tell application "System Events"
+    tell process "Podcasts"
+        try
+            set acctItem to menu bar item "Account" of menu bar 1
+            click acctItem
+            delay 0.4
+            set clicked to false
+            repeat with mi in menu items of menu 1 of acctItem
+                if name of mi contains "Sign In" then
+                    click mi
+                    set clicked to true
+                    exit repeat
+                end if
+            end repeat
+            if clicked then
+                return "opened"
+            else
+                key code 53
+                return "sign_in_item_not_found"
+            end if
+        on error e
+            return "error:" & e
+        end try
+    end tell
+end tell
+"""
+        result = "sign_in_item_not_found"
+        for attempt in range(1, 4):
+            result = run_osascript(script, timeout=15, label="open_sign_in_dialog")
+            self.logger.log(f"Open sign-in dialog (attempt {attempt}): {result}", step="SIGNIN")
+            if "error" not in result and "not_found" not in result:
+                break
+            if attempt < 3:
+                time.sleep(2.5)
+        if "error" in result or "not_found" in result:
+            return f"sign_in_dialog_failed:{result}"
+        time.sleep(2.0)
+
+        # Step 2: Enter email
+        email_escaped = self._as_str(email)
+        script = """
+tell application "System Events"
+    tell process "Podcasts"
+        set deadline to (current date) + 12
+        repeat while (current date) < deadline
+            try
+                repeat with w in windows
+                    try
+                        if (count of text fields of w) > 0 then
+                            set tf to first text field of w
+                            set focused of tf to true
+                            delay 0.2
+                            set value of tf to "__EMAIL__"
+                            return "email_entered"
+                        end if
+                    end try
+                    try
+                        repeat with s in sheets of w
+                            if (count of text fields of s) > 0 then
+                                set tf to first text field of s
+                                set focused of tf to true
+                                delay 0.2
+                                set value of tf to "__EMAIL__"
+                                return "email_entered_in_sheet"
+                            end if
+                        end repeat
+                    end try
+                end repeat
+            end try
+            delay 0.5
+        end repeat
+        return "email_field_not_found"
+    end tell
+end tell
+""".replace("__EMAIL__", email_escaped)
+        result = run_osascript(script, timeout=20, label="enter_email")
+        self.logger.log(f"Email entry: {result}", step="SIGNIN")
+        if "not_found" in result:
+            return f"email_field_not_found:{result}"
+        time.sleep(0.5)
+
+        # Step 3: Click Sign In (submits email)
+        result = self._click_button_in_podcasts_windows("Sign In")
+        self.logger.log(f"Sign In (email) button: {result}", step="SIGNIN")
+        time.sleep(2.5)
+
+        # Step 4: Enter password
+        password_escaped = self._as_str(password)
+        script = """
+tell application "System Events"
+    tell process "Podcasts"
+        set deadline to (current date) + 15
+        repeat while (current date) < deadline
+            try
+                repeat with w in windows
+                    try
+                        if (count of secure text fields of w) > 0 then
+                            set stf to first secure text field of w
+                            set focused of stf to true
+                            delay 0.2
+                            keystroke "a" using command down
+                            delay 0.1
+                            keystroke "__PASS__"
+                            return "password_entered"
+                        end if
+                    end try
+                    try
+                        repeat with s in sheets of w
+                            if (count of secure text fields of s) > 0 then
+                                set stf to first secure text field of s
+                                set focused of stf to true
+                                delay 0.2
+                                keystroke "a" using command down
+                                delay 0.1
+                                keystroke "__PASS__"
+                                return "password_entered_in_sheet"
+                            end if
+                        end repeat
+                    end try
+                end repeat
+            end try
+            delay 0.5
+        end repeat
+        return "password_field_not_found"
+    end tell
+end tell
+""".replace("__PASS__", password_escaped)
+        result = run_osascript(script, timeout=25, label="enter_password")
+        self.logger.log(f"Password entry: {result}", step="SIGNIN")
+        if "not_found" in result:
+            return f"password_field_not_found:{result}"
+        time.sleep(0.5)
+
+        # Step 5: Click Sign In (submits password)
+        result = self._click_button_in_podcasts_windows("Sign In")
+        self.logger.log(f"Sign In (password) button: {result}", step="SIGNIN")
+        time.sleep(3.0)
+
+        # Step 6: Wait for "Other options" button and click it (Apple Account Security dialog)
+        self.logger.log("Waiting for 'Other options' dialog...", step="SIGNIN")
+        result = self._wait_and_click_button("Other options", timeout=30)
+        self.logger.log(f"Other options: {result}", step="SIGNIN")
+        if result != "timeout":
+            time.sleep(2.0)
+
+        # Step 7: Wait for "Do not upgrade" button and click it
+        self.logger.log("Waiting for 'Do not upgrade' dialog...", step="SIGNIN")
+        result = self._wait_and_click_button("Do not upgrade", timeout=20)
+        self.logger.log(f"Do not upgrade: {result}", step="SIGNIN")
+        if result != "timeout":
+            time.sleep(2.0)
+
+        # Step 8: Wait until Account menu confirms sign-in
+        self.logger.log("Waiting for Podcasts sign-in to complete...", step="SIGNIN")
+        completion = self._wait_for_sign_in_complete(timeout=60)
+        self.logger.log(f"Sign-in completion: {completion}", step="SIGNIN")
+
+        return "signed_in" if completion == "signed_in" else f"sign_in_{completion}"
+
+    def click_follow_button(self) -> str:
+        """Click the Follow button on the current show page using fast AX walk."""
+        try:
+            import Quartz  # type: ignore[import]
+        except ImportError:
+            return "error:quartz_unavailable"
+
+        time.sleep(2)
+        for attempt in range(4):
+            nodes = self._ax_nodes()
+            for role, text, x, y, w, h in nodes:
+                if role == "AXButton" and text in ("Follow", "+ Follow"):
+                    cx, cy = x + w // 2, y + h // 2
+                    pt = Quartz.CGPointMake(cx, cy)
+                    for kind in (Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp):
+                        ev = Quartz.CGEventCreateMouseEvent(None, kind, pt, Quartz.kCGMouseButtonLeft)
+                        Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+                        time.sleep(0.05)
+                    return "followed"
+            if attempt < 3:
+                time.sleep(2)
+        return "follow_button_not_found"
+
+    def sign_out_of_podcasts(self) -> str:
+        """Sign out via Account → View Apple Account → System Settings Sign Out button."""
+        step1 = """
+tell application "Podcasts" to activate
+delay 1.5
+tell application "System Events"
+    tell process "Podcasts"
+        try
+            set acctItem to menu bar item "Account" of menu bar 1
+            click acctItem
+            delay 0.5
+            set found to false
+            repeat with mi in menu items of menu 1 of acctItem
+                if name of mi contains "View Apple Account" then
+                    click mi
+                    set found to true
+                    exit repeat
+                end if
+                if name of mi contains "Sign Out" then
+                    click mi
+                    set found to true
+                    exit repeat
+                end if
+            end repeat
+            if not found then
+                key code 53
+                return "no_account_option"
+            end if
+            return "opened"
+        on error e
+            return "error:" & e
+        end try
+    end tell
+end tell
+"""
+        try:
+            r = run_osascript(step1, timeout=16, label="signout_open_settings").strip()
+        except Exception as exc:
+            return f"error:{exc}"
+        if "error" in r or r == "no_account_option":
+            return r
+        time.sleep(3.5)
+
+        try:
+            import Quartz  # type: ignore[import]
+        except ImportError:
+            return "error:quartz_unavailable"
+
+        try:
+            run_osascript('tell application "System Events" to key code 53', timeout=5,
+                          label="signout_escape")
+        except Exception:
+            pass
+        time.sleep(0.5)
+
+        pos_script = """
+tell application "System Events"
+    tell process "System Settings"
+        activate
+        delay 0.3
+        if (count of windows) = 0 then return "no_window"
+        set w to window 1
+        set p to position of w
+        set s to size of w
+        return ((item 1 of p) as text) & "," & ((item 2 of p) as text) & "," & ((item 1 of s) as text) & "," & ((item 2 of s) as text)
+    end tell
+end tell
+"""
+        try:
+            pos_str = run_osascript(pos_script, timeout=10, label="signout_get_window_pos").strip()
+        except Exception as exc:
+            return f"error:get_pos:{exc}"
+        if pos_str == "no_window":
+            return "no_window"
+        try:
+            wx, wy, ww, wh = [int(v.strip()) for v in pos_str.split(",")]
+        except Exception:
+            return f"error:bad_pos:{pos_str}"
+
+        def _qclick(x: int, y: int) -> None:
+            pt = Quartz.CGPointMake(float(x), float(y))
+            for kind in (Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp):
+                ev = Quartz.CGEventCreateMouseEvent(None, kind, pt, Quartz.kCGMouseButtonLeft)
+                Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+                time.sleep(0.05)
+
+        try:
+            from ApplicationServices import (  # type: ignore[import]
+                AXUIElementCreateApplication, AXUIElementCopyAttributeValue,
+                AXValueGetValue, kAXChildrenAttribute, kAXRoleAttribute,
+                kAXDescriptionAttribute, kAXValueAttribute, kAXTitleAttribute,
+                kAXPositionAttribute, kAXSizeAttribute,
+                kAXValueCGPointType, kAXValueCGSizeType,
+            )
+            _ax_ok = True
+        except Exception:
+            _ax_ok = False
+
+        def _attr(el, a):
+            try:
+                err, val = AXUIElementCopyAttributeValue(el, a, None)
+                return val if err == 0 else None
+            except Exception:
+                return None
+
+        def _find_sign_out_in_sys_settings() -> "tuple[int, int] | None":
+            try:
+                ss_pid = int(subprocess.run(
+                    ["osascript", "-e",
+                     'tell application "System Events" to return unix id of process "System Settings"'],
+                    capture_output=True, text=True, timeout=5,
+                ).stdout.strip())
+            except Exception:
+                return None
+            root = AXUIElementCreateApplication(ss_pid)
+            stack = [root]
+            seen = 0
+            while stack and seen < 12000:
+                el = stack.pop()
+                seen += 1
+                for attr in (kAXDescriptionAttribute, kAXValueAttribute, kAXTitleAttribute):
+                    v = _attr(el, attr)
+                    if isinstance(v, str) and "Sign Out" in v:
+                        pv = _attr(el, kAXPositionAttribute)
+                        sv = _attr(el, kAXSizeAttribute)
+                        if pv and sv:
+                            okp, pt = AXValueGetValue(pv, kAXValueCGPointType, None)
+                            oks, sz = AXValueGetValue(sv, kAXValueCGSizeType, None)
+                            if okp and oks:
+                                try:
+                                    return int(pt.x) + int(sz.width) // 2, int(pt.y) + int(sz.height) // 2
+                                except Exception:
+                                    pass
+                        break
+                ch = _attr(el, kAXChildrenAttribute)
+                if ch:
+                    stack.extend(ch)
+            return None
+
+        _qclick(wx + 84, wy + 113)  # Apple Account sidebar row
+        time.sleep(1.5)
+        _qclick(int(wx + ww * 0.65), int(wy + wh * 0.82))  # Media & Purchases
+        time.sleep(2.0)
+
+        sign_out_pos = _find_sign_out_in_sys_settings() if _ax_ok else None
+        if sign_out_pos:
+            _qclick(*sign_out_pos)
+            r2 = f"clicked_ax:{sign_out_pos[0]},{sign_out_pos[1]}"
+        else:
+            _qclick(int(wx + ww * 0.91), int(wy + wh * 0.69))
+            r2 = f"clicked_coord:{int(wx + ww * 0.91)},{int(wy + wh * 0.69)}"
+        time.sleep(1.0)
+
+        step3 = """
+tell application "System Events"
+    set deadline to (current date) + 8
+    repeat while (current date) < deadline
+        try
+            tell process "System Settings"
+                repeat with w in windows
+                    try
+                        repeat with s in sheets of w
+                            repeat with b in buttons of s
+                                if name of b contains "Sign Out" then
+                                    click b
+                                    return "confirmed"
+                                end if
+                            end repeat
+                        end repeat
+                    end try
+                    try
+                        repeat with b in buttons of w
+                            if name of b contains "Sign Out" then
+                                click b
+                                return "confirmed_window"
+                            end if
+                        end repeat
+                    end try
+                end repeat
+            end tell
+        end try
+        delay 0.4
+    end repeat
+    return "no_confirmation"
+end tell
+"""
+        try:
+            r3 = run_osascript(step3, timeout=12, label="signout_confirm").strip()
+        except Exception as exc:
+            r3 = f"error:{exc}"
+        time.sleep(2.0)
+        try:
+            run_osascript('tell application "System Settings" to quit', timeout=5, label="close_sys_settings")
+        except Exception:
+            pass
+        return f"signed_out:{r3}"
 
     def quit_app(self) -> None:
         # Both PyXA.quit() and `osascript ... quit` are GRACEFUL but SYNCHRONOUS:
@@ -5348,6 +5974,19 @@ class Orchestrator:
                     else:
                         self.logger.log("VPN disabled", step="06", status="vpn_disabled")
 
+                    if self.config.accounts:
+                        account = self.config.accounts[(cycle - 1) % len(self.config.accounts)]
+                        self.logger.log(f"Signing in with account {account.email}", step="06b")
+                        sign_in_result = self.podcasts.sign_in_to_podcasts(account.email, account.password)
+                        self.logger.log(
+                            f"Podcasts sign-in result: {sign_in_result}",
+                            step="06b", email=account.email, result=sign_in_result,
+                        )
+                        self.state.data.setdefault("sign_in_results", []).append(
+                            {"cycle": cycle, "email": account.email, "result": sign_in_result}
+                        )
+                        self.state.save()
+
                 # Whether downloads are already confirmed complete before cleanup.
                 # On a resume that skips straight to cleanup we don't know, so the
                 # cleanup phase will fall back to its own download wait.
@@ -5371,6 +6010,12 @@ class Orchestrator:
                             f"show_downloading_page error (non-fatal): {exc}",
                             step="13",
                         )
+
+                if self.config.accounts:
+                    self.logger.log("Signing out before cleanup", step="14a")
+                    self.podcasts.activate()
+                    signout_result = self.podcasts.sign_out_of_podcasts()
+                    self.logger.log(f"Sign-out result: {signout_result}", step="14a")
 
                 if self.config.cleanup:
                     self._cleanup_phase(cycle, downloads_already_done=downloads_done)
@@ -5599,6 +6244,10 @@ class Orchestrator:
         # No fixed settle: click_see_all() already polls for the element to render,
         # so any wait here is dead time before that poll even starts.
         self.logger.log("Podcasts page loaded", step="10")
+
+        # Click Follow on the show page (non-fatal if not found — show may already be followed)
+        follow_result = self.podcasts.click_follow_button()
+        self.logger.log(f"Follow button: {follow_result}", step="10b")
 
         # Capture show name for state-driven cleanup.
         # Primary: Chrome tab title (most reliable — e.g. "The Daily - Apple Podcasts").
