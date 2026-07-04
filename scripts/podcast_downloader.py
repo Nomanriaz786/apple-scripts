@@ -5139,6 +5139,32 @@ class PodcastsController:
             Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
             time.sleep(0.05)
 
+        # Ensure the Podcasts window is large enough for the card grid to render.
+        # Cards require at least ~700px height; a tiny window (e.g. 250px) hides them.
+        try:
+            run_osascript(
+                """
+tell application "System Events"
+    tell process "Podcasts"
+        if (count of windows) > 0 then
+            set w to window 1
+            set sz to size of w
+            set ww to item 1 of sz
+            set wh to item 2 of sz
+            if ww < 900 or wh < 700 then
+                set size of w to {900, 700}
+                delay 0.3
+            end if
+        end if
+    end tell
+end tell
+""",
+                timeout=8,
+                label="cleanup_resize_window",
+            )
+        except Exception:
+            pass
+
         results: list[dict[str, Any]] = []
         removed = 0
         for iteration in range(50):
@@ -5678,6 +5704,7 @@ tell application "System Events"
             click acctItem
             delay 0.5
             set found to false
+            set alreadyOut to false
             repeat with mi in menu items of menu 1 of acctItem
                 if name of mi contains "View Apple Account" then
                     click mi
@@ -5689,7 +5716,15 @@ tell application "System Events"
                     set found to true
                     exit repeat
                 end if
+                if name of mi contains "Sign In" then
+                    set alreadyOut to true
+                    exit repeat
+                end if
             end repeat
+            if alreadyOut then
+                key code 53
+                return "already_signed_out"
+            end if
             if not found then
                 key code 53
                 return "no_account_option"
@@ -5705,7 +5740,7 @@ end tell
             r = run_osascript(step1, timeout=16, label="signout_open_settings").strip()
         except Exception as exc:
             return f"error:{exc}"
-        if "error" in r or r == "no_account_option":
+        if "error" in r or r in ("no_account_option", "already_signed_out"):
             return r
         time.sleep(3.5)
 
