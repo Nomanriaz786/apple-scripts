@@ -5570,6 +5570,8 @@ end tell
         # keystroke with special characters (@, $, etc.) causes AppleScript syntax errors
         # when the password contains characters AppleScript misinterprets; pbcopy+Cmd+V is safe.
         subprocess.run(["pbcopy"], input=password.encode("utf-8"), check=True)
+        # Note: "secure text field" is not in System Events scripting dictionary —
+        # the password field appears as a regular "text field" in the AX tree.
         script = """
 tell application "System Events"
     tell process "Podcasts"
@@ -5578,9 +5580,9 @@ tell application "System Events"
             try
                 repeat with w in windows
                     try
-                        if (count of secure text fields of w) > 0 then
-                            set stf to first secure text field of w
-                            set focused of stf to true
+                        if (count of text fields of w) > 0 then
+                            set tf to last text field of w
+                            set focused of tf to true
                             delay 0.2
                             keystroke "a" using {command down}
                             delay 0.1
@@ -5590,9 +5592,9 @@ tell application "System Events"
                     end try
                     try
                         repeat with s in sheets of w
-                            if (count of secure text fields of s) > 0 then
-                                set stf to first secure text field of s
-                                set focused of stf to true
+                            if (count of text fields of s) > 0 then
+                                set tf to last text field of s
+                                set focused of tf to true
                                 delay 0.2
                                 keystroke "a" using {command down}
                                 delay 0.1
