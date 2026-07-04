@@ -6013,20 +6013,7 @@ class Orchestrator:
                     else:
                         self.logger.log("VPN disabled", step="06", status="vpn_disabled")
 
-                    if self.config.accounts:
-                        account = self.config.accounts[(cycle - 1) % len(self.config.accounts)]
-                        self.logger.log(f"Signing in with account {account.email}", step="06b")
-                        sign_in_result = self.podcasts.sign_in_to_podcasts(account.email, account.password)
-                        self.logger.log(
-                            f"Podcasts sign-in result: {sign_in_result}",
-                            step="06b", email=account.email, result=sign_in_result,
-                        )
-                        self.state.data.setdefault("sign_in_results", []).append(
-                            {"cycle": cycle, "email": account.email, "result": sign_in_result}
-                        )
-                        self.state.save()
-
-                # Whether downloads are already confirmed complete before cleanup.
+                    # Whether downloads are already confirmed complete before cleanup.
                 # On a resume that skips straight to cleanup we don't know, so the
                 # cleanup phase will fall back to its own download wait.
                 downloads_done = False
@@ -6283,6 +6270,23 @@ class Orchestrator:
         # No fixed settle: click_see_all() already polls for the element to render,
         # so any wait here is dead time before that poll even starts.
         self.logger.log("Podcasts page loaded", step="10")
+
+        # Sign in after the Podcasts window is up.
+        # sign_in_to_podcasts returns immediately if already on the correct account,
+        # so calling it on every tab is safe — it's a no-op after the first tab.
+        if self.config.accounts:
+            account = self.config.accounts[(cycle - 1) % len(self.config.accounts)]
+            self.logger.log(f"Signing in with account {account.email}", step="10a")
+            sign_in_result = self.podcasts.sign_in_to_podcasts(account.email, account.password)
+            self.logger.log(
+                f"Podcasts sign-in result: {sign_in_result}",
+                step="10a", email=account.email, result=sign_in_result,
+            )
+            self.state.data.setdefault("sign_in_results", []).append(
+                {"cycle": cycle, "tab": tab_task.tab, "email": account.email,
+                 "result": sign_in_result}
+            )
+            self.state.save()
 
         # Click Follow on the show page (non-fatal if not found — show may already be followed)
         follow_result = self.podcasts.click_follow_button()
