@@ -5479,6 +5479,98 @@ end tell
         except Exception as exc:
             return f"error:{exc}"
 
+    def _ax_click_button(self, button_text: str, deadline_sec: int = 8) -> str:
+        """Find a button by text via native AX walk and Quartz-click it.
+
+        Matches on AXButton whose first non-empty attribute (description/value/title)
+        starts with button_text — handles both title-only and description-only buttons.
+        Only considers on-screen buttons (x >= 0, y >= 0).
+        """
+        try:
+            import Quartz  # type: ignore[import]
+        except ImportError:
+            return "error:quartz_unavailable"
+
+        deadline = time.time() + deadline_sec
+        while time.time() < deadline:
+            nodes = self._ax_nodes()
+            for role, t, x, y, w, h in nodes:
+                if (role == "AXButton" and t.startswith(button_text)
+                        and x >= 0 and y >= 0 and w > 0 and h > 0):
+                    cx, cy = x + w // 2, y + h // 2
+                    for k in (Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp):
+                        ev = Quartz.CGEventCreateMouseEvent(
+                            None, k, Quartz.CGPointMake(cx, cy),
+                            Quartz.kCGMouseButtonLeft)
+                        Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+                        time.sleep(0.06)
+                    self.logger.log(
+                        f"AX button '{button_text}': clicked at ({cx},{cy})",
+                        step="SIGNIN",
+                    )
+                    return "clicked"
+            time.sleep(0.3)
+        return f"not_found:{button_text}"
+
+    def _ax_click_and_paste_in_textfield(
+        self, field_index: int = 0, deadline_sec: int = 15, label: str = "field"
+    ) -> str:
+        """Find the Nth AXTextField in the Podcasts sign-in sheet via the native AX walk,
+        Quartz-click it, select-all, then paste the clipboard contents.
+
+        AppleScript's `text fields of sheet` only surfaces DIRECT children; the Podcasts
+        sign-in sheet wraps the field in groups, so the AS count is always 0.  The native
+        walk visits every node regardless of depth and finds the field reliably.
+        """
+        try:
+            import Quartz  # type: ignore[import]
+        except ImportError:
+            return "error:quartz_unavailable"
+
+        deadline = time.time() + deadline_sec
+        while time.time() < deadline:
+            nodes = self._ax_nodes()
+            # Collect AXTextField nodes inside the sheet y-range (y>200) that are
+            # on-screen (x>=0) — excludes the sidebar search box (y≈82) and the
+            # off-screen search field (x=-1, y≈745).
+            fields = [
+                (x + w // 2, y + h // 2)
+                for role, _t, x, y, w, h in nodes
+                if role == "AXTextField" and y > 200 and x >= 0 and w > 50 and h > 10
+            ]
+            # Negative field_index means "from the end" — e.g. -1 = last field.
+            # The password screen adds a second field (email locked + password active),
+            # so field_index=-1 always picks the correct active field regardless of how
+            # many fields are visible.
+            idx = (len(fields) + field_index) if field_index < 0 else field_index
+            if 0 <= idx < len(fields):
+                cx, cy = fields[idx]
+                # Click to focus the field
+                for k in (Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp):
+                    ev = Quartz.CGEventCreateMouseEvent(
+                        None, k, Quartz.CGPointMake(cx, cy), Quartz.kCGMouseButtonLeft)
+                    Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+                    time.sleep(0.05)
+                time.sleep(0.2)
+                # Select all + paste
+                for key, mods in ((0, Quartz.kCGEventFlagMaskCommand),    # Cmd+A
+                                  (9, Quartz.kCGEventFlagMaskCommand)):    # Cmd+V
+                    dn = Quartz.CGEventCreateKeyboardEvent(None, key, True)
+                    up = Quartz.CGEventCreateKeyboardEvent(None, key, False)
+                    Quartz.CGEventSetFlags(dn, mods)
+                    Quartz.CGEventSetFlags(up, mods)
+                    Quartz.CGEventPost(Quartz.kCGHIDEventTap, dn)
+                    time.sleep(0.05)
+                    Quartz.CGEventPost(Quartz.kCGHIDEventTap, up)
+                    time.sleep(0.05)
+                self.logger.log(
+                    f"AX textfield {label}: clicked at ({cx},{cy}) and pasted",
+                    step="SIGNIN",
+                )
+                return f"{label}_entered"
+            time.sleep(0.4)
+        return f"{label}_field_not_found"
+
     def sign_in_to_podcasts(self, email: str, password: str) -> str:
         """Full sign-in flow for Apple Podcasts. Returns 'signed_in', 'already_signed_in_correct', or error string."""
         self.activate()
@@ -5544,122 +5636,57 @@ end tell
             return f"sign_in_dialog_failed:{result}"
         time.sleep(2.0)
 
-        # Step 2: Enter email
-        email_escaped = self._as_str(email)
-        script = """
-tell application "System Events"
-    tell process "Podcasts"
-        set deadline to (current date) + 12
-        repeat while (current date) < deadline
-            try
-                repeat with w in windows
-                    try
-                        if (count of text fields of w) > 0 then
-                            set tf to first text field of w
-                            set focused of tf to true
-                            delay 0.2
-                            set value of tf to "__EMAIL__"
-                            return "email_entered"
-                        end if
-                    end try
-                    try
-                        repeat with s in sheets of w
-                            if (count of text fields of s) > 0 then
-                                set tf to first text field of s
-                                set focused of tf to true
-                                delay 0.2
-                                set value of tf to "__EMAIL__"
-                                return "email_entered_in_sheet"
-                            end if
-                        end repeat
-                    end try
-                end repeat
-            end try
-            delay 0.5
-        end repeat
-        return "email_field_not_found"
-    end tell
-end tell
-""".replace("__EMAIL__", email_escaped)
-        result = run_osascript(script, timeout=20, label="enter_email")
+        # Step 2: Enter email.
+        # AppleScript's `text fields of window/sheet` only returns DIRECT children —
+        # the Podcasts sign-in sheet nests the field inside groups, so the count is
+        # always 0.  Use the native AX walk instead: find the topmost AXTextField
+        # that is inside the sheet's y-range, click it with Quartz, then paste via
+        # pbcopy+Cmd+V so special characters arrive safely.
+        subprocess.run(["pbcopy"], input=email.encode("utf-8"), check=True)
+        result = self._ax_click_and_paste_in_textfield(
+            field_index=0, deadline_sec=15, label="email"
+        )
         self.logger.log(f"Email entry: {result}", step="SIGNIN")
         if "not_found" in result:
             return f"email_field_not_found:{result}"
         time.sleep(0.5)
 
-        # Step 3: Click Sign In (submits email)
-        result = self._click_button_in_podcasts_windows("Sign In")
+        # Step 3: Click Sign In (submits email) via AX walk + Quartz to avoid
+        # AppleScript `button "X" of sheet` failing when the button title is empty.
+        result = self._ax_click_button("Sign In", deadline_sec=8)
         self.logger.log(f"Sign In (email) button: {result}", step="SIGNIN")
         time.sleep(2.5)
 
-        # Step 4: Enter password — put it in the clipboard then paste into the secure field.
-        # keystroke with special characters (@, $, etc.) causes AppleScript syntax errors
-        # when the password contains characters AppleScript misinterprets; pbcopy+Cmd+V is safe.
+        # Step 4: Enter password — paste via clipboard (safe for special characters).
+        # After email submit the sheet has TWO fields: [email(locked), password(active)].
+        # Use field_index=-1 (last field) so we always land on the password field whether
+        # the form has one field or two.
         subprocess.run(["pbcopy"], input=password.encode("utf-8"), check=True)
-        # Note: "secure text field" is not in System Events scripting dictionary —
-        # the password field appears as a regular "text field" in the AX tree.
-        script = """
-tell application "System Events"
-    tell process "Podcasts"
-        set deadline to (current date) + 15
-        repeat while (current date) < deadline
-            try
-                repeat with w in windows
-                    try
-                        if (count of text fields of w) > 0 then
-                            set tf to last text field of w
-                            set focused of tf to true
-                            delay 0.2
-                            keystroke "a" using {command down}
-                            delay 0.1
-                            keystroke "v" using {command down}
-                            return "password_entered"
-                        end if
-                    end try
-                    try
-                        repeat with s in sheets of w
-                            if (count of text fields of s) > 0 then
-                                set tf to last text field of s
-                                set focused of tf to true
-                                delay 0.2
-                                keystroke "a" using {command down}
-                                delay 0.1
-                                keystroke "v" using {command down}
-                                return "password_entered_in_sheet"
-                            end if
-                        end repeat
-                    end try
-                end repeat
-            end try
-            delay 0.5
-        end repeat
-        return "password_field_not_found"
-    end tell
-end tell
-"""
-        result = run_osascript(script, timeout=25, label="enter_password")
+        result = self._ax_click_and_paste_in_textfield(
+            field_index=-1, deadline_sec=15, label="password"
+        )
         self.logger.log(f"Password entry: {result}", step="SIGNIN")
         if "not_found" in result:
             return f"password_field_not_found:{result}"
         time.sleep(0.5)
 
         # Step 5: Click Sign In (submits password)
-        result = self._click_button_in_podcasts_windows("Sign In")
+        result = self._ax_click_button("Sign In", deadline_sec=8)
         self.logger.log(f"Sign In (password) button: {result}", step="SIGNIN")
         time.sleep(3.0)
 
         # Step 6: Wait for "Other options" button and click it (Apple Account Security dialog)
         self.logger.log("Waiting for 'Other options' dialog...", step="SIGNIN")
-        result = self._wait_and_click_button("Other options", timeout=30)
+        result = self._ax_click_button("Other options", deadline_sec=30)
         self.logger.log(f"Other options: {result}", step="SIGNIN")
-        if result != "timeout":
+        if "clicked" in result:
             time.sleep(2.0)
 
         # Step 7: Wait for "Do not upgrade" button and click it
         self.logger.log("Waiting for 'Do not upgrade' dialog...", step="SIGNIN")
-        result = self._wait_and_click_button("Do not upgrade", timeout=20)
+        result = self._ax_click_button("Do not upgrade", deadline_sec=20)
         self.logger.log(f"Do not upgrade: {result}", step="SIGNIN")
-        if result != "timeout":
+        if "clicked" in result:
             time.sleep(2.0)
 
         # Step 8: Wait until Account menu confirms sign-in
