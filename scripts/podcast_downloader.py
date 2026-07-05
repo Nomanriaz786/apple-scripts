@@ -5968,14 +5968,75 @@ end tell
 # Orchestrator
 # -----------------------------------------------------------------------------
 class Orchestrator:
-    def __init__(self, config: Config, log_dir: Path, state_path: Path):
+    def __init__(self, config: Config, log_dir: Path, state_path: Path,
+                 input_path: Path | None = None):
         self.config = config
+        self.input_path = input_path
         self.logger = RunLogger(log_dir)
         self.state = StateManager(state_path)
         self.net = NetworkState(self.logger)
         self.vpn = VPNController(self.logger, self.net, self.state)
         self.chrome = ChromeController(self.logger, self.state)
         self.podcasts = PodcastsController(self.logger, self.state)
+
+    def _remove_account_from_input(self, email: str) -> str:
+        """Remove the account with `email` from the input tasks.json, leaving the
+        rest of the file (its formatting and every other key) untouched.
+
+        Called once a cycle is fully complete so each account is dropped from the
+        input file right after its own cycle finishes.  Works on the raw text so
+        it only edits the single matching account line and re-normalizes the
+        trailing commas on the remaining account lines — it does not re-serialize
+        the whole file.  Validates the result parses as JSON before writing, so a
+        bug can never corrupt the input file.  Non-fatal: returns a status string
+        instead of raising.
+        """
+        path = self.input_path
+        if path is None:
+            return "no_input_path"
+        try:
+            text = path.read_text(encoding="utf-8-sig")
+        except Exception as exc:
+            return f"read_error:{exc}"
+        lines = text.splitlines(keepends=True)
+        # Locate the "accounts": [ ... ] block.
+        start = next((i for i, ln in enumerate(lines)
+                      if '"accounts"' in ln and '[' in ln), None)
+        if start is None:
+            return "accounts_key_not_found"
+        end = next((j for j in range(start + 1, len(lines))
+                    if lines[j].lstrip().startswith(']')), None)
+        if end is None:
+            return "accounts_close_not_found"
+        target = next((k for k in range(start + 1, end)
+                       if f'"{email}"' in lines[k]), None)
+        if target is None:
+            return "email_not_found"
+        del lines[target]
+        # Re-normalize trailing commas on the remaining account object lines: all
+        # but the last get a trailing comma, the last gets none. Only touches the
+        # comma after each `}` — the internal alignment of each line is preserved.
+        new_end = end - 1
+        remaining = list(range(start + 1, new_end))
+        for pos, k in enumerate(remaining):
+            ln = lines[k]
+            nl = "\n" if ln.endswith("\n") else ""
+            core = ln.rstrip("\n").rstrip()
+            if core.endswith(","):
+                core = core[:-1].rstrip()
+            if pos != len(remaining) - 1:
+                core += ","
+            lines[k] = core + nl
+        new_text = "".join(lines)
+        try:
+            json.loads(new_text)
+        except json.JSONDecodeError as exc:
+            return f"would_corrupt:{exc}"
+        try:
+            path.write_text(new_text, encoding="utf-8")
+        except Exception as exc:
+            return f"write_error:{exc}"
+        return "removed"
 
     def run(self) -> int:
         self.logger.log("Started podcast automation", step="01")
@@ -6103,6 +6164,19 @@ class Orchestrator:
                                   current_tab=None, current_video=None)
                 self.state.mark_phase(cycle, "cycle_completed")
                 self.logger.log(f"Cycle {cycle} complete", step="15", cycle=cycle)
+
+                # This cycle's account is done — remove it from the input file so
+                # each ID is dropped right after its own cycle completes. Only the
+                # on-disk file changes; the in-memory config is untouched so the
+                # remaining cycles keep their existing account indexing.
+                if self.config.accounts:
+                    used = self.config.accounts[(cycle - 1) % len(self.config.accounts)]
+                    remove_result = self._remove_account_from_input(used.email)
+                    self.logger.log(
+                        f"Removed account from input after cycle {cycle}: "
+                        f"{used.email} → {remove_result}",
+                        step="15", cycle=cycle, email=used.email, result=remove_result,
+                    )
 
             self.logger.log("All cycles complete", step="16")
             return 0
@@ -6613,7 +6687,8 @@ def main(argv: list[str]) -> int:
             has_errors = True
         return 1 if has_errors else 0
 
-    orch = Orchestrator(config, log_dir=args.output_dir, state_path=args.state)
+    orch = Orchestrator(config, log_dir=args.output_dir, state_path=args.state,
+                        input_path=args.input)
     return orch.run()
 
 
