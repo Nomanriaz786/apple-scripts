@@ -5719,6 +5719,28 @@ end tell
                 time.sleep(2)
         return "follow_button_not_found"
 
+    def dismiss_continue_popup(self, deadline_sec: int = 5) -> str:
+        """Dismiss the "What's New in Apple Podcasts" onboarding modal by clicking
+        its bottom-center 'Continue' button.
+
+        This modal appears after signing in with a fresh account, once the show
+        page renders — its exact timing varies (right after sign-in, or later
+        during render), and it BLOCKS the app until dismissed, breaking Follow
+        and the download/cleanup steps that follow.  Because it persists once
+        shown, this is called at the points where it blocks (after sign-in and
+        before See All); whichever call sees it first clicks Continue and the
+        rest become no-ops.  The Continue button's accessible name is exactly
+        'Continue'; _ax_click_button matches it and clicks its center, which
+        lands on the bottom-center button.  Non-fatal — a short poll that
+        returns without error when the modal isn't present.
+        """
+        result = self._ax_click_button("Continue", deadline_sec=deadline_sec)
+        if result == "clicked":
+            self.logger.log("What's New popup: clicked Continue button", step="10")
+        else:
+            self.logger.log("What's New popup: none present", step="10")
+        return result
+
     def sign_out_of_podcasts(self) -> str:
         """Sign out via Account → View Apple Account → System Settings Sign Out button."""
         step1 = """
@@ -6315,6 +6337,10 @@ class Orchestrator:
             )
             self.state.save()
 
+        # The "What's New in Apple Podcasts" modal can appear right after a fresh
+        # sign-in and blocks the Follow button — dismiss it before Follow.
+        self.podcasts.dismiss_continue_popup()
+
         # Click Follow on the show page (non-fatal if not found — show may already be followed)
         follow_result = self.podcasts.click_follow_button()
         self.logger.log(f"Follow button: {follow_result}", step="10b")
@@ -6355,6 +6381,11 @@ class Orchestrator:
         }
         cycle_shows.append(show_entry)
         self.state.save()
+
+        # The "What's New" modal can also surface later, once the show finishes
+        # rendering — dismiss it here too so it can't block See All / download /
+        # cleanup (it persists until Continue is clicked). No-op if already gone.
+        self.podcasts.dismiss_continue_popup()
 
         see_all_result = self.podcasts.click_see_all()
         self.logger.log(f"See All {see_all_result}", step="11", status=see_all_result)
