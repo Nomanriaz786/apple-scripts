@@ -302,6 +302,19 @@ class StateManager:
             self.data[k] = v
         self.save()
 
+    def append_list(self, key: str, item: Any) -> None:
+        """Append to a list-valued state key, coercing to a list first.
+
+        Robust against a hand-edited / legacy state file where the key is missing or
+        holds a non-list value (e.g. {}), which would otherwise raise on .append.
+        """
+        cur = self.data.get(key)
+        if not isinstance(cur, list):
+            cur = []
+            self.data[key] = cur
+        cur.append(item)
+        self.save()
+
     def add_task_result(self, **fields: Any) -> None:
         self.data["podcast_task_results"].append(fields)
         self.save()
@@ -2144,12 +2157,102 @@ class PodcastsController:
         """.replace("__TIMEOUT__", str(timeout_sec))
         run_osascript(script, timeout=timeout_sec + 5, label="wait for Podcasts window")
 
+    @staticmethod
+    def _norm_show(name: str) -> str:
+        """Lowercase + strip for tolerant show-name comparison."""
+        return (name or "").strip().lower()
+
+    # Content area starts past the ~180px sidebar; text left of this is chrome/sidebar.
+    _CONTENT_X = 200
+
+    def _content_show_title(self, nodes: "list | None" = None) -> str:
+        """The show title as read from the content-area AX text (topmost heading).
+
+        The Podcasts window has no AX title on current macOS builds (System Events
+        returns `missing value`), so this reads the show name straight from the page
+        content instead — the AXStaticText title node sits at the top of the content
+        column.  Returns '' if the page hasn't rendered a title yet.
+        """
+        nodes = nodes if nodes is not None else self._ax_nodes()
+        best: "tuple[int, str] | None" = None
+        for role, t, x, y, w, h in nodes:
+            if (role in ("AXStaticText", "AXHeading") and t and x >= self._CONTENT_X
+                    and y > 60 and len(t.strip()) >= 2):
+                if best is None or y < best[0]:
+                    best = (y, t.strip())
+        return best[1] if best else ""
+
+    def _content_matches(self, nodes: "list", want: str) -> bool:
+        """True if the requested show name appears in the content-area text/buttons."""
+        if not want:
+            return False
+        for role, t, x, y, w, h in nodes:
+            if not t or x < self._CONTENT_X:
+                continue
+            if role not in ("AXStaticText", "AXButton", "AXHeading"):
+                continue
+            nt = self._norm_show(t)
+            if not nt:
+                continue
+            # Exact, or a substring match guarded by length so short generic words
+            # ("the", "a") can't false-match.
+            if nt == want or (len(nt) >= 4 and (want in nt or nt in want)):
+                return True
+        return False
+
+    def wait_for_show_loaded(self, expected_name: str, timeout_sec: int = 20) -> str:
+        """Block until Podcasts has actually navigated to the requested show.
+
+        `wait_for_window` only proves *a* window exists (always true after the first
+        tab), so on later tabs the app could still be displaying the PREVIOUS show
+        when Follow/download run — leaving the new show unfollowed and its episodes
+        never queued.  This reads the visible show name from the content-area AX text
+        (the window has no AX title on current builds) and returns once it matches
+        `expected_name` (derived from the Chrome tab title).
+
+        Returns 'loaded' when the name matches, 'loaded:changed' when the displayed
+        show changed to a different real show with a rendered page (covers name-format
+        differences), 'loaded:unverified' if a show page rendered but nothing matched
+        within the timeout, or 'timeout' if no show page appeared at all.
+        """
+        want = self._norm_show(expected_name)
+        # Title shown when we start = the PREVIOUS show on tab 2+; a change away from
+        # it (with a rendered page) means navigation happened.
+        initial = self._norm_show(self._content_show_title())
+        deadline = time.time() + timeout_sec
+        saw_show_page = False
+        while time.time() < deadline:
+            nodes = self._ax_nodes()
+            # A "What's New"/subscription "Continue" modal (common on a cold launch or
+            # right after sign-in) COVERS the show page, so the show never renders and
+            # this gate would otherwise time out.  Dismiss it from the nodes we already
+            # have — clicking its Continue button lets the page through.
+            self._dismiss_continue_in_nodes(nodes)
+            has_page = self._follow_button_state(nodes) in ("not_followed", "following")
+            if has_page:
+                saw_show_page = True
+            # Strongest signal: the requested show name is on the page.
+            if self._content_matches(nodes, want):
+                return "loaded"
+            # Weaker signal: the page's title changed to a different real show.
+            cur = self._norm_show(self._content_show_title(nodes))
+            if has_page and cur and initial and cur != initial:
+                return "loaded:changed"
+            time.sleep(0.6)
+        return "loaded:unverified" if saw_show_page else "timeout"
+
     def capture_show_name(self) -> str:
         """Read the podcast show name from the current Podcasts window.
 
-        Tries window title first, then the first prominent heading in the AX tree.
+        Tries the content-area AX title first (the window has no AX title on current
+        macOS builds — System Events returns `missing value`), then the window title,
+        then the first prominent heading in the AX tree.
         Returns a non-empty string or 'unknown_show'.
         """
+        native = self._content_show_title()
+        if native and native.lower() not in ("podcasts", "apple podcasts", "missing value"):
+            return native
+
         script = """
         tell application "System Events"
             tell process "Podcasts"
@@ -2159,7 +2262,7 @@ class PodcastsController:
                 try
                     set wTitle to name of window 1 as string
                 end try
-                if wTitle is not "" and wTitle is not "Podcasts" then
+                if wTitle is not "" and wTitle is not "Podcasts" and wTitle is not "missing value" then
                     return wTitle
                 end if
                 -- Fall back: first static text with value length > 4 in content area
@@ -3294,7 +3397,9 @@ class PodcastsController:
         _mouse(Quartz.kCGEventLeftMouseDown, dl_x, dl_y)
         time.sleep(0.1)
         _mouse(Quartz.kCGEventLeftMouseUp, dl_x, dl_y)
-        time.sleep(0.3)
+        # Fixed settle after every download click so the app registers it before we
+        # move on to the next episode/tab.
+        time.sleep(3)
 
         # Safety net: if an unexpected delete/remove dialog appeared, cancel it
         dialog_result = self._dismiss_delete_dialog_if_unexpected()
@@ -5479,38 +5584,50 @@ end tell
         except Exception as exc:
             return f"error:{exc}"
 
-    def _ax_click_button(self, button_text: str, deadline_sec: int = 8) -> str:
+    def _ax_click_button(self, button_text: "str | list[str]", deadline_sec: int = 8) -> str:
         """Find a button by text via native AX walk and Quartz-click it.
 
         Matches on AXButton whose first non-empty attribute (description/value/title)
         starts with button_text — handles both title-only and description-only buttons.
         Only considers on-screen buttons (x >= 0, y >= 0).
+
+        button_text may be a single string or a list of candidate labels; the first
+        matching label wins.  Matching is CASE-INSENSITIVE, because the same dialog
+        button renders with different capitalization across macOS/Podcasts builds
+        (e.g. "Other Options" vs "Other options", "Do Not Upgrade" vs "Do not
+        upgrade") — a case-sensitive match silently failed on some Macs.
         """
         try:
             import Quartz  # type: ignore[import]
         except ImportError:
             return "error:quartz_unavailable"
 
+        candidates = [button_text] if isinstance(button_text, str) else list(button_text)
+        lowered = [c.lower() for c in candidates]
+
         deadline = time.time() + deadline_sec
         while time.time() < deadline:
             nodes = self._ax_nodes()
             for role, t, x, y, w, h in nodes:
-                if (role == "AXButton" and t.startswith(button_text)
-                        and x >= 0 and y >= 0 and w > 0 and h > 0):
-                    cx, cy = x + w // 2, y + h // 2
-                    for k in (Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp):
-                        ev = Quartz.CGEventCreateMouseEvent(
-                            None, k, Quartz.CGPointMake(cx, cy),
-                            Quartz.kCGMouseButtonLeft)
-                        Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
-                        time.sleep(0.06)
-                    self.logger.log(
-                        f"AX button '{button_text}': clicked at ({cx},{cy})",
-                        step="SIGNIN",
-                    )
-                    return "clicked"
+                if not (role == "AXButton" and x >= 0 and y >= 0 and w > 0 and h > 0):
+                    continue
+                t_low = t.lower()
+                if not any(t_low.startswith(c) for c in lowered):
+                    continue
+                cx, cy = x + w // 2, y + h // 2
+                for k in (Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp):
+                    ev = Quartz.CGEventCreateMouseEvent(
+                        None, k, Quartz.CGPointMake(cx, cy),
+                        Quartz.kCGMouseButtonLeft)
+                    Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+                    time.sleep(0.06)
+                self.logger.log(
+                    f"AX button {candidates!r}: clicked {t!r} at ({cx},{cy})",
+                    step="SIGNIN",
+                )
+                return "clicked"
             time.sleep(0.3)
-        return f"not_found:{button_text}"
+        return f"not_found:{candidates}"
 
     def _ax_click_and_paste_in_textfield(
         self, field_index: int = 0, deadline_sec: int = 15, label: str = "field"
@@ -5675,16 +5792,21 @@ end tell
         self.logger.log(f"Sign In (password) button: {result}", step="SIGNIN")
         time.sleep(3.0)
 
-        # Step 6: Wait for "Other options" button and click it (Apple Account Security dialog)
-        self.logger.log("Waiting for 'Other options' dialog...", step="SIGNIN")
-        result = self._ax_click_button("Other options", deadline_sec=30)
+        # Step 6: Wait for "Other Options" button and click it (Apple Account Security dialog).
+        # Pass capitalization variants — different macOS/Podcasts builds render the label
+        # in title case or sentence case, and matching is now case-insensitive anyway.
+        self.logger.log("Waiting for 'Other Options' dialog...", step="SIGNIN")
+        result = self._ax_click_button(
+            ["Other Options", "Other options"], deadline_sec=30)
         self.logger.log(f"Other options: {result}", step="SIGNIN")
         if "clicked" in result:
             time.sleep(2.0)
 
-        # Step 7: Wait for "Do not upgrade" button and click it
-        self.logger.log("Waiting for 'Do not upgrade' dialog...", step="SIGNIN")
-        result = self._ax_click_button("Do not upgrade", deadline_sec=20)
+        # Step 7: Wait for "Do Not Upgrade" button and click it
+        self.logger.log("Waiting for 'Do Not Upgrade' dialog...", step="SIGNIN")
+        result = self._ax_click_button(
+            ["Do Not Upgrade", "Do not upgrade", "Don't Upgrade", "Don’t Upgrade"],
+            deadline_sec=20)
         self.logger.log(f"Do not upgrade: {result}", step="SIGNIN")
         if "clicked" in result:
             time.sleep(2.0)
@@ -5696,28 +5818,103 @@ end tell
 
         return "signed_in" if completion == "signed_in" else f"sign_in_{completion}"
 
+    # Button labels (lowercased) that mean the show is NOT yet followed.
+    _FOLLOW_LABELS = ("follow", "+ follow", "＋ follow")
+
+    def _find_follow_button(self, nodes: "list | None" = None) -> "tuple[int, int] | None":
+        """Center of the Follow button if the show is currently NOT followed, else None."""
+        nodes = nodes if nodes is not None else self._ax_nodes()
+        for role, text, x, y, w, h in nodes:
+            if role == "AXButton" and text and text.strip().lower() in self._FOLLOW_LABELS:
+                return x + w // 2, y + h // 2
+        return None
+
+    def _follow_button_state(self, nodes: "list | None" = None) -> str:
+        """Inspect the current show page and report follow control state.
+
+        Returns 'not_followed' when a Follow button is present, else 'absent'.
+        NOTE: on current macOS Podcasts the Follow button simply DISAPPEARS once the
+        show is followed (it is replaced by Download / More — there is no persistent
+        'Following'/'Unfollow' text button), so 'absent' on a rendered show page means
+        'already followed'.  Callers distinguish the two via the page-title check.
+        """
+        return "not_followed" if self._find_follow_button(nodes) else "absent"
+
+    def _dismiss_continue_in_nodes(self, nodes: "list") -> bool:
+        """If a 'Continue' button is in the given AX snapshot, Quartz-click it.
+
+        Used by the navigation gate to clear a blocking What's New/subscription modal
+        without a second AX walk.  Returns True if it clicked.
+        """
+        try:
+            import Quartz  # type: ignore[import]
+        except ImportError:
+            return False
+        for role, t, x, y, w, h in nodes:
+            if role == "AXButton" and t and t.strip().lower() == "continue" and w > 0 and h > 0:
+                cx, cy = x + w // 2, y + h // 2
+                for k in (Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp):
+                    ev = Quartz.CGEventCreateMouseEvent(
+                        None, k, Quartz.CGPointMake(cx, cy), Quartz.kCGMouseButtonLeft)
+                    Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+                    time.sleep(0.05)
+                self.logger.log(f"Nav gate: dismissed Continue modal at ({cx},{cy})", step="10")
+                return True
+        return False
+
     def click_follow_button(self) -> str:
-        """Click the Follow button on the current show page using fast AX walk."""
+        """Follow the current show, VERIFYING the Follow button disappears.
+
+        The old version clicked the first Follow button and immediately returned
+        'followed' with no verification — a click that didn't register (e.g. because
+        the "What's New"/subscription modal was covering the button, or the page was
+        still settling after navigating from a previous show) was silently reported as
+        success, so one show in a multi-show run was left unfollowed.  This dismisses
+        any blocking modal, clicks Follow, then confirms the Follow button is gone
+        (the followed state on this build), retrying a few times.
+
+        Returns 'followed_verified', 'already_following', or 'follow_unconfirmed'
+        (non-fatal — the caller logs/records it).
+        """
         try:
             import Quartz  # type: ignore[import]
         except ImportError:
             return "error:quartz_unavailable"
 
-        time.sleep(2)
-        for attempt in range(4):
+        def _click(cx: int, cy: int) -> None:
+            pt = Quartz.CGPointMake(cx, cy)
+            for kind in (Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp):
+                ev = Quartz.CGEventCreateMouseEvent(None, kind, pt, Quartz.kCGMouseButtonLeft)
+                Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+                time.sleep(0.05)
+
+        time.sleep(1.5)
+        for attempt in range(6):
+            # A "What's New"/subscription modal can surface at any time and COVER the
+            # Follow button — dismiss it before every attempt so our click lands on it.
+            self.dismiss_continue_popup(deadline_sec=2)
             nodes = self._ax_nodes()
-            for role, text, x, y, w, h in nodes:
-                if role == "AXButton" and text in ("Follow", "+ Follow"):
-                    cx, cy = x + w // 2, y + h // 2
-                    pt = Quartz.CGPointMake(cx, cy)
-                    for kind in (Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp):
-                        ev = Quartz.CGEventCreateMouseEvent(None, kind, pt, Quartz.kCGMouseButtonLeft)
-                        Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
-                        time.sleep(0.05)
-                    return "followed"
-            if attempt < 3:
-                time.sleep(2)
-        return "follow_button_not_found"
+            follow_pt = self._find_follow_button(nodes)
+
+            if follow_pt is None:
+                # No Follow button.  If the show page has rendered (title present), the
+                # button is gone because the show is already followed.  Otherwise the
+                # header just hasn't rendered yet — wait and retry.
+                if self._content_show_title(nodes):
+                    return "already_following" if attempt == 0 else "followed_verified"
+                time.sleep(1.5)
+                continue
+
+            # Follow button present — click it, then confirm it disappeared.
+            _click(*follow_pt)
+            # Fixed settle after every Follow click so the app registers it.
+            time.sleep(3)
+            self.dismiss_continue_popup(deadline_sec=2)
+            if self._find_follow_button() is None:
+                return "followed_verified"
+            # Click didn't take (modal, or landed off-target) — loop and retry.
+
+        return "follow_unconfirmed"
 
     def dismiss_continue_popup(self, deadline_sec: int = 5) -> str:
         """Dismiss the "What's New in Apple Podcasts" onboarding modal by clicking
@@ -5855,7 +6052,12 @@ end tell
             except Exception:
                 return None
 
-        def _find_sign_out_in_sys_settings() -> "tuple[int, int] | None":
+        def _find_in_sys_settings(needles: "list[str]") -> "tuple[int, int] | None":
+            """Center of the first System Settings element whose Description/Value/Title
+            contains any needle (case-insensitive).  Rebuilds the AX tree each call so it
+            reflects the currently-visible pane."""
+            if not _ax_ok:
+                return None
             try:
                 ss_pid = int(subprocess.run(
                     ["osascript", "-e",
@@ -5864,6 +6066,7 @@ end tell
                 ).stdout.strip())
             except Exception:
                 return None
+            wanted = [n.lower() for n in needles]
             root = AXUIElementCreateApplication(ss_pid)
             stack = [root]
             seen = 0
@@ -5872,7 +6075,7 @@ end tell
                 seen += 1
                 for attr in (kAXDescriptionAttribute, kAXValueAttribute, kAXTitleAttribute):
                     v = _attr(el, attr)
-                    if isinstance(v, str) and "Sign Out" in v:
+                    if isinstance(v, str) and any(n in v.lower() for n in wanted):
                         pv = _attr(el, kAXPositionAttribute)
                         sv = _attr(el, kAXSizeAttribute)
                         if pv and sv:
@@ -5889,12 +6092,20 @@ end tell
                     stack.extend(ch)
             return None
 
-        _qclick(wx + 84, wy + 113)  # Apple Account sidebar row
-        time.sleep(1.5)
-        _qclick(int(wx + ww * 0.65), int(wy + wh * 0.82))  # Media & Purchases
+        # Navigate the System Settings panes by AX label (resolution/scaling-independent),
+        # falling back to the old fixed coordinates only when AX can't resolve an element.
+        # 1) Apple Account sidebar row (labeled with the account name in the sidebar; the
+        #    pane header reads "Apple Account" on Sequoia+, "Apple ID" on older macOS).
+        acct_pos = _find_in_sys_settings(["Apple Account", "Apple ID"])
+        _qclick(*(acct_pos or (wx + 84, wy + 113)))
+        time.sleep(1.8)
+        # 2) Media & Purchases (holds the Podcasts/media Sign Out button).
+        media_pos = _find_in_sys_settings(["Media & Purchases", "Media and Purchases"])
+        _qclick(*(media_pos or (int(wx + ww * 0.65), int(wy + wh * 0.82))))
         time.sleep(2.0)
 
-        sign_out_pos = _find_sign_out_in_sys_settings() if _ax_ok else None
+        # 3) The Sign Out button itself.
+        sign_out_pos = _find_in_sys_settings(["Sign Out"])
         if sign_out_pos:
             _qclick(*sign_out_pos)
             r2 = f"clicked_ax:{sign_out_pos[0]},{sign_out_pos[1]}"
@@ -5940,11 +6151,40 @@ end tell
             r3 = run_osascript(step3, timeout=12, label="signout_confirm").strip()
         except Exception as exc:
             r3 = f"error:{exc}"
+
+        # The AppleScript confirm above only sees buttons that are DIRECT children of the
+        # sheet/window — on newer macOS the confirmation "Sign Out" button is nested in
+        # groups, which is why it returned no_confirmation on every run.  Fall back to the
+        # deep AX search + Quartz click, which walks the full tree.
+        if "confirmed" not in r3:
+            deadline = time.time() + 6
+            while time.time() < deadline:
+                pos = _find_in_sys_settings(["Sign Out"])
+                if pos:
+                    _qclick(*pos)
+                    r3 = f"confirmed_ax:{pos[0]},{pos[1]}"
+                    break
+                time.sleep(0.4)
         time.sleep(2.0)
         try:
             run_osascript('tell application "System Settings" to quit', timeout=5, label="close_sys_settings")
         except Exception:
             pass
+
+        # Verify the sign-out actually took effect instead of reporting a false success.
+        # Give Podcasts a moment to reflect the change, then read the Account menu.
+        self.activate()
+        time.sleep(1.5)
+        final_state = "unknown"
+        for _ in range(4):
+            final_state = self.check_sign_in_state()
+            if final_state != "signed_in":
+                break
+            time.sleep(2.0)
+        if final_state == "signed_in":
+            self.logger.log(
+                f"Sign-out UNVERIFIED — still signed in after confirm ({r3})", step="14a")
+            return f"signout_unverified:{r3}"
         return f"signed_out:{r3}"
 
     def quit_app(self) -> None:
@@ -6363,6 +6603,31 @@ class Orchestrator:
         self.logger.log(f"Live diagnostic complete: {result}", step="03", **result)
         return result
 
+    @staticmethod
+    def _clean_show_title(chrome_title: str) -> str:
+        """Strip Apple Podcasts suffixes from a Chrome tab title to get the show name.
+
+        Returns "" if nothing usable remains (caller falls back to the AX heading).
+        """
+        cleaned = (chrome_title or "").strip()
+        suffixes = (
+            " - Apple Podcasts", " – Apple Podcasts", " — Apple Podcasts",
+            " | Apple Podcasts",
+            " - Podcast", " – Podcast", " — Podcast",
+            " - Podcasts", " – Podcasts", " — Podcasts",
+        )
+        changed = True
+        while changed:
+            changed = False
+            for sfx in suffixes:
+                if cleaned.endswith(sfx):
+                    cleaned = cleaned[: -len(sfx)].strip()
+                    changed = True
+                    break
+        if cleaned.lower() in ("", "podcasts", "apple podcasts"):
+            return ""
+        return cleaned
+
     def _process_tab(self, tab_task: TabTask, cycle: int) -> None:
         self.state.update(current_tab=tab_task.tab, current_video=None)
         self.logger.log(f"Switching Chrome to tab {tab_task.tab}", step="07", tab=tab_task.tab)
@@ -6386,12 +6651,46 @@ class Orchestrator:
                 original_url=url, opened_url=podcast_url,
             )
 
+        # Derive the expected show name from the Chrome tab title up-front so we can
+        # confirm Podcasts actually navigated to THIS show before following/downloading.
+        expected_show = self._clean_show_title(title)
+
         self.logger.log(f"Opening URL in Podcasts app: {podcast_url}", step="09")
         self.podcasts.open_url(podcast_url)
         self.podcasts.activate()
         self.podcasts.wait_for_window()
-        # No fixed settle: click_see_all() already polls for the element to render,
-        # so any wait here is dead time before that poll even starts.
+        # Navigation gate: on tab 2+ the window already exists from the previous show,
+        # so wait_for_window returns instantly and Follow/download could run against the
+        # PREVIOUS (already-followed) show — the root cause of "misses one podcast".
+        # Block until the visible show matches the requested one.  Timeout allows for a
+        # cold Podcasts launch (the between-cycle quit means the first tab of each new
+        # cycle relaunches the app).
+        load_state = self.podcasts.wait_for_show_loaded(expected_show, timeout_sec=40)
+        if load_state == "timeout":
+            # A cold launch can drop the first deep link — re-open once and wait again.
+            self.logger.log(
+                f"Show load timeout on tab {tab_task.tab}; re-opening {podcast_url} once",
+                step="10", tab=tab_task.tab, status="reopen",
+            )
+            self.podcasts.open_url(podcast_url)
+            self.podcasts.activate()
+            self.podcasts.wait_for_window()
+            load_state = self.podcasts.wait_for_show_loaded(expected_show, timeout_sec=40)
+        self.logger.log(f"Show load state: {load_state}", step="10",
+                        tab=tab_task.tab, expected_show=expected_show, status=load_state)
+        if load_state == "timeout":
+            # Still nothing rendered — log loudly and record, but do NOT abort: killing a
+            # multi-cycle run over one slow load is worse than attempting the tab anyway
+            # (follow/download degrade gracefully if the page really isn't there).
+            self.logger.log(
+                f"WARNING: Podcasts did not load show for tab {tab_task.tab} "
+                f"({expected_show!r}) — continuing anyway",
+                step="10", tab=tab_task.tab, status="show_load_timeout",
+            )
+            self.state.append_list(
+                "load_warnings",
+                {"cycle": cycle, "tab": tab_task.tab, "show": expected_show},
+            )
         self.logger.log("Podcasts page loaded", step="10")
 
         # Sign in after the Podcasts window is up.
@@ -6415,32 +6714,27 @@ class Orchestrator:
         # sign-in and blocks the Follow button — dismiss it before Follow.
         self.podcasts.dismiss_continue_popup()
 
-        # Click Follow on the show page (non-fatal if not found — show may already be followed)
+        # Follow the show, verifying the click actually took effect. A follow that
+        # can't be confirmed is a real miss (downstream cleanup keys off it), so record
+        # it loudly — but do NOT abort: episodes can still download, and killing a
+        # multi-cycle run over one uncertain follow is worse than the miss.
         follow_result = self.podcasts.click_follow_button()
-        self.logger.log(f"Follow button: {follow_result}", step="10b")
+        self.logger.log(f"Follow button: {follow_result}", step="10b",
+                        tab=tab_task.tab, status=follow_result)
+        if follow_result == "follow_unconfirmed":
+            self.logger.log(
+                f"WARNING: follow could not be confirmed for tab {tab_task.tab} "
+                f"({expected_show!r}) — continuing; show may be left unfollowed",
+                step="10b", tab=tab_task.tab, status="follow_unconfirmed",
+            )
+            self.state.append_list(
+                "follow_warnings",
+                {"cycle": cycle, "tab": tab_task.tab, "show": expected_show},
+            )
 
-        # Capture show name for state-driven cleanup.
-        # Primary: Chrome tab title (most reliable — e.g. "The Daily - Apple Podcasts").
-        # Secondary: Podcasts AX window title / heading.
-        chrome_title = title.strip()
-        _podcast_suffixes = (
-            " - Apple Podcasts", " – Apple Podcasts", " — Apple Podcasts",
-            " | Apple Podcasts",
-            " - Podcast", " – Podcast", " — Podcast",
-            " - Podcasts", " – Podcasts", " — Podcasts",
-        )
-        _changed = True
-        while _changed:
-            _changed = False
-            for _sfx in _podcast_suffixes:
-                if chrome_title.endswith(_sfx):
-                    chrome_title = chrome_title[: -len(_sfx)].strip()
-                    _changed = True
-                    break
-        if chrome_title and chrome_title.lower() not in ("", "podcasts", "apple podcasts"):
-            show_name = chrome_title
-        else:
-            show_name = self.podcasts.capture_show_name()
+        # Show name for state-driven cleanup: prefer the cleaned Chrome tab title
+        # (most reliable), else the Podcasts AX window title / heading.
+        show_name = expected_show or self.podcasts.capture_show_name()
         self.logger.log(f"Show name captured: {show_name!r}", step="10", show_name=show_name)
 
         # Record this tab in processed_shows so cleanup can find it by name
