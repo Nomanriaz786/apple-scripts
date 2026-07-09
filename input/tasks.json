@@ -1,8 +1,8 @@
 {
-  "repeat": 5,
+  "repeat": 3,
   "vpn": {
     "enabled": true,
-    "app": "ProtonVPN",
+    "app": "ExpressVPN",
     "location": "United States",
     "require_provider_in_org": false,
     "state_count": 20,
@@ -18,7 +18,7 @@
       "videos": [
         1,
         5,
-        20
+        7
       ]
     },
     {
