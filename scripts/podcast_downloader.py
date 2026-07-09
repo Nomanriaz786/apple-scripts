@@ -6187,6 +6187,48 @@ end tell
             return f"signout_unverified:{r3}"
         return f"signed_out:{r3}"
 
+    def is_signed_out(self) -> bool:
+        """True only when we can POSITIVELY confirm no Apple ID is signed in.
+
+        Conservative on purpose: it must see BOTH no signed-in email AND the Account
+        menu offering 'Sign In'. Any ambiguous/unknown reading returns False (treated
+        as still signed in) so the caller keeps trying rather than removing shows.
+        """
+        self.activate()
+        if "@" in self.get_signed_in_email():
+            return False
+        return self.check_sign_in_state() == "signed_out"
+
+    def sign_out_confirmed(self, max_attempts: int = 4) -> bool:
+        """Sign out and VERIFY it, retrying until confirmed signed out.
+
+        Returns True only when the sign-out is confirmed (is_signed_out()). The
+        underlying sign_out_of_podcasts() return string is NOT trusted — it has been
+        seen to both under- and over-report — so success is decided solely by an
+        independent post-check of the Account menu.
+        """
+        for attempt in range(1, max_attempts + 1):
+            if self.is_signed_out():
+                self.logger.log(
+                    f"Sign-out confirmed (attempt {attempt}: already signed out)", step="14a")
+                return True
+            result = self.sign_out_of_podcasts()
+            self.logger.log(
+                f"Sign-out attempt {attempt}/{max_attempts}: {result}", step="14a")
+            for _ in range(6):
+                time.sleep(2)
+                if self.is_signed_out():
+                    self.logger.log(
+                        f"Sign-out CONFIRMED after attempt {attempt}", step="14a")
+                    return True
+            self.logger.log(
+                f"Sign-out attempt {attempt} did not confirm — retrying", step="14a")
+        confirmed = self.is_signed_out()
+        self.logger.log(
+            f"Sign-out final state after {max_attempts} attempts: "
+            f"{'confirmed' if confirmed else 'STILL SIGNED IN'}", step="14a")
+        return confirmed
+
     def quit_app(self) -> None:
         # Both PyXA.quit() and `osascript ... quit` are GRACEFUL but SYNCHRONOUS:
         # they block until Podcasts has fully terminated, which can take 10-30s after
@@ -6390,8 +6432,21 @@ class Orchestrator:
                 if self.config.accounts:
                     self.logger.log("Signing out before cleanup", step="14a")
                     self.podcasts.activate()
-                    signout_result = self.podcasts.sign_out_of_podcasts()
-                    self.logger.log(f"Sign-out result: {signout_result}", step="14a")
+                    signed_out = self.podcasts.sign_out_confirmed(max_attempts=4)
+                    self.logger.log(f"Sign-out confirmed before cleanup: {signed_out}",
+                                    step="14a", cycle=cycle, signed_out=signed_out)
+                    if not signed_out:
+                        # HARD GATE: never remove shows while an Apple ID is still signed
+                        # in. Abort before cleanup so downloads stay in place and the
+                        # cycle is neither completed nor its account dropped.
+                        self.state.record_failure(
+                            step="14a", error="signout_unconfirmed_cleanup_blocked",
+                            cycle=cycle,
+                        )
+                        raise AutomationError(
+                            f"Cycle {cycle}: Apple ID sign-out could not be confirmed after "
+                            f"retries — refusing to remove shows while still signed in"
+                        )
 
                 if self.config.cleanup:
                     self._cleanup_phase(cycle, downloads_already_done=downloads_done)
