@@ -87,7 +87,7 @@ class VPNCalibration:
 @dataclass(frozen=True)
 class VPNConfig:
     enabled: bool
-    app: str = "Proton VPN"
+    app: str = "ExpressVPN"
     location: str = "United States"
     location_code: str = "US"
     servers: tuple[str, ...] = ()
@@ -124,7 +124,7 @@ def _parse_vpn(raw_vpn: Any) -> VPNConfig:
         raise ValueError("'vpn' must be a boolean or an object {enabled, app, location}")
 
     enabled = bool(raw_vpn.get("enabled", True))
-    app = str(raw_vpn.get("app", "Proton VPN")).strip() or "Proton VPN"
+    app = str(raw_vpn.get("app", "ExpressVPN")).strip() or "ExpressVPN"
     location = str(raw_vpn.get("location", "United States")).strip() or "United States"
     location_code = _COUNTRY_CODE_FALLBACK.get(location.lower(), location.upper()[:2] or "US")
 
@@ -635,77 +635,34 @@ class VPNController:
         org_ok = provider_name.lower() in (ip_info.get("org") or "").lower()
         return country_ok and org_ok
 
+    # ExpressVPN main-window layout fractions (validated live). Clicks are anchored to
+    # the live window position, so they survive the window being moved.
+    _EVPN_CARD = (0.50, 0.46)      # Selected-Location card -> opens the location picker
+    _EVPN_SEARCH = (0.50, 0.113)   # search field in the picker
+    _EVPN_ROW0_Y = 0.261           # first result row centre (fraction of window height)
+    _EVPN_ROW_DY = 0.0621          # spacing between result rows
+    _EVPN_ROW_X = 0.45             # x fraction to click within a result row
+    _EVPN_ROWS = 8                 # top US result rows to rotate across
+
     def connect_with_config(self, cycle: int, vpn_cfg: VPNConfig) -> str:
-        """Top-level entry point. Handles cache lookup, discovery, rotation, and verification."""
+        """Connect ExpressVPN to a rotating US location and verify via the network.
+
+        ExpressVPN's main window is not accessibility-inspectable, so connecting is
+        driven by the validated main-window flow: open the Selected-Location card,
+        type the country into the search bar, then click one of the top result rows
+        (a distinct US city each cycle, for IP variety). Disconnect uses the
+        accessibility-exposed status-bar menu. Verification is the same network-based
+        _poll_verify (tunnel + route + IP change + country) used before.
+        """
         provider_token = self._provider_token(vpn_cfg.app)
 
-        # Pick the server list: explicit override > cached discovery > fresh discovery.
-        servers = list(vpn_cfg.servers)
-        if not servers:
-            discovered = self.state.data.setdefault("discovered_servers_by_location", {})
-            cached = discovered.get(vpn_cfg.location, [])
-            # Use the cache only if it has >1 server.  A single-server cache means
-            # the previous discovery run was incomplete (ProtonVPN's US list has many
-            # servers); with only 1 server the rotation index never advances and the
-            # same IP is used on every cycle.  Treat it as stale and re-discover.
-            if cached and len(cached) > 1:
-                servers = list(cached)
-                self.logger.log(
-                    f"Using cached server list for {vpn_cfg.location} ({len(servers)} servers)",
-                    step="06", location=vpn_cfg.location, source="cache",
-                )
-            else:
-                if cached:
-                    self.logger.log(
-                        f"Cached server list for {vpn_cfg.location} has only {len(cached)} "
-                        f"server — treating as stale, re-discovering",
-                        step="06", location=vpn_cfg.location,
-                    )
-                else:
-                    self.logger.log(
-                        f"No cached servers for {vpn_cfg.location}; running discovery in {vpn_cfg.app}",
-                        step="06", location=vpn_cfg.location, app=vpn_cfg.app,
-                    )
-                if not self._open_provider_app(vpn_cfg.app):
-                    raise AutomationError(
-                        f"{vpn_cfg.app} app not found. Install and sign in first."
-                    )
-                servers = self._discover_servers(
-                    vpn_cfg.location, vpn_cfg.location_code, vpn_cfg.app
-                )
-                if not servers:
-                    raise AutomationError(
-                        f"No servers discovered for {vpn_cfg.location} in {vpn_cfg.app}. "
-                        f"Open {vpn_cfg.app}, search '{vpn_cfg.location}', expand the country, "
-                        f"and try again — OR set vpn.servers explicitly in input/tasks.json."
-                    )
-                discovered[vpn_cfg.location] = servers
-                self.state.save()
-                self.logger.log(
-                    f"Discovered {len(servers)} servers for {vpn_cfg.location}: {servers[:5]}"
-                    + ("..." if len(servers) > 5 else ""),
-                    step="06", location=vpn_cfg.location, server_count=len(servers),
-                )
-
-        # If the user specified a fixed state count, regenerate the slot list with
-        # that count — overrides whatever AX discovery returned (AX lazy-renders only
-        # the visible rows, so it systematically undercounts scrollable lists).
-        if vpn_cfg.state_count > 0 and len(servers) != vpn_cfg.state_count:
-            lc = vpn_cfg.location_code.upper()
-            servers = [f"{lc}-SLOT-{i + 1}" for i in range(vpn_cfg.state_count)]
-            discovered = self.state.data.setdefault("discovered_servers_by_location", {})
-            discovered[vpn_cfg.location] = servers
-            self.state.save()
-            self.logger.log(
-                f"state_count override: {vpn_cfg.state_count} slots for {vpn_cfg.location}",
-                step="06", location=vpn_cfg.location, state_count=vpn_cfg.state_count,
-            )
-
-        # Ensure app is open.
         if not self._open_provider_app(vpn_cfg.app):
-            raise AutomationError(f"{vpn_cfg.app} app not found.")
+            raise AutomationError(f"{vpn_cfg.app} app not found. Install and sign in first.")
+        time.sleep(1.5)
 
-        # Baseline network state — capture route before any disconnect/connect.
+        row_count = vpn_cfg.state_count if vpn_cfg.state_count > 0 else self._EVPN_ROWS
+        row_count = max(1, min(row_count, self._EVPN_ROWS))
+
         baseline_route = self.net.default_route_gateway()
         baseline = self.net.snapshot()
         baseline_ip = baseline.get("public_ip")
@@ -718,21 +675,14 @@ class VPNController:
             step="06", baseline=baseline,
         )
 
-        # Disconnect any current tunnel so we connect to the requested server fresh.
-        disc = self._click_disconnect(vpn_cfg.app)
+        disc = self._evpn_disconnect(vpn_cfg.app)
         self.logger.log(f"Pre-connect disconnect: {disc}", step="06", status=disc)
         if disc == "disconnect_clicked":
-            time.sleep(1.5)
-        ui_state = self._read_ui_connection_state(vpn_cfg.app)
+            time.sleep(2.0)
+        ui_state = self._evpn_state(vpn_cfg.app)
         self.logger.log(f"{vpn_cfg.app} UI connection state: {ui_state}", step="06",
                         ui_connection_state=ui_state)
 
-        # Re-capture baseline AFTER disconnect so baseline_ip reflects the bare (non-VPN) IP.
-        # This handles the case where ProtonVPN auto-reconnects during the subsequent setup
-        # AppleScript (which can take several seconds): the post-connect IP equals the
-        # pre-disconnect VPN IP, making ip==baseline_ip (even though connection succeeded).
-        # If the IP hasn't changed yet (auto-reconnect or slow teardown), disable the
-        # ip-change guard by using None — country + tunnel-interface checks are sufficient.
         post_disc_snap = self.net.snapshot()
         post_disc_ip = post_disc_snap.get("public_ip")
         if post_disc_ip and post_disc_ip != baseline_ip:
@@ -745,71 +695,48 @@ class VPNController:
                 step="06",
             )
 
-        # Build a try-order: start at the next server in a PERSISTENT rotation and
-        # wrap through all. The pointer is stored in state per location and advances
-        # by one on every connection, so the repeated flow walks through ALL servers
-        # instead of always starting at slot 1 on each fresh run. (The old
-        # `(cycle - 1) % len` reset to slot 1 every run, which is why only one IP was
-        # ever used.) Persist the advance immediately so a crash/next run continues
-        # from the next server.
         rot = self.state.data.setdefault("vpn_rotation_index", {})
-        start_idx = int(rot.get(vpn_cfg.location, 0)) % len(servers)
-        rot[vpn_cfg.location] = (start_idx + 1) % len(servers)
+        start_idx = int(rot.get(vpn_cfg.location, 0)) % row_count
+        rot[vpn_cfg.location] = (start_idx + 1) % row_count
         self.state.save()
         self.logger.log(
-            f"VPN rotation: starting at slot index {start_idx} "
-            f"({servers[start_idx]}); next run will use index {rot[vpn_cfg.location]}",
+            f"VPN rotation: starting at US row {start_idx}; "
+            f"next run will use row {rot[vpn_cfg.location]}",
             step="06", rotation_index=start_idx,
         )
-        servers_to_try = [servers[(start_idx + off) % len(servers)]
-                          for off in range(len(servers))]
-        last_exc: AutomationError | None = None
-        slot_baseline_ip = baseline_ip  # refreshed per attempt
-        slot_baseline_route = baseline_route  # refreshed per attempt
-        # Capture the VPN IP used in the previous *successful* cycle so we can skip states
-        # that are in the same server cluster (same IP) and advance to a fresh one.
+        rows_to_try = [(start_idx + off) % row_count for off in range(row_count)]
+        last_exc: "AutomationError | None" = None
+        slot_baseline_ip = baseline_ip
+        slot_baseline_route = baseline_route
         prev_vpn_ip = self.state.data.get("last_vpn_ip")
 
-        for attempt_i, target_server in enumerate(servers_to_try):
+        for attempt_i, row in enumerate(rows_to_try):
             if attempt_i > 0:
-                self.logger.log(
-                    f"Slot {servers_to_try[attempt_i - 1]} failed; retrying with {target_server}",
-                    step="06", server=target_server,
-                )
-                disc2 = self._click_disconnect(vpn_cfg.app)
+                disc2 = self._evpn_disconnect(vpn_cfg.app)
                 self.logger.log(f"Retry pre-disconnect: {disc2}", step="06", status=disc2)
-                wait_s = 5.0 if disc2 == "disconnect_clicked" else 2.0
-                time.sleep(wait_s)
+                time.sleep(5.0 if disc2 == "disconnect_clicked" else 2.0)
                 snap2 = self.net.snapshot()
                 slot_baseline_ip = snap2.get("public_ip")
                 slot_baseline_route = self.net.default_route_gateway()
                 self.logger.log(
-                    f"Retry baseline: ip={slot_baseline_ip} route={slot_baseline_route}", step="06",
+                    f"Retry baseline: ip={slot_baseline_ip} route={slot_baseline_route}",
+                    step="06",
                 )
 
             self.logger.log(
-                f"Cycle {cycle} target {vpn_cfg.app} server: {target_server} "
-                f"(attempt {attempt_i + 1}/{len(servers_to_try)})",
-                step="06", cycle=cycle, target_server=target_server,
+                f"Cycle {cycle} target {vpn_cfg.app} US row {row} "
+                f"(attempt {attempt_i + 1}/{row_count})",
+                step="06", cycle=cycle, target_row=row,
             )
 
-            ui_status = self._click_server_by_name(
-                vpn_cfg.app, target_server, vpn_cfg.location,
-                force_retype=(attempt_i > 0), calibration=vpn_cfg.calibration,
-            )
+            ui_status = self._evpn_connect_us(vpn_cfg.app, row, vpn_cfg.location)
             self.logger.log(
-                f"{vpn_cfg.app} server '{target_server}': {ui_status}",
-                step="06", status=ui_status, server=target_server,
+                f"{vpn_cfg.app} connect US row {row}: {ui_status}",
+                step="06", status=ui_status, row=row,
             )
-            if ui_status not in (
-                "server_clicked",
-                "row_clicked",
-                "connect_button_clicked",
-                "quick_connect_clicked",
-                "connect_clicked",
-            ):
+            if ui_status != "connect_clicked":
                 last_exc = AutomationError(
-                    f"Could not click server '{target_server}' in {vpn_cfg.app}: {ui_status}"
+                    f"Could not connect ExpressVPN US row {row}: {ui_status}"
                 )
                 continue
 
@@ -825,33 +752,27 @@ class VPNController:
                 if result == "connected_verified":
                     snap = self.net.snapshot()
                     new_ip = snap.get("public_ip")
-                    # Skip this state if it landed on the same IP as the previous successful
-                    # cycle — that means it's in the same server cluster.  Disconnect and
-                    # advance to the next state rather than deliver a repeat address.
                     if (new_ip and prev_vpn_ip
                             and new_ip == prev_vpn_ip
                             and prev_vpn_ip != baseline_ip):
                         self.logger.log(
                             f"IP {new_ip} repeats previous cycle — "
-                            f"disconnecting and skipping {target_server}",
-                            step="06", server=target_server, status="ip_repeat_skip",
+                            f"disconnecting and skipping US row {row}",
+                            step="06", row=row, status="ip_repeat_skip",
                         )
-                        self._click_disconnect(vpn_cfg.app)
+                        self._evpn_disconnect(vpn_cfg.app)
                         time.sleep(2.5)
                         last_exc = AutomationError(
-                            f"IP {new_ip} repeated (prev={prev_vpn_ip}); "
-                            f"skipping {target_server}"
+                            f"IP {new_ip} repeated (prev={prev_vpn_ip}); skipping row {row}"
                         )
                         continue
-                    self._record_server(target_server)
-                    # Persist the VPN IP so the next cycle can detect repeats.
+                    self._record_server(f"US-ROW-{row}")
                     if new_ip:
                         self.state.data["last_vpn_ip"] = new_ip
-                    # Record full verified session (slot name, not assumed real server name)
                     sessions = self.state.data.setdefault("vpn_sessions", [])
                     sessions.append({
                         "cycle": cycle,
-                        "slot": target_server,
+                        "slot": f"US-ROW-{row}",
                         "verified": True,
                         "utun": (snap.get("tunnel_interfaces") or [None])[0],
                         "public_ip": new_ip,
@@ -864,7 +785,166 @@ class VPNController:
                 last_exc = exc
                 continue
 
-        raise last_exc or AutomationError("All VPN slots exhausted without a verified connection")
+        raise last_exc or AutomationError(
+            "All ExpressVPN US rows exhausted without a verified connection"
+        )
+
+    def _evpn_window_bounds(self, app_name: str) -> "tuple[int, int, int, int] | None":
+        """Live (x, y, w, h) of the ExpressVPN main window, or None."""
+        script = (
+            f'tell application "System Events" to tell process "{app_name}"\n'
+            '    if (count of windows) = 0 then return "no_window"\n'
+            '    set p to position of window 1\n'
+            '    set s to size of window 1\n'
+            '    return ((item 1 of p) as text) & "," & ((item 2 of p) as text) & "," & '
+            '((item 1 of s) as text) & "," & ((item 2 of s) as text)\n'
+            'end tell'
+        )
+        try:
+            out = run_osascript(script, timeout=8, label="evpn_window_bounds").strip()
+        except AutomationError:
+            return None
+        if out == "no_window" or "," not in out:
+            return None
+        try:
+            wx, wy, ww, wh = [int(v.strip()) for v in out.split(",")]
+            return wx, wy, ww, wh
+        except Exception:
+            return None
+
+    def _evpn_state(self, app_name: str) -> str:
+        """Connection state from the ExpressVPN status-bar menu (accessibility-based).
+
+        Returns 'connected', 'disconnected', or 'unknown:...'. An enabled 'Disconnect'
+        item in the status menu means connected.
+        """
+        script = (
+            'tell application "System Events"\n'
+            f'    tell process "{app_name}"\n'
+            '        try\n'
+            '            set sm to menu bar item 1 of menu bar 2\n'
+            '            click sm\n'
+            '            delay 0.8\n'
+            '            set isConn to false\n'
+            '            repeat with mi in menu items of menu 1 of sm\n'
+            '                set t to ""\n'
+            '                try\n'
+            '                    set t to title of mi\n'
+            '                end try\n'
+            '                set en to false\n'
+            '                try\n'
+            '                    set en to enabled of mi\n'
+            '                end try\n'
+            '                if t is "Disconnect" and en then set isConn to true\n'
+            '            end repeat\n'
+            '            key code 53\n'
+            '            if isConn then\n'
+            '                return "connected"\n'
+            '            else\n'
+            '                return "disconnected"\n'
+            '            end if\n'
+            '        on error e\n'
+            '            try\n'
+            '                key code 53\n'
+            '            end try\n'
+            '            return "unknown:" & e\n'
+            '        end try\n'
+            '    end tell\n'
+            'end tell'
+        )
+        try:
+            return run_osascript(script, timeout=12, label="evpn_state").strip()
+        except AutomationError as exc:
+            return f"unknown:{exc}"
+
+    def _evpn_disconnect(self, app_name: str) -> str:
+        """Click 'Disconnect' in the ExpressVPN status-bar menu if connected."""
+        script = (
+            'tell application "System Events"\n'
+            f'    tell process "{app_name}"\n'
+            '        try\n'
+            '            set sm to menu bar item 1 of menu bar 2\n'
+            '            click sm\n'
+            '            delay 0.8\n'
+            '            repeat with mi in menu items of menu 1 of sm\n'
+            '                set t to ""\n'
+            '                try\n'
+            '                    set t to title of mi\n'
+            '                end try\n'
+            '                set en to false\n'
+            '                try\n'
+            '                    set en to enabled of mi\n'
+            '                end try\n'
+            '                if t is "Disconnect" and en then\n'
+            '                    click mi\n'
+            '                    return "disconnect_clicked"\n'
+            '                end if\n'
+            '            end repeat\n'
+            '            key code 53\n'
+            '            return "no_disconnect_button"\n'
+            '        on error e\n'
+            '            try\n'
+            '                key code 53\n'
+            '            end try\n'
+            '            return "error:" & e\n'
+            '        end try\n'
+            '    end tell\n'
+            'end tell'
+        )
+        try:
+            return run_osascript(script, timeout=12, label="evpn_disconnect").strip()
+        except AutomationError as exc:
+            return f"error:{exc}"
+
+    def _evpn_connect_us(self, app_name: str, row_index: int, search_term: str) -> str:
+        """Connect via the ExpressVPN main window: open the location card, search for
+        the country, and click the Nth result row. All clicks are anchored to the live
+        window position. Returns 'connect_clicked' or an error token.
+        """
+        try:
+            import Quartz
+        except ImportError:
+            return "quartz_unavailable"
+        bounds = self._evpn_window_bounds(app_name)
+        if bounds is None:
+            return "no_window"
+        wx, wy, ww, wh = bounds
+
+        def _click(fx: float, fy: float) -> None:
+            pt = Quartz.CGPointMake(wx + int(ww * fx), wy + int(wh * fy))
+            for k in (Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp):
+                ev = Quartz.CGEventCreateMouseEvent(None, k, pt, Quartz.kCGMouseButtonLeft)
+                Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+                time.sleep(0.06)
+
+        def _key(vk: int, flags: int = 0) -> None:
+            for down in (True, False):
+                ev = Quartz.CGEventCreateKeyboardEvent(None, vk, down)
+                if flags:
+                    Quartz.CGEventSetFlags(ev, flags)
+                Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+                time.sleep(0.04)
+
+        try:
+            run_osascript(f'tell application "{app_name}" to activate',
+                          timeout=5, label="evpn_activate")
+        except AutomationError:
+            pass
+        time.sleep(0.6)
+        _key(0x35)  # Escape — close any already-open picker so the card click is valid
+        time.sleep(0.4)
+        _click(*self._EVPN_CARD)   # open the location picker
+        time.sleep(1.3)
+        _click(*self._EVPN_SEARCH)  # focus the search field
+        time.sleep(0.4)
+        subprocess.run(["pbcopy"], input=search_term.encode("utf-8"), check=True)
+        _key(0x00, Quartz.kCGEventFlagMaskCommand)  # Cmd+A (clear existing text)
+        _key(0x09, Quartz.kCGEventFlagMaskCommand)  # Cmd+V (paste search term)
+        time.sleep(1.5)
+        row_y = self._EVPN_ROW0_Y + self._EVPN_ROW_DY * row_index
+        _click(self._EVPN_ROW_X, row_y)  # click the Nth US result row -> connects
+        time.sleep(1.0)
+        return "connect_clicked"
 
     @staticmethod
     def _provider_token(app_name: str) -> str:
@@ -895,814 +975,9 @@ class VPNController:
         self.state.data["used_vpn_servers"] = used
         self.state.save()
 
-    def _process_name_candidates(self, app_name: str) -> str:
-        """AppleScript list literal of process name candidates for this app."""
-        names = [app_name, app_name.replace(" ", "")]
-        # dedupe while preserving order
-        seen: list[str] = []
-        for n in names:
-            if n not in seen:
-                seen.append(n)
-        return ", ".join('"' + n.replace('"', '\\"') + '"' for n in seen)
 
-    def _discover_servers(
-        self, location: str, location_code: str, app_name: str = "ProtonVPN"
-    ) -> list[str]:
-        """Discover the real number of available servers by expanding the country list.
 
-        Runs the same Phase 1-3 ProtonVPN UI setup as _connect_via_slot to obtain
-        window coordinates, then expands the country row and counts server rows via:
-          1. AX table row count (works on the *filtered* list, which has ~50-100 rows,
-             not the unfiltered 6000+ row table).
-          2. Pixel brightness sampling fallback if AX times out.
 
-        Returns positional slot tokens (e.g. US-SLOT-1 … US-SLOT-N) because ProtonVPN
-        lazy-renders label text — real server names are only readable after hover.
-        Leaves ProtonVPN in the expanded/filtered state so the immediately following
-        _connect_via_slot(slot=1) call finds the list already expanded.
-        """
-        try:
-            import Quartz  # type: ignore[import]
-        except ImportError:
-            self.logger.log(
-                f"Quartz unavailable for discovery — using 5 positional slots",
-                step="06", location=location,
-            )
-            return [f"{location_code.upper()}-SLOT-{i + 1}" for i in range(5)]
-
-        process_list = self._process_name_candidates(app_name)
-
-        def _dmouse(kind, x, y):
-            pt = Quartz.CGPoint(x=float(x), y=float(y))
-            ev = Quartz.CGEventCreateMouseEvent(None, kind, pt, Quartz.kCGMouseButtonLeft)
-            Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
-            time.sleep(0.05)
-
-        def _dkey(vk, down, flags=0):
-            src = Quartz.CGEventSourceCreate(Quartz.kCGEventSourceStateCombinedSessionState)
-            ev = Quartz.CGEventCreateKeyboardEvent(src, vk, down)
-            if flags:
-                Quartz.CGEventSetFlags(ev, flags)
-            Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
-            time.sleep(0.05)
-
-        def _fallback(n: int = 5) -> list[str]:
-            return [f"{location_code.upper()}-SLOT-{i + 1}" for i in range(n)]
-
-        # ── Phase 1: get search-field + window coordinates ────────────────────
-        p1_script = f"""
-        tell application "System Events"
-            set procName to ""
-            repeat with candidate in {{{process_list}}}
-                if exists process (candidate as text) then
-                    set procName to candidate as text
-                    exit repeat
-                end if
-            end repeat
-            if procName is "" then return "ERROR:no_process"
-            tell process procName
-                set frontmost to true
-                delay 0.5
-                if not (exists window 1) then return "ERROR:no_window"
-                if not (exists text field 1 of group 1 of window 1) then return "ERROR:no_sf"
-                set sf to text field 1 of group 1 of window 1
-                set sfPos to position of sf
-                set sfSz to size of sf
-                set wPos to position of window 1
-                set wSz to size of window 1
-                return "SF:" & (item 1 of sfPos) & "," & (item 2 of sfPos) & "," & ¬
-                                (item 1 of sfSz) & "," & (item 2 of sfSz) & ¬
-                       "|W:" & (item 1 of wPos) & "," & (item 2 of wPos) & "," & ¬
-                               (item 1 of wSz)  & "," & (item 2 of wSz)
-            end tell
-        end tell
-        """
-        try:
-            p1 = run_osascript(p1_script, timeout=30, label=f"discover-p1 {location}")
-        except AutomationError as exc:
-            self.logger.log(f"Discovery p1 failed ({exc}) — using 5 slots", step="06")
-            return _fallback()
-
-        if p1.startswith("ERROR:"):
-            self.logger.log(f"Discovery p1 error: {p1} — using 5 slots", step="06")
-            return _fallback()
-
-        sf_x = sf_y = sf_w = sf_h = 0
-        w_x = w_y = w_w = w_h = 0
-        for chunk in p1.split("|"):
-            if chunk.startswith("SF:"):
-                parts = chunk[3:].split(",")
-                if len(parts) == 4:
-                    sf_x, sf_y, sf_w, sf_h = (int(p) for p in parts)
-            elif chunk.startswith("W:"):
-                parts = chunk[2:].split(",")
-                if len(parts) == 4:
-                    w_x, w_y, w_w, w_h = (int(p) for p in parts)
-
-        if sf_w == 0 or w_w == 0:
-            self.logger.log(f"Discovery p1 bad data: {p1!r} — using 5 slots", step="06")
-            return _fallback()
-
-        # ── Phase 2: type the search filter character by character ────────────────────
-        sf_cx, sf_cy = sf_x + sf_w // 2, sf_y + sf_h // 2
-        _dmouse(Quartz.kCGEventLeftMouseDown, sf_cx, sf_cy)
-        _dmouse(Quartz.kCGEventLeftMouseUp,   sf_cx, sf_cy)
-        time.sleep(0.4)
-        _dkey(0x00, True,  Quartz.kCGEventFlagMaskCommand)   # Cmd+A
-        _dkey(0x00, False, Quartz.kCGEventFlagMaskCommand)
-        time.sleep(0.1)
-        _dkey(0x33, True); _dkey(0x33, False)                # Delete
-        time.sleep(0.3)
-        _dvk = {
-            'a': 0x00, 's': 0x01, 'd': 0x02, 'f': 0x03, 'h': 0x04,
-            'g': 0x05, 'z': 0x06, 'x': 0x07, 'c': 0x08, 'v': 0x09,
-            'b': 0x0B, 'q': 0x0C, 'w': 0x0D, 'e': 0x0E, 'r': 0x0F,
-            'y': 0x10, 't': 0x11, 'u': 0x20, 'i': 0x22, 'o': 0x1F,
-            'p': 0x23, 'l': 0x25, 'j': 0x26, 'k': 0x28, 'n': 0x2D,
-            'm': 0x2E, ' ': 0x31,
-        }
-        unmapped_d = [c for c in location if c.lower() not in _dvk]
-        if not unmapped_d:
-            for char in location:
-                lc = char.lower()
-                flags = Quartz.kCGEventFlagMaskShift if char != lc else 0
-                _dkey(_dvk[lc], True,  flags)
-                _dkey(_dvk[lc], False, 0)
-            self.logger.log(f"Discovery: search filter typed '{location}'", step="06")
-        else:
-            old_clip = subprocess.run(["pbpaste"], capture_output=True).stdout
-            try:
-                subprocess.run(["pbcopy"], input=location.encode(), check=True)
-                _dkey(0x09, True,  Quartz.kCGEventFlagMaskCommand)   # Cmd+V
-                _dkey(0x09, False, Quartz.kCGEventFlagMaskCommand)
-                self.logger.log(
-                    f"Discovery: search filter pasted (unmapped {unmapped_d}): '{location}'",
-                    step="06",
-                )
-            finally:
-                subprocess.run(["pbcopy"], input=old_clip, check=False)
-        time.sleep(2.5)  # wait for ProtonVPN to filter + auto-expand the country row
-
-        # ── Phase 3: scroll to top, get first-state position ─────────────────
-        p3_script = f"""
-        tell application "System Events"
-            set procName to ""
-            repeat with candidate in {{{process_list}}}
-                if exists process (candidate as text) then
-                    set procName to candidate as text
-                    exit repeat
-                end if
-            end repeat
-            if procName is "" then return "ERROR:no_process"
-            tell process procName
-                if not (exists group 1 of window 1) then return "ERROR:no_group"
-                if not (exists scroll area 1 of group 1 of window 1) then return "ERROR:no_scroll"
-                set sc to scroll area 1 of group 1 of window 1
-                -- Do NOT reset scroll bar — it clears the search filter.
-                if not (exists UI element 1 of sc) then return "ERROR:no_outer_list"
-                set outerList to UI element 1 of sc
-                set wPos to position of window 1
-                set wSz to size of window 1
-                -- Case A: filter active + country expanded — outerList IS the state list.
-                set outerDD to ""
-                try
-                    set outerDD to description of outerList as text
-                end try
-                if outerDD is "list" then
-                    if not (exists UI element 1 of outerList) then return "ERROR:empty_state_list"
-                    set firstElem to UI element 1 of outerList
-                    set fPos to position of firstElem
-                    return "R2:" & (item 2 of fPos) & "|W:" & (item 1 of wPos) & "," & (item 2 of wPos) & "," & (item 1 of wSz) & "," & (item 2 of wSz) & "|EXP:1"
-                end if
-                -- Case B: collapsed or unfiltered — walk children.
-                set stateList to missing value
-                set headerY to 0
-                repeat with c in UI elements of outerList
-                    set cdd to ""
-                    try
-                        set cdd to description of c as text
-                    end try
-                    if (class of c as text) is "button" and headerY = 0 then
-                        try
-                            set csz to size of c
-                            if (item 1 of csz) > 100 then
-                                set cpos to position of c
-                                set headerY to (item 2 of cpos) as integer
-                            end if
-                        end try
-                    end if
-                    if cdd is "list" and stateList is missing value then
-                        set stateList to c
-                    end if
-                end repeat
-                if stateList is missing value then
-                    return "R2:" & headerY & "|W:" & (item 1 of wPos) & "," & (item 2 of wPos) & "," & (item 1 of wSz) & "," & (item 2 of wSz) & "|EXP:0"
-                end if
-                if not (exists UI element 1 of stateList) then return "ERROR:empty_state_list"
-                set firstElem to UI element 1 of stateList
-                set fPos to position of firstElem
-                return "R2:" & (item 2 of fPos) & "|W:" & (item 1 of wPos) & "," & (item 2 of wPos) & "," & (item 1 of wSz) & "," & (item 2 of wSz) & "|EXP:1"
-            end tell
-        end tell
-        """
-        try:
-            p3 = run_osascript(p3_script, timeout=20, label=f"discover-p3 {location}")
-        except AutomationError as exc:
-            self.logger.log(f"Discovery p3 failed ({exc}) — using 5 slots", step="06")
-            return _fallback()
-
-        if p3.startswith("ERROR:"):
-            self.logger.log(f"Discovery p3 error: {p3} — using 5 slots", step="06")
-            return _fallback()
-
-        r2_top = 0
-        is_expanded_p3 = False
-        for chunk in p3.split("|"):
-            if chunk.startswith("R2:"):
-                try:
-                    r2_top = int(chunk[3:])
-                except ValueError:
-                    pass
-            elif chunk.startswith("W:"):
-                parts = chunk[2:].split(",")
-                if len(parts) == 4:
-                    w_x, w_y, w_w, w_h = (int(p) for p in parts)
-            elif chunk.startswith("EXP:"):
-                is_expanded_p3 = chunk[4:].strip() == "1"
-
-        if r2_top == 0:
-            self.logger.log(f"Discovery p3 bad data: {p3!r} — using 5 slots", step="06")
-            return _fallback()
-
-        # New Mac: row height = 44px; US header height ≈ row height.
-        SERVER_ROW_H = 44
-        expand_x = w_x + w_w // 2
-        expand_y = r2_top + SERVER_ROW_H // 2
-
-        # ── Phase 4: expand if needed, then count state rows ─────────────────
-        subprocess.run(
-            ["osascript", "-e",
-             f'tell application "System Events" to set frontmost of process "ProtonVPN" to true'],
-            timeout=4, check=False,
-        )
-        time.sleep(0.2)
-
-        self.logger.log(f"Discovery: p3 expanded={is_expanded_p3}", step="06")
-        if not is_expanded_p3:
-            _dmouse(Quartz.kCGEventLeftMouseDown, expand_x, expand_y)
-            _dmouse(Quartz.kCGEventLeftMouseUp,   expand_x, expand_y)
-            time.sleep(1.5)
-
-        # ── Count server rows ─────────────────────────────────────────────────
-        # Primary: AX row count (fast on the *filtered* table, ~50-100 rows max).
-        # After filtering to a single country the table is small; the 6000+ row
-        # problem only appears on the unfiltered table.
-        count_script = f"""
-        tell application "System Events"
-            set procName to ""
-            repeat with candidate in {{{process_list}}}
-                if exists process (candidate as text) then
-                    set procName to candidate as text
-                    exit repeat
-                end if
-            end repeat
-            if procName is "" then return "ERROR:no_process"
-            tell process procName
-                if not (exists scroll area 1 of group 1 of window 1) then return "ERROR:no_scroll"
-                set sc to scroll area 1 of group 1 of window 1
-                if not (exists UI element 1 of sc) then return "ERROR:no_outer_list"
-                set outerList to UI element 1 of sc
-                set stateList to missing value
-                repeat with c in UI elements of outerList
-                    set cdd to ""
-                    try
-                        set cdd to description of c as text
-                    end try
-                    if cdd is "list" then
-                        set stateList to c
-                        exit repeat
-                    end if
-                end repeat
-                if stateList is missing value then return "ERROR:no_state_list"
-                -- Each state has 2 elements (name button + three-dot button)
-                set elemCount to count of UI elements of stateList
-                set stateCount to elemCount div 2
-                if stateCount < 1 then set stateCount to 1
-                return stateCount as text
-            end tell
-        end tell
-        """
-        server_count = 0
-        try:
-            cr = run_osascript(count_script, timeout=15, label=f"discover-count {location}")
-            cr = cr.strip()
-            if not cr.startswith("ERROR:"):
-                server_count = int(cr)
-                self.logger.log(
-                    f"Discovery: AX element count → {server_count} states for {location}",
-                    step="06",
-                )
-        except (AutomationError, ValueError) as exc:
-            self.logger.log(
-                f"Discovery: AX count failed ({exc}) — defaulting to 10 states",
-                step="06",
-            )
-
-        if server_count <= 0:
-            server_count = 10
-            self.logger.log(
-                f"Discovery: AX count returned 0 — using default {server_count} states",
-                step="06",
-            )
-
-        server_count = max(server_count, 1)
-        slots = [f"{location_code.upper()}-SLOT-{i + 1}" for i in range(server_count)]
-        self.logger.log(
-            f"Discovery complete: {len(slots)} positional slots for {location}",
-            step="06", location=location, slot_count=len(slots),
-        )
-        return slots
-
-    def _click_server_by_name(
-        self, app_name: str, server: str, location: str = "", force_retype: bool = False,
-        calibration: "VPNCalibration | None" = None,
-    ) -> str:
-        """Route to slot-based connect or (future) named-server connect."""
-        if "-SLOT-" in server:
-            try:
-                slot_num = int(server.split("-SLOT-")[1])
-            except (ValueError, IndexError):
-                slot_num = 1
-            return self._connect_via_slot(
-                app_name, location or server.split("-SLOT-")[0], slot_num,
-                force_retype=force_retype, calibration=calibration,
-            )
-        # Named server fallback (not normally reached with slot discovery).
-        process_list = self._process_name_candidates(app_name)
-        server_esc = server.replace('"', '\\"')
-        script = f"""
-        tell application "System Events"
-            set procName to ""
-            repeat with candidate in {{{process_list}}}
-                if exists process (candidate as text) then
-                    set procName to candidate as text
-                    exit repeat
-                end if
-            end repeat
-            if procName is "" then return "vpn_process_not_found"
-            tell process procName
-                set frontmost to true
-                delay 0.5
-                if not (exists window 1) then return "no_window"
-                if not (exists text field 1 of group 1 of window 1) then return "search_field_not_found"
-                set sf to text field 1 of group 1 of window 1
-                try
-                    set focused of sf to true
-                    delay 0.1
-                end try
-                set value of sf to "{server_esc}"
-                delay 0.2
-                key code 36
-                delay 1.5
-                set tbl to table 1 of scroll area 1 of window 1
-                if (count of rows of tbl) > 0 then
-                    click row 1 of tbl
-                    return "row_clicked"
-                end if
-                return "server_not_found"
-            end tell
-        end tell
-        """
-        return run_osascript(script, timeout=20, label=f"click server {server}")
-
-    def _connect_via_slot(
-        self, app_name: str, location: str, slot_num: int, force_retype: bool = False,
-        calibration: "VPNCalibration | None" = None,
-    ) -> str:
-        """Search for location in ProtonVPN, expand the country row via Quartz click,
-        then hover+click the Nth server row's Connect button.
-
-        All accessibility reads happen BEFORE expansion (table has 2 rows, fast).
-        After expansion the table has 6000+ rows and any accessibility op times out,
-        so Quartz handles both the expansion click and the Connect hover+click.
-
-        Row heights are empirically fixed in ProtonVPN 4.x:
-          - "All locations" header: 32 px
-          - Country header row:     48 px
-          - Individual server rows: 48 px
-        Connect button appears at right_edge - 38 px on hover (default; see
-        VPNCalibration / scripts/calibrate.py for per-device overrides).
-        """
-        if calibration is None:
-            calibration = VPNCalibration()
-        process_list = self._process_name_candidates(app_name)
-
-        # ProtonVPN Mac Catalyst text field accepts NEITHER AppleScript keystroke NOR
-        # Quartz CGEventKeyboardSetUnicodeString — both are silently swallowed.
-        # The ONLY reliable input path is clipboard paste (Cmd+V) after a Quartz click
-        # focuses the field.  So we:
-        #   Phase 1 – AppleScript: focus ProtonVPN, return sf pixel position + window pos.
-        #   Phase 2 – Quartz:     click sf, Cmd+A+Del to clear, Cmd+V to paste location.
-        #   Phase 3 – AppleScript: scroll-to-top, read row-2 position (filter already applied).
-        #   Phase 4 – Quartz:     expansion click (if needed), hover, click Connect button.
-
-        try:
-            import Quartz  # type: ignore[import]
-        except ImportError:
-            self.logger.log("Quartz unavailable — cannot connect", step="06")
-            return "quartz_unavailable"
-
-        def _mouse(kind, x, y):
-            pt = Quartz.CGPoint(x=float(x), y=float(y))
-            ev = Quartz.CGEventCreateMouseEvent(None, kind, pt, Quartz.kCGMouseButtonLeft)
-            Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
-            time.sleep(0.05)
-
-        def _warp(x, y):
-            # Move the REAL hardware cursor, then post a mouse-moved event.
-            # ProtonVPN's Mac Catalyst Connect button is rendered only while the
-            # cursor hovers the row (an NSTrackingArea), and tracking follows the
-            # *actual* cursor position — a synthetic kCGEventMouseMoved alone does
-            # not reliably enter the tracking area on every Mac (it worked on one
-            # mini, not another, where the button never appeared and the click hit
-            # nothing).  CGWarpMouseCursorPosition guarantees the cursor is really
-            # over the row so the button paints before we click it.
-            pt = Quartz.CGPoint(x=float(x), y=float(y))
-            Quartz.CGWarpMouseCursorPosition(pt)
-            ev = Quartz.CGEventCreateMouseEvent(None, Quartz.kCGEventMouseMoved, pt,
-                                                Quartz.kCGMouseButtonLeft)
-            Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
-            time.sleep(0.05)
-
-        def _key(vk, down, flags=0):
-            src = Quartz.CGEventSourceCreate(Quartz.kCGEventSourceStateCombinedSessionState)
-            ev = Quartz.CGEventCreateKeyboardEvent(src, vk, down)
-            if flags:
-                Quartz.CGEventSetFlags(ev, flags)
-            Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
-            time.sleep(0.05)
-
-        # ── Phase 1: get sf + window coordinates ─────────────────────────────────────
-        phase1_script = f"""
-        tell application "System Events"
-            set procName to ""
-            repeat with candidate in {{{process_list}}}
-                if exists process (candidate as text) then
-                    set procName to candidate as text
-                    exit repeat
-                end if
-            end repeat
-            if procName is "" then return "ERROR:vpn_process_not_found"
-            tell process procName
-                set frontmost to true
-                delay 0.5
-                if not (exists window 1) then return "ERROR:no_window"
-                if not (exists text field 1 of group 1 of window 1) then return "ERROR:no_search_field"
-                set sf to text field 1 of group 1 of window 1
-                set sfPos to position of sf
-                set sfSz to size of sf
-                set sfX to (item 1 of sfPos) as integer
-                set sfY to (item 2 of sfPos) as integer
-                set sfW to (item 1 of sfSz) as integer
-                set sfH to (item 2 of sfSz) as integer
-                set wPos to position of window 1
-                set wSz to size of window 1
-                set wX to (item 1 of wPos) as integer
-                set wY to (item 2 of wPos) as integer
-                set wW to (item 1 of wSz) as integer
-                return "SF:" & sfX & "," & sfY & "," & sfW & "," & sfH & "|W:" & wX & "," & wY & "," & wW
-            end tell
-        end tell
-        """
-        try:
-            p1 = run_osascript(phase1_script, timeout=30, label=f"slot-connect phase1 {location}")
-        except AutomationError as exc:
-            self.logger.log(f"Slot connect phase1 failed: {exc}", step="06", status="slot_setup_failed")
-            if "Accessibility permission required" in str(exc):
-                raise
-            return "slot_setup_failed"
-
-        if p1.startswith("ERROR:"):
-            self.logger.log(f"Slot connect phase1: {p1}", step="06", status=p1)
-            return p1
-
-        sf_x = sf_y = sf_w = sf_h = 0
-        w_x = w_y = w_w = 0
-        for chunk in p1.split("|"):
-            if chunk.startswith("SF:"):
-                nums = chunk[3:].split(",")
-                if len(nums) == 4:
-                    sf_x, sf_y, sf_w, sf_h = int(nums[0]), int(nums[1]), int(nums[2]), int(nums[3])
-            elif chunk.startswith("W:"):
-                nums = chunk[2:].split(",")
-                if len(nums) == 3:
-                    w_x, w_y, w_w = int(nums[0]), int(nums[1]), int(nums[2])
-
-        if sf_w == 0 or w_w == 0:
-            self.logger.log(f"Bad phase1 data: {p1!r}", step="06")
-            return "bad_anchor_data"
-
-        # ── Phase 2: type the search filter character by character ────────────────────
-        # Typing via real VK-code key events (same mechanism as the working Cmd+A and
-        # Delete above) mirrors actual keyboard input and reliably triggers ProtonVPN's
-        # incremental search filter via UITextField's insertText: / editingChanged path.
-        # Clipboard paste (Cmd+V) is kept only as a fallback for unmappable characters.
-        sf_cx = sf_x + sf_w // 2
-        sf_cy = sf_y + sf_h // 2
-
-        # Click search field to focus it.
-        _mouse(Quartz.kCGEventLeftMouseDown, sf_cx, sf_cy)
-        _mouse(Quartz.kCGEventLeftMouseUp,   sf_cx, sf_cy)
-        time.sleep(0.4)
-
-        # Cmd+A + Delete to clear existing content.
-        _key(0x00, True,  Quartz.kCGEventFlagMaskCommand)   # Cmd+A
-        _key(0x00, False, Quartz.kCGEventFlagMaskCommand)
-        time.sleep(0.1)
-        _key(0x33, True); _key(0x33, False)                 # Delete
-        time.sleep(0.3)
-
-        # macOS US-layout virtual key codes for a–z and space.
-        _vk = {
-            'a': 0x00, 's': 0x01, 'd': 0x02, 'f': 0x03, 'h': 0x04,
-            'g': 0x05, 'z': 0x06, 'x': 0x07, 'c': 0x08, 'v': 0x09,
-            'b': 0x0B, 'q': 0x0C, 'w': 0x0D, 'e': 0x0E, 'r': 0x0F,
-            'y': 0x10, 't': 0x11, 'u': 0x20, 'i': 0x22, 'o': 0x1F,
-            'p': 0x23, 'l': 0x25, 'j': 0x26, 'k': 0x28, 'n': 0x2D,
-            'm': 0x2E, ' ': 0x31,
-        }
-        unmapped = [c for c in location if c.lower() not in _vk]
-        if not unmapped:
-            for char in location:
-                lc = char.lower()
-                flags = Quartz.kCGEventFlagMaskShift if char != lc else 0
-                _key(_vk[lc], True,  flags)
-                _key(_vk[lc], False, 0)
-            self.logger.log(f"Search filter typed: '{location}'", step="06")
-        else:
-            # Fallback: clipboard paste for locations with characters outside the VK map.
-            old_clip = subprocess.run(["pbpaste"], capture_output=True).stdout
-            try:
-                subprocess.run(["pbcopy"], input=location.encode(), check=True)
-                _key(0x09, True,  Quartz.kCGEventFlagMaskCommand)   # Cmd+V
-                _key(0x09, False, Quartz.kCGEventFlagMaskCommand)
-                self.logger.log(
-                    f"Search filter pasted (unmapped chars {unmapped}): '{location}'", step="06",
-                )
-            finally:
-                subprocess.run(["pbcopy"], input=old_clip, check=False)
-
-        time.sleep(2.5)  # wait for ProtonVPN to filter + auto-expand the country row
-
-        # ── Phase 3: scroll to top, read state-list position ────────────────────────────
-        # New Mac AX structure: scroll area is inside group 1 (not a direct window child).
-        # The list uses nested UI elements instead of a table with rows.
-        phase3_script = f"""
-        tell application "System Events"
-            set procName to ""
-            repeat with candidate in {{{process_list}}}
-                if exists process (candidate as text) then
-                    set procName to candidate as text
-                    exit repeat
-                end if
-            end repeat
-            if procName is "" then return "ERROR:vpn_process_not_found"
-            tell process procName
-                if not (exists group 1 of window 1) then return "ERROR:no_group"
-                if not (exists scroll area 1 of group 1 of window 1) then return "ERROR:no_scroll_area"
-                set sc to scroll area 1 of group 1 of window 1
-                -- Do NOT reset scroll bar here — setting its value clears ProtonVPN's
-                -- search filter, causing all 147 countries to reappear instead of the
-                -- filtered result (e.g. "United States").
-                if not (exists UI element 1 of sc) then return "ERROR:no_outer_list"
-                set outerList to UI element 1 of sc
-                set wPos to position of window 1
-                set wSz to size of window 1
-                set wX to (item 1 of wPos) as integer
-                set wY to (item 2 of wPos) as integer
-                set wW to (item 1 of wSz) as integer
-                set wH to (item 2 of wSz) as integer
-                -- Case A: filter active + country already expanded.
-                -- outerList itself IS the state list (description="list"); its children
-                -- are the per-state buttons directly (no extra nesting).
-                set outerDD to ""
-                try
-                    set outerDD to description of outerList as text
-                end try
-                if outerDD is "list" then
-                    if not (exists UI element 1 of outerList) then return "ERROR:empty_state_list"
-                    set firstElem to UI element 1 of outerList
-                    set fPos to position of firstElem
-                    set fSz to size of firstElem
-                    set firstY to (item 2 of fPos) as integer
-                    set rowH to (item 2 of fSz) as integer
-                    set stateCount to (count of UI elements of outerList) div 2
-                    if stateCount < 1 then set stateCount to 1
-                    return "R2:0," & firstY & "|W:" & wX & "," & wY & "," & wW & "," & wH & "|EXP:1|RH:" & rowH & "|SC:" & stateCount
-                end if
-                -- Case B: filter active + country collapsed, OR filter not applied.
-                -- Walk outerList children: find country header button (first wide button)
-                -- and optional nested state list (dd="list").
-                set stateList to missing value
-                set headerY to 0
-                repeat with c in UI elements of outerList
-                    set cdd to ""
-                    try
-                        set cdd to description of c as text
-                    end try
-                    if (class of c as text) is "button" and headerY = 0 then
-                        try
-                            set csz to size of c
-                            if (item 1 of csz) > 100 then
-                                set cpos to position of c
-                                set headerY to (item 2 of cpos) as integer
-                            end if
-                        end try
-                    end if
-                    if cdd is "list" and stateList is missing value then
-                        set stateList to c
-                    end if
-                end repeat
-                if stateList is missing value then
-                    return "R2:0," & headerY & "|W:" & wX & "," & wY & "," & wW & "," & wH & "|EXP:0|RH:44|SC:0"
-                end if
-                if not (exists UI element 1 of stateList) then return "ERROR:empty_state_list"
-                set firstElem to UI element 1 of stateList
-                set fPos to position of firstElem
-                set fSz to size of firstElem
-                set firstY to (item 2 of fPos) as integer
-                set rowH to (item 2 of fSz) as integer
-                set stateCount to (count of UI elements of stateList) div 2
-                if stateCount < 1 then set stateCount to 1
-                return "R2:0," & firstY & "|W:" & wX & "," & wY & "," & wW & "," & wH & "|EXP:1|RH:" & rowH & "|SC:" & stateCount
-            end tell
-        end tell
-        """
-        try:
-            p3 = run_osascript(phase3_script, timeout=20, label=f"slot-connect phase3 {location}")
-        except AutomationError as exc:
-            self.logger.log(f"Slot connect phase3 failed: {exc}", step="06", status="slot_setup_failed")
-            if "Accessibility permission required" in str(exc):
-                raise
-            return "slot_setup_failed"
-
-        if p3.startswith("ERROR:"):
-            self.logger.log(f"Slot connect phase3: {p3}", step="06", status=p3)
-            return p3
-
-        r2_x = r2_top = 0
-        w_x2 = w_y2 = w_w2 = w_h2 = 0
-        already_expanded = False
-        row_h_from_p3 = 0
-        state_count_from_p3 = 0
-        for chunk in p3.split("|"):
-            if chunk.startswith("R2:"):
-                nums = chunk[3:].split(",")
-                if len(nums) == 2:
-                    r2_x, r2_top = int(nums[0]), int(nums[1])
-            elif chunk.startswith("W:"):
-                nums = chunk[2:].split(",")
-                if len(nums) >= 4:
-                    w_x2, w_y2, w_w2, w_h2 = (
-                        int(nums[0]), int(nums[1]), int(nums[2]), int(nums[3])
-                    )
-                elif len(nums) == 3:
-                    w_x2, w_y2, w_w2 = int(nums[0]), int(nums[1]), int(nums[2])
-            elif chunk.startswith("EXP:"):
-                already_expanded = chunk[4:].strip() == "1"
-            elif chunk.startswith("RH:"):
-                try:
-                    row_h_from_p3 = int(chunk[3:])
-                except ValueError:
-                    pass
-            elif chunk.startswith("SC:"):
-                try:
-                    state_count_from_p3 = int(chunk[3:])
-                except ValueError:
-                    pass
-
-        # Use phase3 window coords if available (most current), fall back to phase1.
-        w_h = w_h2  # window height (phase1 does not capture it; 0 disables scroll)
-        if w_w2 > 0:
-            w_x, w_y, w_w = w_x2, w_y2, w_w2
-
-        if r2_top == 0 or w_w == 0:
-            self.logger.log(f"Bad phase3 data: {p3!r}", step="06")
-            return "bad_anchor_data"
-
-        # Row height comes from Phase 3 AX measurement; calibration is the fallback.
-        SERVER_ROW_H = row_h_from_p3 if row_h_from_p3 > 0 else calibration.row_height
-
-        # Use discovered server count as the authoritative slot count.
-        # state_count_from_p3 is the number of visible STATE groups (e.g. New York, LA),
-        # not the number of individual servers within the expanded state — using it would
-        # cause incorrect wrapping (e.g. 2 states → every slot > 2 wraps back to 1/2).
-        cached_count = len(
-            self.state.data.get("discovered_servers_by_location", {}).get(location, [])
-        )
-        total_slots = cached_count or state_count_from_p3 or slot_num
-        effective_slot = ((slot_num - 1) % total_slots) + 1 if total_slots > 1 else slot_num
-
-        # State N centre y — r2_top is the first state's y when already_expanded,
-        # or the country-header y when collapsed (states start one row_h below).
-        if already_expanded:
-            state_y = r2_top + (effective_slot - 1) * SERVER_ROW_H + SERVER_ROW_H // 2
-        else:
-            state_y = r2_top + SERVER_ROW_H + (effective_slot - 1) * SERVER_ROW_H + SERVER_ROW_H // 2
-
-        # Connect button x: inside the ProtonVPN window, left of the three-dot (60 px from right).
-        state_connect_x = w_x + w_w - calibration.state_connect_offset_from_right
-
-        self.logger.log(
-            f"Slot {slot_num} (eff {effective_slot}/{total_slots}): r2=({r2_x},{r2_top}) "
-            f"w=({w_x},{w_y},{w_w}) row_h={SERVER_ROW_H} "
-            f"already_expanded={already_expanded} state_y={state_y} connect_x={state_connect_x}",
-            step="06", slot=slot_num,
-        )
-
-        # ── Phase 4: hover state N → click its Connect button ────────────────────────────────
-        # State rows accept Quartz clicks without resetting the search filter (only clicking
-        # the search field or the scroll-area root resets it).  Hovering the row reveals the
-        # Connect button; we then click at the calibrated x position inside the window.
-
-        subprocess.run(
-            ["osascript", "-e",
-             'tell application "System Events" to set frontmost of process "ProtonVPN" to true'],
-            timeout=4, check=False,
-        )
-        time.sleep(0.3)
-
-        Quartz.CGAssociateMouseAndMouseCursorPosition(True)
-
-        # If the country row is not yet expanded, expand it first so state rows are visible.
-        if not already_expanded:
-            expand_x = w_x + w_w // 2
-            expand_y = r2_top + SERVER_ROW_H // 2
-            _mouse(Quartz.kCGEventLeftMouseDown, expand_x, expand_y)
-            _mouse(Quartz.kCGEventLeftMouseUp,   expand_x, expand_y)
-            time.sleep(1.5)
-            self.logger.log(
-                f"Slot {slot_num}: expanded country at ({expand_x},{expand_y})", step="06",
-            )
-
-        # Scroll so that state N is within the visible window area.
-        # w_h comes from Phase 3 (window height); if 0, skip scroll check.
-        # ProtonVPN (Mac Catalyst) routes scroll events by actual cursor position,
-        # so we _warp the cursor into the list first, then send small scroll chunks
-        # to avoid UIKit momentum overshoot.
-        row_center_x = w_x + w_w // 2
-        if w_h > 0:
-            # Target: bring state N to the vertical centre of the visible list area.
-            list_top    = r2_top                  # y of first state row (from Phase 3)
-            list_bottom = w_y + w_h - SERVER_ROW_H
-            list_center = (list_top + list_bottom) // 2
-
-            need_scroll = 0
-            if state_y > list_bottom:
-                need_scroll = state_y - list_center   # scroll DOWN (positive → negative delta)
-            elif state_y < list_top:
-                need_scroll = state_y - list_center   # scroll UP (negative → positive delta)
-
-            if need_scroll != 0:
-                # Warp cursor over the list so ProtonVPN's scroll area receives the events.
-                list_area_y = (list_top + list_bottom) // 2
-                _warp(row_center_x, list_area_y)
-                time.sleep(0.15)
-
-                # Send in row-sized chunks so UIKit processes each increment cleanly.
-                remaining = abs(need_scroll)
-                sign = -1 if need_scroll > 0 else 1   # negative = scroll down
-                while remaining > 0:
-                    chunk = min(SERVER_ROW_H, remaining)
-                    ev = Quartz.CGEventCreateScrollWheelEvent(
-                        None, Quartz.kCGScrollEventUnitPixel, 1, sign * chunk)
-                    Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
-                    time.sleep(0.06)
-                    remaining -= chunk
-                time.sleep(0.5)   # let the list settle after scrolling
-
-                state_y -= need_scroll
-                self.logger.log(
-                    f"Slot {slot_num}: scrolled {need_scroll:+d}px → state_y now {state_y}",
-                    step="06", slot=slot_num,
-                )
-
-        # Hover over state N row to reveal the Connect button.
-        _warp(row_center_x, state_y - 20)   # approach from just above
-        time.sleep(0.15)
-        _warp(row_center_x, state_y)         # settle on row centre
-        time.sleep(0.5)                       # wait for Connect button to paint
-
-        # Click the Connect button.
-        _mouse(Quartz.kCGEventLeftMouseDown, state_connect_x, state_y)
-        time.sleep(0.1)
-        _mouse(Quartz.kCGEventLeftMouseUp,   state_connect_x, state_y)
-        self.logger.log(
-            f"Slot {slot_num}: Connect clicked at ({state_connect_x},{state_y})",
-            step="06", slot=slot_num,
-        )
-        time.sleep(0.5)
-        return "connect_button_clicked"
 
     def _record_ip(self, ip: str | None) -> None:
         if not ip:
@@ -1712,184 +987,9 @@ class VPNController:
             self.state.data["used_public_ips"].append(ip)
         self.state.save()
 
-    def _click_disconnect(self, app_name: str) -> str:
-        process_list = self._process_name_candidates(app_name)
-        # Avoid deep tree walk (which hits the 6000+ row server table and times out).
-        # Try the Disconnect button at shallow known paths only.
-        script = f"""
-        tell application "System Events"
-            set procName to ""
-            repeat with candidate in {{{process_list}}}
-                if exists process (candidate as text) then
-                    set procName to candidate as text
-                    exit repeat
-                end if
-            end repeat
-            if procName is "" then return "vpn_process_not_found"
 
-            tell process procName
-                set frontmost to true
-                delay 0.4
-                if not (exists window 1) then return "no_window"
 
-                -- Try "Disconnect" and "Cancel" (shown during Connecting state)
-                -- at window and two group levels.  Skip scroll areas to avoid
-                -- hitting the 6000+ row server table which causes timeouts.
-                set targetBtns to {{"Disconnect", "Cancel"}}
-                repeat with btnName in targetBtns
-                    try
-                        if exists button (btnName as text) of window 1 then
-                            click button (btnName as text) of window 1
-                            return "disconnect_clicked"
-                        end if
-                    end try
-                    try
-                        repeat with g in groups of window 1
-                            if exists button (btnName as text) of g then
-                                click button (btnName as text) of g
-                                return "disconnect_clicked"
-                            end if
-                            try
-                                repeat with gg in groups of g
-                                    if exists button (btnName as text) of gg then
-                                        click button (btnName as text) of gg
-                                        return "disconnect_clicked"
-                                    end if
-                                end repeat
-                            end try
-                        end repeat
-                    end try
-                end repeat
 
-                return "no_disconnect_button"
-            end tell
-        end tell
-        """
-        return run_osascript(script, timeout=10, label=f"{app_name} disconnect")
-
-    def _click_quick_connect(self, app_name: str) -> str:
-        process_list = self._process_name_candidates(app_name)
-        script = f"""
-        on clickNamedButton(containerElem, btnName)
-            tell application "System Events"
-                try
-                    if exists button btnName of containerElem then
-                        click button btnName of containerElem
-                        return true
-                    end if
-                end try
-            end tell
-            return false
-        end clickNamedButton
-
-        tell application "System Events"
-            set procName to ""
-            repeat with candidate in {{{process_list}}}
-                if exists process (candidate as text) then
-                    set procName to candidate as text
-                    exit repeat
-                end if
-            end repeat
-            if procName is "" then return "vpn_process_not_found"
-
-            tell process procName
-                set frontmost to true
-                delay 0.4
-                if not (exists window 1) then return "no_window"
-
-                if my clickNamedButton(window 1, "Quick Connect") then return "quick_connect_clicked"
-                if my clickNamedButton(window 1, "Connect") then return "connect_clicked"
-
-                try
-                    repeat with g in groups of window 1
-                        if my clickNamedButton(g, "Quick Connect") then return "quick_connect_clicked"
-                        if my clickNamedButton(g, "Connect") then return "connect_clicked"
-                        try
-                            repeat with gg in groups of g
-                                if my clickNamedButton(gg, "Quick Connect") then return "quick_connect_clicked"
-                                if my clickNamedButton(gg, "Connect") then return "connect_clicked"
-                            end repeat
-                        end try
-                    end repeat
-                end try
-
-                return "quick_connect_not_found"
-            end tell
-        end tell
-        """
-        return run_osascript(script, timeout=10, label=f"{app_name} quick connect")
-
-    def _read_ui_connection_state(self, app_name: str) -> str:
-        """Best-effort UI status for logs only.
-
-        Network verification is authoritative. If UI text is used for human
-        diagnostics, negative states must be checked before positive words so
-        "You are not connected" can never become "connected".
-        """
-        process_list = self._process_name_candidates(app_name)
-        script = f"""
-        tell application "System Events"
-            set procName to ""
-            repeat with candidate in {{{process_list}}}
-                if exists process (candidate as text) then
-                    set procName to candidate as text
-                    exit repeat
-                end if
-            end repeat
-            if procName is "" then return "vpn_process_not_found"
-
-            tell process procName
-                if not (exists window 1) then return "no_window"
-                set txt to ""
-                try
-                    repeat with s in static texts of window 1
-                        try
-                            set txt to txt & " " & (value of s as text)
-                        end try
-                        try
-                            set txt to txt & " " & (name of s as text)
-                        end try
-                    end repeat
-                end try
-                try
-                    repeat with b in buttons of window 1
-                        try
-                            set txt to txt & " " & (name of b as text)
-                        end try
-                    end repeat
-                end try
-                return txt
-            end tell
-        end tell
-        """
-        try:
-            raw = run_osascript(script, timeout=8, label=f"{app_name} ui status")
-        except AutomationError as exc:
-            return f"unknown:{exc}"
-        return self._classify_ui_connection_text(raw)
-
-    @staticmethod
-    def _classify_ui_connection_text(raw: str) -> str:
-        lowered = " ".join(raw.lower().split())
-        if not lowered:
-            return "unknown_empty_ui"
-        negative_markers = (
-            "not connected",
-            "you are not connected",
-            "quick connect",
-            "connect now",
-            "disconnected",
-        )
-        if any(marker in lowered for marker in negative_markers):
-            return "ui_disconnected"
-        positive_markers = (
-            "protected",
-            "connected",
-            "disconnect",
-        )
-        if any(marker in lowered for marker in positive_markers):
-            return "ui_connected_hint"
-        return "ui_unknown"
 
     def _poll_verify(
         self,
@@ -1933,14 +1033,17 @@ class VPNController:
                 last_tunnels = []
                 continue
 
-            # ── Level 2: route changed ─────────────────────────────────────────
+            # ── Level 2: traffic routed through the tunnel ────────────────────
             current_route = self.net.default_route_gateway()
-            # Accept three conditions: route changed to new value, OR route is gone
-            # (ProtonVPN kill-switch drops the default route while tunnel is active).
-            # Baseline may also be empty on cycle 2+ if previous VPN left no default route.
+            # Accept: route changed to a new gateway, OR the default route is gone, OR
+            # an active tunnel exists.  ExpressVPN (Lightway) routes through its utun
+            # WITHOUT changing the default-route gateway (it stays the LAN gateway), so
+            # requiring a gateway change would never pass — the real proof of a working
+            # connection is the public IP moving into the target country (L3/L4 below).
             route_changed = (
                 (bool(current_route) and current_route != baseline_route)
                 or (has_tunnel and not current_route)
+                or has_tunnel
             )
 
             if not route_changed:
@@ -2025,7 +1128,7 @@ class VPNController:
     def diagnose_current_state(self, vpn_cfg: VPNConfig) -> dict[str, Any]:
         provider_token = self._provider_token(vpn_cfg.app)
         snapshot = self.net.snapshot()
-        ui_state = self._read_ui_connection_state(vpn_cfg.app)
+        ui_state = self._evpn_state(vpn_cfg.app)
         info = {
             "ip": snapshot.get("public_ip"),
             "country": snapshot.get("country"),
