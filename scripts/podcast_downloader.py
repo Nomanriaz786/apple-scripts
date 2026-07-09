@@ -5214,6 +5214,65 @@ class PodcastsController:
             return "no_confirm_dialog"
         return f"remove_failed:{remove}"
 
+    def _count_downloaded_cards(self) -> int:
+        """Fast native count of show cards on the Downloaded grid.
+
+        Uses the same window + card geometry as _find_downloaded_card_frame's native
+        path. Used to detect that an (async) removal has actually taken effect.
+        """
+        nodes = self._ax_nodes()
+        win_x = win_y = win_w = win_h = 0
+        for role, _t, x, y, w, h in nodes:
+            if role == "AXWindow" and w > 400 and h > 400:
+                win_x, win_y, win_w, win_h = x, y, w, h
+                break
+        if win_w == 0:
+            return 0
+        content_left = win_x + 240
+        content_top = win_y + 60
+        win_right = win_x + win_w
+        win_bottom = win_y + win_h
+        return sum(
+            1 for role, _t, x, y, w, h in nodes
+            if x > content_left and y > content_top
+            and x < win_right and y < win_bottom
+            and 80 <= w <= 800 and 80 <= h <= 900
+            and h > w and h < w * 4 and w < win_w - 100
+        )
+
+    def _wait_downloaded_cards_below(self, previous: int, timeout: int = 12) -> bool:
+        """Poll until the Downloaded card count drops below `previous` (the removal
+        actually completed) or the grid empties. Returns True once it drops.
+
+        Removals are asynchronous and some shows take longer than others; this waits
+        for the just-triggered removal to take effect before the next card is scanned,
+        so a slow removal is never skipped.
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            time.sleep(1.0)
+            now = self._count_downloaded_cards()
+            if now == 0 or now < previous:
+                return True
+        return False
+
+    def _downloaded_grid_confirmed_empty(self, checks: int = 2, delay: float = 1.2) -> bool:
+        """Re-confirm the grid is empty across a few native re-scans.
+
+        Reached only after the authoritative _find_downloaded_card_frame already
+        returned None; the extra native re-checks make the "no shows remain" decision
+        resilient to a slow async removal that might still be settling a card in.
+        """
+        for _ in range(checks):
+            time.sleep(delay)
+            self.navigate_to_downloaded_tab()
+            if self._has_back_button():
+                self._click_back_button()
+                time.sleep(0.5)
+            if self._count_downloaded_cards() > 0:
+                return False
+        return True
+
     def cleanup_all_from_downloads_tab(
         self, expected_cards: int | None = None
     ) -> list[dict[str, Any]]:
@@ -5228,10 +5287,10 @@ class PodcastsController:
           5. If Podcasts shows a confirmation sheet, click Remove in it.
           6. Re-navigate to Downloaded and repeat.
 
-        `expected_cards`: if given (the number of shows we actually downloaded this
-        cycle), stop after removing that many — this skips the expensive
-        "is the grid empty?" card search at the end (each such search is a ~30s
-        System Events AX walk, and it ran 2-3× per cleanup before).
+        `expected_cards`: advisory only (kept for signature compatibility). Cleanup no
+        longer stops on a count — it removes cards and re-scans until the Downloaded
+        grid is verified empty, waiting for each (async) removal to actually complete
+        first, so a slow removal can never leave a show behind.
         """
         try:
             import Quartz  # type: ignore[import]
@@ -5273,16 +5332,6 @@ end tell
         results: list[dict[str, Any]] = []
         removed = 0
         for iteration in range(50):
-            # Stop as soon as we've removed every card we expected — avoids the
-            # trailing empty-grid search(es), which dominate cleanup time.
-            if expected_cards is not None and removed >= expected_cards:
-                self.logger.log(
-                    f"Downloads cleanup: removed expected {removed} card(s) — done",
-                    step="14",
-                )
-                results.append({"iteration": iteration + 1, "result": "done_expected_count"})
-                break
-
             # Re-navigate each iteration — card removal may shift view focus.
             nav = self.navigate_to_downloaded_tab()
             if nav != "navigated":
@@ -5311,14 +5360,27 @@ end tell
                         time.sleep(0.5)
                         frame = self._find_downloaded_card_frame()
             if frame is None:
+                # No card visible — but a previous removal may still be settling, so
+                # confirm the grid is really empty across a few re-checks before
+                # stopping. Only a persistently empty grid ends cleanup.
+                if self._downloaded_grid_confirmed_empty():
+                    self.logger.log(
+                        f"Downloads cleanup: grid confirmed empty after "
+                        f"{iteration} removal(s)",
+                        step="14",
+                    )
+                    results.append({"iteration": iteration + 1, "result": "done"})
+                    break
                 self.logger.log(
-                    f"Downloads cleanup: no more show cards after {iteration} removal(s)",
+                    "Downloads cleanup: a card resurfaced after settle — continuing",
                     step="14",
                 )
-                results.append({"iteration": iteration + 1, "result": "done"})
-                break
+                continue
 
             card_x, card_y, card_w, card_h = frame
+            # Card count before this removal — used afterwards to confirm the (async)
+            # removal actually took effect before we scan for the next card.
+            cards_before = self._count_downloaded_cards()
             # Artwork on Downloads grid cards is always a square whose side equals
             # the card width.  The ⋯ button appears at the lower-right of the artwork
             # square (not the lower-right of the full card which includes the title strip
@@ -5407,8 +5469,19 @@ end tell
             results.append({"iteration": iteration + 1, "result": result_label})
             if actual_removed:
                 removed += 1
-            # No settle here — move straight on to the next show. (The card finder
-            # below retries if the next card hasn't rendered yet.)
+            # Wait for this removal to ACTUALLY take effect before scanning again.
+            # Removals are async and some shows take longer, so proceeding immediately
+            # can skip a still-removing card and leave the last show behind.
+            if self._wait_downloaded_cards_below(cards_before, timeout=12):
+                self.logger.log(
+                    f"Downloads cleanup card {iteration + 1}: removal confirmed "
+                    f"(cards were {cards_before})", step="14",
+                )
+            else:
+                self.logger.log(
+                    f"Downloads cleanup card {iteration + 1}: card count did not drop "
+                    f"below {cards_before} within timeout — re-scanning anyway", step="14",
+                )
 
         return results
 
