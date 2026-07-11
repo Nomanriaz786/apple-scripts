@@ -671,21 +671,36 @@ class VPNController:
 
         rot = self.state.data.setdefault("vpn_rotation_index", {})
         start_idx = int(rot.get(vpn_cfg.location, 0)) % row_count
-        rot[vpn_cfg.location] = (start_idx + 1) % row_count
-        self.state.save()
         self.logger.log(
-            f"VPN rotation: starting at US row {start_idx}; "
-            f"next run will use row {rot[vpn_cfg.location]}",
+            f"VPN rotation: starting at US row {start_idx}/{row_count}",
             step="06", rotation_index=start_idx,
         )
         rows_to_try = [(start_idx + off) % row_count for off in range(row_count)]
         last_exc: "AutomationError | None" = None
         slot_baseline_ip = baseline_ip
         slot_baseline_route = baseline_route
-        prev_vpn_ip = self.state.data.get("last_vpn_ip")
 
-        for attempt_i, row in enumerate(rows_to_try):
-            if attempt_i > 0:
+        # Several ExpressVPN US cities share one datacenter /24, so a plain row rotation
+        # can hand out the same IP range for many cycles in a row.  Track the /24s used
+        # in the last few cycles and each row's known /24, so we advance to a server in a
+        # DIFFERENT subnet — skipping already-known repeat rows for free.
+        recent = self.state.data.setdefault("recent_vpn_subnets", [])
+        row_subnet = self.state.data.setdefault("evpn_row_subnet", {})
+        recent_window = 6
+        max_connect_attempts = 10   # bound the cost if many rows share a subnet
+        connect_attempts = 0
+        did_connect = False
+
+        for row in rows_to_try:
+            known = row_subnet.get(str(row))
+            if known and known in recent:
+                self.logger.log(
+                    f"Skipping US row {row}: known subnet {known}.x used recently",
+                    step="06", row=row, status="subnet_skip_cached",
+                )
+                continue
+
+            if did_connect:
                 disc2 = self._evpn_disconnect(vpn_cfg.app)
                 self.logger.log(f"Retry pre-disconnect: {disc2}", step="06", status=disc2)
                 time.sleep(5.0 if disc2 == "disconnect_clicked" else 2.0)
@@ -698,12 +713,13 @@ class VPNController:
                 )
 
             self.logger.log(
-                f"Cycle {cycle} target {vpn_cfg.app} US row {row} "
-                f"(attempt {attempt_i + 1}/{row_count})",
+                f"Cycle {cycle} target {vpn_cfg.app} US row {row}",
                 step="06", cycle=cycle, target_row=row,
             )
 
             ui_status = self._evpn_connect_us(vpn_cfg.app, row, vpn_cfg.location, row_count)
+            did_connect = True
+            connect_attempts += 1
             self.logger.log(
                 f"{vpn_cfg.app} connect US row {row}/{row_count}: {ui_status}",
                 step="06", status=ui_status, row=row,
@@ -726,23 +742,29 @@ class VPNController:
                 if result == "connected_verified":
                     snap = self.net.snapshot()
                     new_ip = snap.get("public_ip")
-                    if (new_ip and prev_vpn_ip
-                            and new_ip == prev_vpn_ip
-                            and prev_vpn_ip != baseline_ip):
+                    subnet = ".".join(new_ip.split(".")[:3]) if new_ip else None
+                    if subnet:
+                        row_subnet[str(row)] = subnet  # remember this row's /24
+                    if subnet and subnet in recent and connect_attempts < max_connect_attempts:
                         self.logger.log(
-                            f"IP {new_ip} repeats previous cycle — "
-                            f"disconnecting and skipping US row {row}",
-                            step="06", row=row, status="ip_repeat_skip",
+                            f"US row {row} IP {new_ip} is in a recently-used subnet "
+                            f"{subnet}.x — disconnecting and trying a different server",
+                            step="06", row=row, status="subnet_repeat_skip",
                         )
                         self._evpn_disconnect(vpn_cfg.app)
                         time.sleep(2.5)
                         last_exc = AutomationError(
-                            f"IP {new_ip} repeated (prev={prev_vpn_ip}); skipping row {row}"
+                            f"subnet {subnet}.x repeated; skipping US row {row}"
                         )
                         continue
-                    self._record_server(f"US-ROW-{row}")
+                    # Accept this server: advance the rotation past it and record its /24.
+                    rot[vpn_cfg.location] = (row + 1) % row_count
+                    if subnet:
+                        recent.append(subnet)
+                        del recent[:-recent_window]
                     if new_ip:
                         self.state.data["last_vpn_ip"] = new_ip
+                    self._record_server(f"US-ROW-{row}")
                     sessions = self.state.data.setdefault("vpn_sessions", [])
                     sessions.append({
                         "cycle": cycle,
@@ -754,6 +776,7 @@ class VPNController:
                         "verified_at": datetime.now().isoformat(),
                     })
                     self.state.save()
+                    return result
                 return result
             except AutomationError as exc:
                 last_exc = exc
@@ -907,16 +930,21 @@ class VPNController:
             return False
 
     @staticmethod
-    def _evpn_scroll(px: int) -> None:
+    def _evpn_scroll(px: int, dwell: float = 0.28) -> None:
         """Post one pixel-precise scroll-wheel event (negative px scrolls the list down;
-        one _EVPN_ROW_H_PX step == exactly one row)."""
+        one _EVPN_ROW_H_PX step == exactly one row).
+
+        `dwell` MUST stay large enough (~0.25s+) between consecutive row scrolls: firing
+        row scrolls faster makes macOS apply scroll acceleration, which over-scrolls and
+        makes higher rows all land on the same bottom server.  A big non-row scroll (e.g.
+        scroll-to-top) can pass a smaller dwell since it doesn't need row precision."""
         try:
             import Quartz
         except ImportError:
             return
         ev = Quartz.CGEventCreateScrollWheelEvent(None, Quartz.kCGScrollEventUnitPixel, 1, px)
         Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
-        time.sleep(0.06)
+        time.sleep(dwell)
 
     def _evpn_open_us_list(self, app_name: str, search_term: str) -> "tuple[int, int, int, int] | None":
         """Open the picker, type the country search, hover the list and scroll to the
@@ -965,7 +993,7 @@ class VPNController:
             Quartz.CGPointMake(wx + int(ww * 0.5), wy + int(wh * 0.55)), 0))
         time.sleep(0.1)
         for _ in range(8):
-            self._evpn_scroll(600)
+            self._evpn_scroll(600, dwell=0.1)
         time.sleep(0.4)
         return bounds
 
@@ -1009,7 +1037,6 @@ class VPNController:
         steps = 0
         for _ in range(150):
             self._evpn_scroll(-self._EVPN_ROW_H_PX)
-            time.sleep(0.12)
             cur = _name_hash()
             if cur and cur == prev:
                 break
