@@ -1,5 +1,5 @@
 {
-  "repeat": 3,
+  "repeat": 10,
   "vpn": {
     "enabled": true,
     "app": "ExpressVPN",
@@ -16,17 +16,7 @@
     {
       "tab": 1,
       "videos": [
-        1,
-        5,
-        7
-      ]
-    },
-    {
-      "tab": 2,
-      "videos": [
-        1,
-        7,
-        10
+        1
       ]
     }
   ],

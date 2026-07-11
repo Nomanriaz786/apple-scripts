@@ -604,14 +604,16 @@ class VPNController:
         org_ok = provider_name.lower() in (ip_info.get("org") or "").lower()
         return country_ok and org_ok
 
-    # ExpressVPN main-window layout fractions (validated live). Clicks are anchored to
-    # the live window position, so they survive the window being moved.
-    _EVPN_CARD = (0.50, 0.46)      # Selected-Location card -> opens the location picker
-    _EVPN_SEARCH = (0.50, 0.113)   # search field in the picker
-    _EVPN_ROW0_Y = 0.261           # first result row centre (fraction of window height)
-    _EVPN_ROW_DY = 0.0621          # spacing between result rows
-    _EVPN_ROW_X = 0.45             # x fraction to click within a result row
-    _EVPN_ROWS = 8                 # top US result rows to rotate across
+    # ExpressVPN location-picker geometry (validated live).  Clicks are anchored to the
+    # live window position; a single 40px pixel-scroll event moves the list exactly one
+    # row, so any server is reachable by scrolling (the window can't be read via AX and
+    # its search results can't be enumerated, so rows are addressed positionally).
+    _EVPN_SEARCH_YF = 0.113        # search-field centre, fraction of window height
+    _EVPN_ROW_X = 0.45             # x fraction within a result row to click
+    _EVPN_ROW0_YF = 0.261          # first (top) visible result row centre, height fraction
+    _EVPN_LASTROW_YF = 0.95        # last (bottom) visible row centre when pinned to bottom
+    _EVPN_ROW_H_PX = 40            # result row height in px (== one pixel-scroll row)
+    _EVPN_VISIBLE = 12             # result rows fully visible at once (conservative)
 
     def connect_with_config(self, cycle: int, vpn_cfg: VPNConfig) -> str:
         """Connect ExpressVPN to a rotating US location and verify via the network.
@@ -629,8 +631,11 @@ class VPNController:
             raise AutomationError(f"{vpn_cfg.app} app not found. Install and sign in first.")
         time.sleep(1.5)
 
-        row_count = vpn_cfg.state_count if vpn_cfg.state_count > 0 else self._EVPN_ROWS
-        row_count = max(1, min(row_count, self._EVPN_ROWS))
+        # Rotate across EVERY USA server, not a fixed cap: use the count discovered from
+        # the ExpressVPN location list (cached). Each index is a distinct server; the
+        # rotation walks all of them once before repeating.
+        row_count = self._evpn_us_server_count(vpn_cfg.app, vpn_cfg.location)
+        row_count = max(1, row_count)
 
         baseline_route = self.net.default_route_gateway()
         baseline = self.net.snapshot()
@@ -698,9 +703,9 @@ class VPNController:
                 step="06", cycle=cycle, target_row=row,
             )
 
-            ui_status = self._evpn_connect_us(vpn_cfg.app, row, vpn_cfg.location)
+            ui_status = self._evpn_connect_us(vpn_cfg.app, row, vpn_cfg.location, row_count)
             self.logger.log(
-                f"{vpn_cfg.app} connect US row {row}: {ui_status}",
+                f"{vpn_cfg.app} connect US row {row}/{row_count}: {ui_status}",
                 step="06", status=ui_status, row=row,
             )
             if ui_status != "connect_clicked":
@@ -865,25 +870,79 @@ class VPNController:
         except AutomationError as exc:
             return f"error:{exc}"
 
-    def _evpn_connect_us(self, app_name: str, row_index: int, search_term: str) -> str:
-        """Connect via the ExpressVPN main window: open the location card, search for
-        the country, and click the Nth result row. All clicks are anchored to the live
-        window position. Returns 'connect_clicked' or an error token.
-        """
+    def _evpn_open_locations(self, app_name: str) -> bool:
+        """Open the ExpressVPN location picker via the status-bar 'Show All Locations'
+        menu item — deterministic regardless of the current window view."""
+        script = (
+            'tell application "System Events"\n'
+            f'    tell process "{app_name}"\n'
+            '        try\n'
+            '            set sm to menu bar item 1 of menu bar 2\n'
+            '            click sm\n'
+            '            delay 0.8\n'
+            '            repeat with mi in menu items of menu 1 of sm\n'
+            '                set t to ""\n'
+            '                try\n'
+            '                    set t to title of mi\n'
+            '                end try\n'
+            '                if t is "Show All Locations" then\n'
+            '                    click mi\n'
+            '                    return "opened"\n'
+            '                end if\n'
+            '            end repeat\n'
+            '            key code 53\n'
+            '            return "not_found"\n'
+            '        on error e\n'
+            '            try\n'
+            '                key code 53\n'
+            '            end try\n'
+            '            return "error:" & e\n'
+            '        end try\n'
+            '    end tell\n'
+            'end tell'
+        )
+        try:
+            return run_osascript(script, timeout=12, label="evpn_show_all").strip() == "opened"
+        except AutomationError:
+            return False
+
+    @staticmethod
+    def _evpn_scroll(px: int) -> None:
+        """Post one pixel-precise scroll-wheel event (negative px scrolls the list down;
+        one _EVPN_ROW_H_PX step == exactly one row)."""
         try:
             import Quartz
         except ImportError:
-            return "quartz_unavailable"
+            return
+        ev = Quartz.CGEventCreateScrollWheelEvent(None, Quartz.kCGScrollEventUnitPixel, 1, px)
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+        time.sleep(0.06)
+
+    def _evpn_open_us_list(self, app_name: str, search_term: str) -> "tuple[int, int, int, int] | None":
+        """Open the picker, type the country search, hover the list and scroll to the
+        top.  Returns the live window bounds (wx, wy, ww, wh) or None."""
+        try:
+            import Quartz
+        except ImportError:
+            return None
+        try:
+            run_osascript(f'tell application "{app_name}" to activate', timeout=5, label="evpn_activate")
+        except AutomationError:
+            pass
+        time.sleep(0.6)
+        if not self._evpn_open_locations(app_name):
+            return None
+        time.sleep(1.8)
         bounds = self._evpn_window_bounds(app_name)
         if bounds is None:
-            return "no_window"
+            return None
         wx, wy, ww, wh = bounds
 
         def _click(fx: float, fy: float) -> None:
             pt = Quartz.CGPointMake(wx + int(ww * fx), wy + int(wh * fy))
             for k in (Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp):
-                ev = Quartz.CGEventCreateMouseEvent(None, k, pt, Quartz.kCGMouseButtonLeft)
-                Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+                Quartz.CGEventPost(Quartz.kCGHIDEventTap,
+                                   Quartz.CGEventCreateMouseEvent(None, k, pt, Quartz.kCGMouseButtonLeft))
                 time.sleep(0.06)
 
         def _key(vk: int, flags: int = 0) -> None:
@@ -894,24 +953,118 @@ class VPNController:
                 Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
                 time.sleep(0.04)
 
-        try:
-            run_osascript(f'tell application "{app_name}" to activate',
-                          timeout=5, label="evpn_activate")
-        except AutomationError:
-            pass
-        time.sleep(0.6)
-        _key(0x35)  # Escape — close any already-open picker so the card click is valid
-        time.sleep(0.4)
-        _click(*self._EVPN_CARD)   # open the location picker
-        time.sleep(1.3)
-        _click(*self._EVPN_SEARCH)  # focus the search field
+        _click(0.5, self._EVPN_SEARCH_YF)
         time.sleep(0.4)
         subprocess.run(["pbcopy"], input=search_term.encode("utf-8"), check=True)
-        _key(0x00, Quartz.kCGEventFlagMaskCommand)  # Cmd+A (clear existing text)
-        _key(0x09, Quartz.kCGEventFlagMaskCommand)  # Cmd+V (paste search term)
-        time.sleep(1.5)
-        row_y = self._EVPN_ROW0_Y + self._EVPN_ROW_DY * row_index
-        _click(self._EVPN_ROW_X, row_y)  # click the Nth US result row -> connects
+        _key(0x00, Quartz.kCGEventFlagMaskCommand)  # Cmd+A
+        _key(0x09, Quartz.kCGEventFlagMaskCommand)  # Cmd+V
+        time.sleep(1.3)
+        # Hover the list, then scroll firmly to the top for a known starting position.
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, Quartz.CGEventCreateMouseEvent(
+            None, Quartz.kCGEventMouseMoved,
+            Quartz.CGPointMake(wx + int(ww * 0.5), wy + int(wh * 0.55)), 0))
+        time.sleep(0.1)
+        for _ in range(8):
+            self._evpn_scroll(600)
+        time.sleep(0.4)
+        return bounds
+
+    def _evpn_us_server_count(self, app_name: str, search_term: str) -> int:
+        """Number of USA servers in the ExpressVPN list, discovered once and cached.
+
+        Scrolls the searched list from top to bottom one row at a time and counts the
+        scrolls until the list stops moving.  Only the name column is hashed — the
+        latency 'ms' column updates on its own and would otherwise never look stable.
+        Falls back to a sensible default on any failure.
+        """
+        cached = self.state.data.get("evpn_us_server_count")
+        if isinstance(cached, int) and cached > 0:
+            return cached
+        default = 30
+        bounds = self._evpn_open_us_list(app_name, search_term)
+        if bounds is None:
+            self.logger.log(
+                f"ExpressVPN server-count discovery failed to open list — default {default}",
+                step="06")
+            return default
+        wx, wy, ww, wh = bounds
+        import hashlib, tempfile, os
+        strip = os.path.join(tempfile.gettempdir(), "evpn_count_strip.png")
+        region = f"-R{wx + 120},{wy + 150},{max(1, int(ww * 0.42))},{max(1, wh - 260)}"
+
+        def _name_hash() -> str:
+            subprocess.run(["screencapture", "-x", region, strip], check=False)
+            try:
+                with open(strip, "rb") as f:
+                    return hashlib.md5(f.read()).hexdigest()
+            except Exception:
+                return ""
+
+        prev = _name_hash()
+        if not prev:
+            self.logger.log(
+                f"ExpressVPN server-count discovery: screen capture failed — default {default}",
+                step="06")
+            return default
+        steps = 0
+        for _ in range(150):
+            self._evpn_scroll(-self._EVPN_ROW_H_PX)
+            time.sleep(0.12)
+            cur = _name_hash()
+            if cur and cur == prev:
+                break
+            prev = cur
+            steps += 1
+        count = steps + self._EVPN_VISIBLE if steps > 0 else default
+        # Sanity clamp — if the bottom was never detected (count runs away), the scan is
+        # unreliable; fall back to the default rather than a bogus huge rotation.
+        if count > 120:
+            self.logger.log(
+                f"ExpressVPN server-count discovery ran away ({count}) — default {default}",
+                step="06")
+            count = default
+        self.state.data["evpn_us_server_count"] = count
+        self.state.save()
+        self.logger.log(
+            f"ExpressVPN USA server count discovered: {count} "
+            f"({steps} row-scrolls + {self._EVPN_VISIBLE} visible)", step="06")
+        return count
+
+    def _evpn_connect_us(self, app_name: str, index: int, search_term: str, count: int) -> str:
+        """Connect to the USA server at rotation `index` (0-based) by searching the
+        country and scrolling to that row with pixel-precise scrolling, so EVERY server
+        is reachable — not just the first screenful.  Returns 'connect_clicked' or an
+        error token.
+        """
+        try:
+            import Quartz
+        except ImportError:
+            return "quartz_unavailable"
+        bounds = self._evpn_open_us_list(app_name, search_term)
+        if bounds is None:
+            return "no_list"
+        wx, wy, ww, wh = bounds
+        vis = self._EVPN_VISIBLE
+        index = max(0, min(index, count - 1))
+        if index <= count - vis:
+            # Row is reachable at the top: scroll it up to the first visible slot.
+            for _ in range(index):
+                self._evpn_scroll(-self._EVPN_ROW_H_PX)
+            cy = wy + int(wh * self._EVPN_ROW0_YF)
+        else:
+            # Tail rows can't reach the top; pin the list at the bottom and count up
+            # from the last row.  A ±1-row miss still lands on an adjacent US server.
+            for _ in range(count + 3):
+                self._evpn_scroll(-self._EVPN_ROW_H_PX)
+            j = (count - 1) - index  # 0 == last row
+            cy = wy + int(wh * self._EVPN_LASTROW_YF) - j * self._EVPN_ROW_H_PX
+        time.sleep(0.4)
+        cx = wx + int(ww * self._EVPN_ROW_X)
+        pt = Quartz.CGPointMake(cx, cy)
+        for k in (Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp):
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap,
+                               Quartz.CGEventCreateMouseEvent(None, k, pt, Quartz.kCGMouseButtonLeft))
+            time.sleep(0.06)
         time.sleep(1.0)
         return "connect_clicked"
 
