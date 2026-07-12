@@ -616,14 +616,20 @@ class VPNController:
     _EVPN_VISIBLE = 12             # result rows fully visible at once (conservative)
 
     def connect_with_config(self, cycle: int, vpn_cfg: VPNConfig) -> str:
-        """Connect ExpressVPN to a rotating US location and verify via the network.
+        """Connect ExpressVPN using a FIXED SEQUENTIAL rotation over every USA server.
 
-        ExpressVPN's main window is not accessibility-inspectable, so connecting is
-        driven by the validated main-window flow: open the Selected-Location card,
-        type the country into the search bar, then click one of the top result rows
-        (a distinct US city each cycle, for IP variety). Disconnect uses the
-        accessibility-exposed status-bar menu. Verification is the same network-based
-        _poll_verify (tunnel + route + IP change + country) used before.
+        ExpressVPN's own location picker lists USA servers in a stable order (index 0
+        == the first server alphabetically ... index N-1 == the last), so that index
+        IS the persistent server list — this walks index 0, 1, 2, ... N-1, then wraps
+        back to 0: cycle 1 -> server 1, cycle 2 -> server 2, ..., cycle N -> server N,
+        restarting from server 1 only once every server has been used.  The persisted
+        rotation pointer for the NEXT cycle is fixed the moment this cycle's target is
+        chosen, so the sequence itself never skips, reorders, or restarts early.  If
+        the targeted server fails to connect or verify, that failure is logged and the
+        NEXT server in the sequence is tried within the same cycle as a fallback only
+        — it does not change which server future cycles will target.  Disconnect uses
+        the accessibility-exposed status-bar menu.  Verification is the same
+        network-based _poll_verify (tunnel + route + IP change + country) used before.
         """
         provider_token = self._provider_token(vpn_cfg.app)
 
@@ -631,9 +637,8 @@ class VPNController:
             raise AutomationError(f"{vpn_cfg.app} app not found. Install and sign in first.")
         time.sleep(1.5)
 
-        # Rotate across EVERY USA server, not a fixed cap: use the count discovered from
-        # the ExpressVPN location list (cached). Each index is a distinct server; the
-        # rotation walks all of them once before repeating.
+        # Discover (or reuse the cached) full count of USA servers so the rotation
+        # walks EVERY one of them, not a fixed cap.
         row_count = self._evpn_us_server_count(vpn_cfg.app, vpn_cfg.location)
         row_count = max(1, row_count)
 
@@ -669,38 +674,33 @@ class VPNController:
                 step="06",
             )
 
+        # Fixed sequential rotation: this cycle's target is index start_idx, and the
+        # pointer for the NEXT cycle (start_idx + 1, wrapping after the last server) is
+        # committed immediately and unconditionally — nothing below can change it.
         rot = self.state.data.setdefault("vpn_rotation_index", {})
         start_idx = int(rot.get(vpn_cfg.location, 0)) % row_count
+        rot[vpn_cfg.location] = (start_idx + 1) % row_count
+        if start_idx == 0:
+            # A new lap through every server is starting: forget which on-screen rows
+            # were used in the PREVIOUS lap so they're eligible again — only drift
+            # within THIS lap should ever be corrected against.
+            self.state.data["evpn_recent_row_hashes"] = []
+        self.state.save()
         self.logger.log(
-            f"VPN rotation: starting at US row {start_idx}/{row_count}",
+            f"VPN rotation: cycle {cycle} -> US server {start_idx + 1}/{row_count} "
+            f"(index {start_idx}); next cycle will use server "
+            f"{rot[vpn_cfg.location] + 1}/{row_count}",
             step="06", rotation_index=start_idx,
         )
+        # Same-cycle fallback order only (does not touch the persisted pointer above):
+        # if the targeted server fails, try the following servers in sequence.
         rows_to_try = [(start_idx + off) % row_count for off in range(row_count)]
         last_exc: "AutomationError | None" = None
         slot_baseline_ip = baseline_ip
         slot_baseline_route = baseline_route
 
-        # Several ExpressVPN US cities share one datacenter /24, so a plain row rotation
-        # can hand out the same IP range for many cycles in a row.  Track the /24s used
-        # in the last few cycles and each row's known /24, so we advance to a server in a
-        # DIFFERENT subnet — skipping already-known repeat rows for free.
-        recent = self.state.data.setdefault("recent_vpn_subnets", [])
-        row_subnet = self.state.data.setdefault("evpn_row_subnet", {})
-        recent_window = 6
-        max_connect_attempts = 10   # bound the cost if many rows share a subnet
-        connect_attempts = 0
-        did_connect = False
-
-        for row in rows_to_try:
-            known = row_subnet.get(str(row))
-            if known and known in recent:
-                self.logger.log(
-                    f"Skipping US row {row}: known subnet {known}.x used recently",
-                    step="06", row=row, status="subnet_skip_cached",
-                )
-                continue
-
-            if did_connect:
+        for attempt_i, row in enumerate(rows_to_try):
+            if attempt_i > 0:
                 disc2 = self._evpn_disconnect(vpn_cfg.app)
                 self.logger.log(f"Retry pre-disconnect: {disc2}", step="06", status=disc2)
                 time.sleep(5.0 if disc2 == "disconnect_clicked" else 2.0)
@@ -713,20 +713,24 @@ class VPNController:
                 )
 
             self.logger.log(
-                f"Cycle {cycle} target {vpn_cfg.app} US row {row}",
+                f"Cycle {cycle} target {vpn_cfg.app} US server {row + 1}/{row_count} "
+                f"(attempt {attempt_i + 1}/{row_count})",
                 step="06", cycle=cycle, target_row=row,
             )
 
             ui_status = self._evpn_connect_us(vpn_cfg.app, row, vpn_cfg.location, row_count)
-            did_connect = True
-            connect_attempts += 1
             self.logger.log(
-                f"{vpn_cfg.app} connect US row {row}/{row_count}: {ui_status}",
+                f"{vpn_cfg.app} connect US server {row + 1}/{row_count}: {ui_status}",
                 step="06", status=ui_status, row=row,
             )
             if ui_status != "connect_clicked":
+                self.logger.log(
+                    f"US server {row + 1}/{row_count} failed to connect ({ui_status}) — "
+                    f"continuing to the next server in the sequence",
+                    step="06", row=row, status="server_connect_failed",
+                )
                 last_exc = AutomationError(
-                    f"Could not connect ExpressVPN US row {row}: {ui_status}"
+                    f"Could not connect ExpressVPN US server {row + 1}: {ui_status}"
                 )
                 continue
 
@@ -742,28 +746,16 @@ class VPNController:
                 if result == "connected_verified":
                     snap = self.net.snapshot()
                     new_ip = snap.get("public_ip")
-                    subnet = ".".join(new_ip.split(".")[:3]) if new_ip else None
-                    if subnet:
-                        row_subnet[str(row)] = subnet  # remember this row's /24
-                    if subnet and subnet in recent and connect_attempts < max_connect_attempts:
-                        self.logger.log(
-                            f"US row {row} IP {new_ip} is in a recently-used subnet "
-                            f"{subnet}.x — disconnecting and trying a different server",
-                            step="06", row=row, status="subnet_repeat_skip",
-                        )
-                        self._evpn_disconnect(vpn_cfg.app)
-                        time.sleep(2.5)
-                        last_exc = AutomationError(
-                            f"subnet {subnet}.x repeated; skipping US row {row}"
-                        )
-                        continue
-                    # Accept this server: advance the rotation past it and record its /24.
-                    rot[vpn_cfg.location] = (row + 1) % row_count
-                    if subnet:
-                        recent.append(subnet)
-                        del recent[:-recent_window]
                     if new_ip:
                         self.state.data["last_vpn_ip"] = new_ip
+                    # Remember this row's on-screen fingerprint (for the rest of THIS
+                    # lap only — cleared above whenever start_idx wraps to 0) so a later
+                    # cycle that drifts onto the same row gets nudged to a fresh one
+                    # instead of silently repeating this server before the lap is done.
+                    used_hash = self.state.data.pop("_evpn_pending_row_hash", None)
+                    if used_hash:
+                        recent_hashes = self.state.data.setdefault("evpn_recent_row_hashes", [])
+                        recent_hashes.append(used_hash)
                     self._record_server(f"US-ROW-{row}")
                     sessions = self.state.data.setdefault("vpn_sessions", [])
                     sessions.append({
@@ -776,14 +768,18 @@ class VPNController:
                         "verified_at": datetime.now().isoformat(),
                     })
                     self.state.save()
-                    return result
                 return result
             except AutomationError as exc:
+                self.logger.log(
+                    f"US server {row + 1}/{row_count} failed to verify ({exc}) — "
+                    f"continuing to the next server in the sequence",
+                    step="06", row=row, status="server_verify_failed",
+                )
                 last_exc = exc
                 continue
 
         raise last_exc or AutomationError(
-            "All ExpressVPN US rows exhausted without a verified connection"
+            "All ExpressVPN US servers exhausted without a verified connection"
         )
 
     def _evpn_window_bounds(self, app_name: str) -> "tuple[int, int, int, int] | None":
@@ -1057,11 +1053,62 @@ class VPNController:
             f"({steps} row-scrolls + {self._EVPN_VISIBLE} visible)", step="06")
         return count
 
+    @staticmethod
+    def _evpn_row_hash(wx: int, ww: int, cy: int) -> str:
+        """md5 of a narrow screenshot strip at absolute screen y=cy (the row's name
+        area).  Used to verify scroll position empirically instead of trusting blind
+        scroll-distance math — ExpressVPN's list occasionally drops or coalesces a
+        synthetic scroll event, which pixel math alone can't detect."""
+        import hashlib, tempfile, os
+        strip = os.path.join(tempfile.gettempdir(), "evpn_row_strip.png")
+        region = f"-R{wx + 120},{cy - 14},{max(1, int(ww * 0.42))},28"
+        subprocess.run(["screencapture", "-x", region, strip], check=False)
+        try:
+            with open(strip, "rb") as f:
+                return hashlib.md5(f.read()).hexdigest()
+        except Exception:
+            return ""
+
+    def _evpn_scroll_rows_verified(
+        self, wx: int, ww: int, check_cy: int, n: int, max_retries_per_step: int = 3
+    ) -> None:
+        """Scroll `n` rows down, verifying via screenshot hash after EACH step that the
+        row at check_cy actually changed before moving to the next step.  Retries a
+        single step in place (not the whole walk) when the row didn't change, which is
+        what makes the final landing row reliably match the intended offset — a blind
+        fixed-count scroll can silently drop or coalesce an event partway through and
+        land short (this is the root cause of two different indices occasionally
+        landing on the same real server)."""
+        if n <= 0:
+            return
+        prev_hash = self._evpn_row_hash(wx, ww, check_cy)
+        for step in range(n):
+            moved = False
+            for _ in range(1 + max_retries_per_step):
+                self._evpn_scroll(-self._EVPN_ROW_H_PX)
+                cur_hash = self._evpn_row_hash(wx, ww, check_cy)
+                if cur_hash and cur_hash != prev_hash:
+                    prev_hash = cur_hash
+                    moved = True
+                    break
+                time.sleep(0.15)  # extra settle before retrying this same step
+            if not moved:
+                self.logger.log(
+                    f"ExpressVPN scroll step {step + 1}/{n}: row did not change after "
+                    f"retries — continuing anyway", step="06",
+                )
+
     def _evpn_connect_us(self, app_name: str, index: int, search_term: str, count: int) -> str:
         """Connect to the USA server at rotation `index` (0-based) by searching the
-        country and scrolling to that row with pixel-precise scrolling, so EVERY server
-        is reachable — not just the first screenful.  Returns 'connect_clicked' or an
-        error token.
+        country and scrolling to that row with verified, per-step scrolling, so EVERY
+        server is reachable — not just the first screenful — and the landing row is
+        confirmed rather than assumed.  After positioning, also checks the landed row
+        against recently-CONNECTED rows (self.state['evpn_recent_row_hashes']) and
+        nudges forward if it matches, so residual drift can never repeat a server that
+        was used in the last several cycles.  Returns 'connect_clicked' or an error
+        token.  On success, stashes the clicked row's fingerprint in
+        state['_evpn_pending_row_hash'] for the caller to record once the connection is
+        verified.
         """
         try:
             import Quartz
@@ -1075,17 +1122,36 @@ class VPNController:
         index = max(0, min(index, count - 1))
         if index <= count - vis:
             # Row is reachable at the top: scroll it up to the first visible slot.
-            for _ in range(index):
-                self._evpn_scroll(-self._EVPN_ROW_H_PX)
             cy = wy + int(wh * self._EVPN_ROW0_YF)
+            self._evpn_scroll_rows_verified(wx, ww, cy, index)
         else:
-            # Tail rows can't reach the top; pin the list at the bottom and count up
-            # from the last row.  A ±1-row miss still lands on an adjacent US server.
+            # Tail rows can't reach the top; pin the list at the bottom (over-scrolling
+            # is safe here — the list simply stops at the true end) and count up from
+            # the last row.
             for _ in range(count + 3):
                 self._evpn_scroll(-self._EVPN_ROW_H_PX)
             j = (count - 1) - index  # 0 == last row
             cy = wy + int(wh * self._EVPN_LASTROW_YF) - j * self._EVPN_ROW_H_PX
         time.sleep(0.4)
+
+        # Guard against residual drift landing on a server already used earlier in this
+        # lap: nudge forward (one verified row at a time) until the fingerprint at the
+        # click position is fresh, bounded so a rare stubborn collision (e.g. very near
+        # the end of a lap, where few unused rows remain) can't stall the rotation.
+        recent_hashes = self.state.data.get("evpn_recent_row_hashes", [])
+        row_hash = self._evpn_row_hash(wx, ww, cy)
+        nudges = 0
+        while row_hash and row_hash in recent_hashes and nudges < 15:
+            self.logger.log(
+                f"ExpressVPN server at index {index} matches a recently-used server — "
+                f"nudging forward one row to reach a fresh one",
+                step="06",
+            )
+            self._evpn_scroll_rows_verified(wx, ww, cy, 1)
+            row_hash = self._evpn_row_hash(wx, ww, cy)
+            nudges += 1
+        self.state.data["_evpn_pending_row_hash"] = row_hash
+
         cx = wx + int(ww * self._EVPN_ROW_X)
         pt = Quartz.CGPointMake(cx, cy)
         for k in (Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp):
