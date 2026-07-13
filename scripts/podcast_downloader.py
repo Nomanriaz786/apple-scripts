@@ -1546,6 +1546,125 @@ class PodcastsController:
         except AutomationError:
             return "unknown_show"
 
+    # ── Follow ─────────────────────────────────────────────────────────────
+
+    # Button labels (lowercased) that mean the show is NOT yet followed.
+    _FOLLOW_LABELS = ("follow", "+ follow", "＋ follow")
+
+    # Content area starts past the sidebar; text left of this is chrome/sidebar.
+    _CONTENT_X = 200
+
+    def _find_follow_button(self, nodes: list | None = None) -> tuple[int, int] | None:
+        """Center of the Follow button if the show is currently NOT followed, else None."""
+        nodes = nodes if nodes is not None else self._ax_nodes()
+        for role, text, x, y, w, h in nodes:
+            if role == "AXButton" and text and text.strip().lower() in self._FOLLOW_LABELS:
+                return x + w // 2, y + h // 2
+        return None
+
+    def _content_show_title(self, nodes: list | None = None) -> str:
+        """Topmost content-area heading text — i.e. the show title once the page has
+        actually rendered. Returns '' if no title has rendered yet, which lets
+        click_follow_button tell "not followed yet" apart from "page still loading"
+        when no Follow button is present.
+        """
+        nodes = nodes if nodes is not None else self._ax_nodes()
+        best: tuple[int, str] | None = None
+        for role, t, x, y, w, h in nodes:
+            if (role in ("AXStaticText", "AXHeading") and t and x >= self._CONTENT_X
+                    and y > 60 and len(t.strip()) >= 2):
+                if best is None or y < best[0]:
+                    best = (y, t.strip())
+        return best[1] if best else ""
+
+    def _ax_click_button(self, button_text: str, deadline_sec: int = 8) -> str:
+        """Find a button by text (case-insensitive prefix match) via the native AX
+        walk and Quartz-click it. Non-fatal — returns 'not_found:...' if absent.
+        """
+        try:
+            import Quartz  # type: ignore[import]
+        except ImportError:
+            return "error:quartz_unavailable"
+
+        needle = button_text.strip().lower()
+        deadline = time.time() + deadline_sec
+        while time.time() < deadline:
+            nodes = self._ax_nodes()
+            for role, t, x, y, w, h in nodes:
+                if not (role == "AXButton" and x >= 0 and y >= 0 and w > 0 and h > 0):
+                    continue
+                if not t.strip().lower().startswith(needle):
+                    continue
+                cx, cy = x + w // 2, y + h // 2
+                pt = Quartz.CGPointMake(cx, cy)
+                for kind in (Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp):
+                    ev = Quartz.CGEventCreateMouseEvent(None, kind, pt, Quartz.kCGMouseButtonLeft)
+                    Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+                    time.sleep(0.06)
+                self.logger.log(
+                    f"AX button {button_text!r}: clicked {t!r} at ({cx},{cy})", step="10b")
+                return "clicked"
+            time.sleep(0.3)
+        return f"not_found:{button_text}"
+
+    def dismiss_continue_popup(self, deadline_sec: int = 2) -> str:
+        """Dismiss the 'What's New in Apple Podcasts' onboarding modal, if present, by
+        clicking its 'Continue' button. It can cover the Follow button, so this is
+        called before every Follow attempt. Non-fatal no-op when the modal is absent.
+        """
+        result = self._ax_click_button("Continue", deadline_sec=deadline_sec)
+        if result == "clicked":
+            self.logger.log("What's New popup: clicked Continue button", step="10b")
+        return result
+
+    def click_follow_button(self) -> str:
+        """Follow the current show, VERIFYING the Follow button disappears before
+        returning. A click that silently misses — e.g. because the What's New modal
+        was covering the button, or the page was still settling right after
+        navigation — would otherwise be reported as success while leaving the show
+        unfollowed.
+
+        Returns 'followed_verified', 'already_following', or 'follow_unconfirmed'.
+        """
+        try:
+            import Quartz  # type: ignore[import]
+        except ImportError:
+            return "error:quartz_unavailable"
+
+        def _click(cx: int, cy: int) -> None:
+            pt = Quartz.CGPointMake(cx, cy)
+            for kind in (Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp):
+                ev = Quartz.CGEventCreateMouseEvent(None, kind, pt, Quartz.kCGMouseButtonLeft)
+                Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+                time.sleep(0.05)
+
+        time.sleep(1.0)
+        for attempt in range(6):
+            # A "What's New"/subscription modal can surface at any time and COVER the
+            # Follow button — dismiss it before every attempt so our click lands on it.
+            self.dismiss_continue_popup(deadline_sec=2)
+            nodes = self._ax_nodes()
+            follow_pt = self._find_follow_button(nodes)
+
+            if follow_pt is None:
+                # No Follow button. If the show page has rendered (title present), the
+                # button is gone because the show is already followed. Otherwise the
+                # header just hasn't rendered yet — wait and retry.
+                if self._content_show_title(nodes):
+                    return "already_following" if attempt == 0 else "followed_verified"
+                time.sleep(1.5)
+                continue
+
+            # Follow button present — click it, then confirm it disappeared.
+            _click(*follow_pt)
+            time.sleep(3)
+            self.dismiss_continue_popup(deadline_sec=2)
+            if self._find_follow_button() is None:
+                return "followed_verified"
+            # Click didn't take (modal, or landed off-target) — loop and retry.
+
+        return "follow_unconfirmed"
+
     def click_see_all(self, time_budget_sec: int = DEFAULT_SEE_ALL_BUDGET_SEC) -> str:
         """Find and click the episode-list 'See All' via the native AX walk (~1s/pass).
 
@@ -3149,6 +3268,52 @@ class PodcastsController:
         self.logger.log(f"Clicked Downloaded sidebar at ({cx},{cy})", step="14")
         return "navigated"
 
+    def navigate_to_recently_updated_tab(self) -> str:
+        """Navigate to the Recently Updated section in the Podcasts sidebar.
+
+        Mirrors navigate_to_downloaded_tab, targeting the 'Recently Updated' sidebar
+        item instead of 'Downloaded'.
+        """
+        try:
+            import Quartz  # type: ignore[import]
+        except ImportError:
+            return "quartz_unavailable"
+
+        try:
+            run_osascript('tell application "Podcasts" to activate',
+                          timeout=5, label="activate before Recently Updated nav")
+        except AutomationError:
+            pass
+        time.sleep(0.3)
+
+        nodes = self._ax_nodes()
+        cx = cy = 0
+        for role, t, x, y, w, h in nodes:
+            if t == "Recently Updated" and x < 400 and w > 100 and h > 0:
+                cx = x + w // 2
+                cy = y + h // 2
+                break
+
+        if not cx:
+            self.logger.log("navigate_to_recently_updated_tab: ERROR:not_found", step="14")
+            return "not_found"
+
+        def _mouse(kind, px, py):
+            pt = Quartz.CGPointMake(px, py)
+            ev = Quartz.CGEventCreateMouseEvent(None, kind, pt, Quartz.kCGMouseButtonLeft)
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+            time.sleep(0.05)
+
+        _mouse(Quartz.kCGEventMouseMoved, cx, cy)
+        time.sleep(0.15)
+        _mouse(Quartz.kCGEventLeftMouseDown, cx, cy)
+        time.sleep(0.1)
+        _mouse(Quartz.kCGEventLeftMouseUp, cx, cy)
+        time.sleep(0.4)
+
+        self.logger.log(f"Clicked Recently Updated sidebar at ({cx},{cy})", step="14")
+        return "navigated"
+
     def show_downloading_page(self, wait_timeout: int = 1800) -> str:
         """Open the 'Downloading' progress modal, then wait for it to auto-close.
 
@@ -3442,6 +3607,43 @@ class PodcastsController:
         # Native saw no card — could be genuinely empty, or a render lag. Let the
         # System Events walk confirm (it's slow but authoritative).
         return self._find_downloaded_card_frame_sysevents()
+
+    def _find_downloaded_card_frame_native_only(self) -> tuple[int, int, int, int] | None:
+        """Same card search as _find_downloaded_card_frame, but WITHOUT the System
+        Events fallback (~15-30s) when nothing is found — just the ~1s native walk.
+
+        Used by the Recently Updated cleanup's own polling/verification steps
+        (_wait_card_gone, _recently_updated_confirmed_empty), which call this
+        repeatedly and don't need the authoritative-but-slow fallback on every
+        call: cleanup_all_from_recently_updated's main loop already does one full
+        (fallback-included) _find_downloaded_card_frame() call per iteration, so
+        that's where the "is a card genuinely there" authority lives.
+        """
+        nodes = self._ax_nodes()
+        win_x = win_y = win_w = win_h = 0
+        for role, _t, x, y, w, h in nodes:
+            if role == "AXWindow" and w > 400 and h > 400:
+                win_x, win_y, win_w, win_h = x, y, w, h
+                break
+        if win_w == 0:
+            return None
+        content_left = win_x + 240
+        content_top = win_y + 60
+        win_right = win_x + win_w
+        win_bottom = win_y + win_h
+        cards = [
+            (x, y, w, h) for role, _t, x, y, w, h in nodes
+            if x > content_left and y > content_top
+            and x < win_right and y < win_bottom
+            and 80 <= w <= 800 and 80 <= h <= 900
+            and h > w
+            and h < w * 4
+            and w < win_w - 100
+        ]
+        if not cards:
+            return None
+        cards.sort(key=lambda c: (c[1], c[0]))
+        return cards[0]
 
     def _find_downloaded_card_frame_sysevents(self) -> tuple[int, int, int, int] | None:
         """Fallback: System Events BFS for the first Downloaded card (~30s). Kept as a
@@ -4318,6 +4520,34 @@ class PodcastsController:
                 return True
         return False
 
+    def _click_unfollow_show_menu_item_ax(self) -> bool:
+        """Click 'Unfollow Show' in the card context menu via AX walk + Quartz.
+
+        Retries up to 3 times with 0.5s gaps — the Mac Catalyst context menu can
+        take slightly longer than the nominal wait to appear in the AX tree.
+        """
+        try:
+            import Quartz  # type: ignore[import]
+        except ImportError:
+            return False
+
+        for attempt in range(3):
+            nodes = self._ax_nodes()
+            for role, text, x, y, w, h in nodes:
+                if role == "AXButton" and h > 0 and h < 40 and text == "Unfollow Show":
+                    cx, cy = x + w // 2, y + h // 2
+                    pt = Quartz.CGPoint(x=float(cx), y=float(cy))
+                    for kind in (Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp):
+                        ev = Quartz.CGEventCreateMouseEvent(
+                            None, kind, pt, Quartz.kCGMouseButtonLeft)
+                        Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+                        time.sleep(0.05)
+                    self.logger.log(f"Clicked 'Unfollow Show' at ({cx},{cy})", step="14")
+                    return True
+            if attempt < 2:
+                time.sleep(0.5)
+        return False
+
     # ── Generic card-based cleanup (fallback when show names not captured) ───
 
     def cleanup_all_downloaded(self) -> list[dict[str, Any]]:
@@ -4579,6 +4809,211 @@ class PodcastsController:
                 removed += 1
             # No settle here — move straight on to the next show. (The card finder
             # below retries if the next card hasn't rendered yet.)
+
+        return results
+
+    def _wait_card_gone(self, prev_x: int, prev_y: int, timeout: int = 5) -> bool:
+        """Poll until the card previously at (prev_x, prev_y) is no longer the
+        top-left card — i.e. it was actually removed from the grid (or a different
+        show now occupies that slot). Used to verify a Recently Updated removal
+        completed before moving on to the next show.
+
+        Uses the native-only card search (~1s) rather than the full
+        _find_downloaded_card_frame (which falls back to a ~15s System Events scan
+        on every "no card" result) — this is just a settle-time poll, not the
+        authoritative empty check, so a fast/cheap read is enough here.
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            time.sleep(1.0)
+            frame = self._find_downloaded_card_frame_native_only()
+            if frame is None:
+                return True
+            fx, fy, _fw, _fh = frame
+            if abs(fx - prev_x) > 10 or abs(fy - prev_y) > 10:
+                return True
+        return False
+
+    def _recently_updated_confirmed_empty(self, checks: int = 1, delay: float = 1.2) -> bool:
+        """Re-confirm the Recently Updated grid is empty with one quick re-scan.
+
+        Reached only after the caller's own _find_downloaded_card_frame() call
+        (the slow, authoritative one, with the System Events fallback) already
+        returned None. This re-check uses the fast native-only search — the
+        authority that a card is really gone was already established by the
+        caller; this just re-samples once after a short settle to catch a slow
+        async unfollow. If a card resurfaces anyway, the outer
+        cleanup_all_from_recently_updated loop catches it on its next iteration.
+        """
+        for _ in range(checks):
+            time.sleep(delay)
+            self.navigate_to_recently_updated_tab()
+            if self._has_back_button():
+                self._click_back_button()
+                time.sleep(0.5)
+            if self._find_downloaded_card_frame_native_only() is not None:
+                return False
+        return True
+
+    def cleanup_all_from_recently_updated(self) -> list[dict[str, Any]]:
+        """Remove every show from the Recently Updated section: Remove Download,
+        then Unfollow Show — leaving the Downloaded section untouched.
+
+        The Recently Updated section displays show cards the same way the Downloads
+        tab does. Strategy: navigate to Recently Updated, then loop:
+          1. Find the first show card via _find_downloaded_card_frame (BFS, card geometry).
+          2. Hover the card center to reveal the ⋯ button, click it, click 'Remove Download'.
+          3. Wait 4s for the removal to complete.
+          4. Re-open the ⋯ menu on the same card and click 'Unfollow Show' — this is
+             what actually drops the card from Recently Updated (a list of followed
+             shows), since Remove Download alone only clears the local download.
+          5. Verify the card is actually gone before moving to the next one.
+          6. Re-navigate to Recently Updated and repeat until the section is empty.
+        """
+        try:
+            import Quartz  # type: ignore[import]
+        except ImportError:
+            return [{"iteration": 0, "result": "quartz_unavailable"}]
+
+        def _warp(x: int, y: int) -> None:
+            pt_w = Quartz.CGPoint(x=float(x), y=float(y))
+            Quartz.CGWarpMouseCursorPosition(pt_w)
+            mv = Quartz.CGEventCreateMouseEvent(
+                None, Quartz.kCGEventMouseMoved, pt_w, Quartz.kCGMouseButtonLeft
+            )
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap, mv)
+            time.sleep(0.05)
+
+        def _open_three_dots_menu(three_x: int, three_y: int, artwork_cx: int, artwork_cy: int) -> None:
+            """Hover artwork center → move to ⋯ → left-click to open context menu."""
+            _warp(artwork_cx, artwork_cy)
+            time.sleep(0.8)    # hover so the ⋯ button renders
+            _warp(three_x, three_y)
+            time.sleep(0.3)
+            Quartz.CGAssociateMouseAndMouseCursorPosition(True)
+            pt_td = Quartz.CGPoint(x=float(three_x), y=float(three_y))
+            for kind in (Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp):
+                ev_td = Quartz.CGEventCreateMouseEvent(
+                    None, kind, pt_td, Quartz.kCGMouseButtonLeft
+                )
+                Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev_td)
+                time.sleep(0.05)
+            time.sleep(1.2)   # Mac Catalyst context menu render time
+
+        results: list[dict[str, Any]] = []
+        for iteration in range(50):
+            # Re-navigate each iteration — card removal may shift view focus.
+            nav = self.navigate_to_recently_updated_tab()
+            if nav != "navigated":
+                self.logger.log(f"Recently Updated cleanup: nav failed ({nav})", step="14")
+                results.append({"iteration": iteration + 1, "result": f"nav_failed:{nav}"})
+                break
+
+            # One authoritative find per iteration (native walk + System Events
+            # fallback if needed) — the "card may still be rendering" / "settling"
+            # retry is handled below by _recently_updated_confirmed_empty's fast
+            # native-only re-check instead of a second slow authoritative call here.
+            frame = self._find_downloaded_card_frame()
+            if frame is None:
+                # No card found — determine whether the section is empty or we landed
+                # on a show's episode page instead of the grid. The episode page has a
+                # "Back" button in the nav bar; the grid does not.
+                if self._has_back_button():
+                    self.logger.log(
+                        "Recently Updated cleanup: on show page — clicking Back to reach grid",
+                        step="14",
+                    )
+                    self._click_back_button()
+                    time.sleep(0.8)
+                    frame = self._find_downloaded_card_frame_native_only()
+            if frame is None:
+                # No card visible — but a previous unfollow may still be settling, so
+                # confirm the section is really empty across a few re-checks before
+                # stopping. Only a persistently empty section ends cleanup.
+                if self._recently_updated_confirmed_empty():
+                    self.logger.log(
+                        f"Recently Updated cleanup: confirmed empty after "
+                        f"{iteration} removal(s)",
+                        step="14",
+                    )
+                    results.append({"iteration": iteration + 1, "result": "done"})
+                    break
+                self.logger.log(
+                    "Recently Updated cleanup: a card resurfaced after settle — continuing",
+                    step="14",
+                )
+                continue
+
+            card_x, card_y, card_w, card_h = frame
+            # Artwork on these grid cards is always a square whose side equals the
+            # card width. The ⋯ button appears at the lower-right of the artwork
+            # square (not the lower-right of the full card, which includes the title
+            # strip below the artwork).
+            artwork_h = card_w
+            three_x = card_x + card_w - 20       # 20 px inside right edge of artwork
+            three_y = card_y + artwork_h - 20     # 20 px above bottom of artwork square
+            artwork_cx = card_x + card_w // 2
+            artwork_cy = card_y + artwork_h // 2
+
+            self.logger.log(
+                f"Recently Updated cleanup card {iteration + 1}: "
+                f"({card_x},{card_y},{card_w},{card_h}) "
+                f"artwork_cx=({artwork_cx},{artwork_cy}) three_dots=({three_x},{three_y})",
+                step="14",
+            )
+
+            # Bring Podcasts to front explicitly before any mouse/key events.
+            try:
+                run_osascript(
+                    'tell application "Podcasts" to activate',
+                    timeout=5, label="activate Podcasts before cleanup click",
+                )
+                time.sleep(0.3)
+            except AutomationError:
+                pass
+
+            # Step 1: three-dot menu → Remove Download.
+            _open_three_dots_menu(three_x, three_y, artwork_cx, artwork_cy)
+            remove_ok = self._click_remove_menu_item_ax()
+            if remove_ok:
+                self._click_confirmation_remove(max_attempts=5)
+            else:
+                self.logger.log(
+                    f"Recently Updated cleanup card {iteration + 1}: "
+                    "Remove Download item not found via AX — continuing to Unfollow",
+                    step="14",
+                )
+
+            # Step 2: wait for the removal to complete before continuing.
+            time.sleep(4)
+
+            # Step 3: re-open the three-dot menu on the same card → Unfollow Show.
+            _open_three_dots_menu(three_x, three_y, artwork_cx, artwork_cy)
+            unfollow_ok = self._click_unfollow_show_menu_item_ax()
+            confirm = "no_sheet"
+            if unfollow_ok:
+                confirm = self._click_confirmation_remove(max_attempts=5)
+            else:
+                self.logger.log(
+                    f"Recently Updated cleanup card {iteration + 1}: "
+                    "Unfollow Show item not found via AX",
+                    step="14",
+                )
+
+            # Step 4: verify this show actually left Recently Updated before moving on.
+            settled = self._wait_card_gone(card_x, card_y, timeout=5)
+
+            result_label = "removed:unfollowed" if unfollow_ok else "unfollow_failed"
+            if not remove_ok:
+                result_label += ":remove_download_not_found"
+            if confirm not in ("no_sheet",):
+                result_label += f"+confirmed:{confirm}"
+            result_label += ":verified" if settled else ":unverified"
+
+            self.logger.log(
+                f"Recently Updated cleanup card {iteration + 1}: {result_label}", step="14"
+            )
+            results.append({"iteration": iteration + 1, "result": result_label})
 
         return results
 
@@ -4986,6 +5421,24 @@ class Orchestrator:
         cycle_shows.append(show_entry)
         self.state.save()
 
+        # Follow the show before touching episodes. This must be confirmed before
+        # continuing — a click that silently misses must not be allowed to slip
+        # through and leave the show unfollowed.
+        follow_result = self.podcasts.click_follow_button()
+        self.logger.log(f"Follow button: {follow_result}", step="10b",
+                        tab=tab_task.tab, show_name=show_name, status=follow_result)
+        show_entry["follow_result"] = follow_result
+        self.state.save()
+        if follow_result == "follow_unconfirmed":
+            self.state.record_failure(
+                step="10b", error="follow_unconfirmed",
+                current_tab=tab_task.tab, show_name=show_name,
+            )
+            raise AutomationError(
+                f"Could not confirm Follow for tab {tab_task.tab} ({show_name!r}) "
+                "after retries"
+            )
+
         see_all_result = self.podcasts.click_see_all()
         self.logger.log(f"See All {see_all_result}", step="11", status=see_all_result)
         self.state.data.setdefault("see_all_state", {})[str(tab_task.tab)] = see_all_result
@@ -5051,18 +5504,21 @@ class Orchestrator:
         self.logger.log(f"Download check: {check}", step="14", **check)
 
     def _startup_cleanup(self) -> None:
-        """Remove stale downloaded items before the first cycle begins.
+        """Remove stale shows from Recently Updated before the first cycle begins.
 
-        Called only when clean_start=True in tasks.json.
+        Called only when clean_start=True in tasks.json. Leaves the Downloaded
+        section untouched — cleanup only ever acts on Recently Updated.
         """
-        self.logger.log("clean_start: checking Downloads tab for stale items", step="00")
+        self.logger.log(
+            "clean_start: checking Recently Updated section for stale items", step="00"
+        )
         try:
             self.podcasts.activate()
             self.podcasts.wait_for_window()
-            results = self.podcasts.cleanup_all_from_downloads_tab()
+            results = self.podcasts.cleanup_all_from_recently_updated()
             removed = sum(1 for r in results if "removed" in r.get("result", ""))
             self.logger.log(
-                f"clean_start cleanup done: {removed} episode(s) removed", step="00"
+                f"clean_start cleanup done: {removed} show(s) removed", step="00"
             )
         except Exception as exc:
             self.logger.log(f"clean_start cleanup error (non-fatal): {exc}", step="00")
@@ -5092,14 +5548,10 @@ class Orchestrator:
             )
         self.state.mark_phase(cycle, "downloads_stable")
 
-        # Each downloaded show is one card on the Downloads tab. We know how many we
-        # queued this cycle, so tell cleanup to stop after removing exactly that many
-        # — this skips the ~30s-each empty-grid searches that used to run at the end.
-        shows = self.state.data.get("processed_shows", {}).get(str(cycle), [])
-        expected_cards = sum(1 for s in shows if s.get("videos_downloaded")) or None
-
-        # Remove every downloaded show from the Downloads tab.
-        results = self.podcasts.cleanup_all_from_downloads_tab(expected_cards=expected_cards)
+        # Remove every show from Recently Updated (Remove Download, then Unfollow
+        # Show) until the section is confirmed empty. The Downloaded section is left
+        # untouched — downloaded shows stay in place.
+        results = self.podcasts.cleanup_all_from_recently_updated()
 
         for r in results:
             self.state.add_cleanup_result(cycle=cycle, **r)
@@ -5107,7 +5559,7 @@ class Orchestrator:
         removed = sum(1 for r in results if "removed" in r.get("result", ""))
         self.state.mark_phase(cycle, "cleanup_completed")
         self.logger.log(
-            f"Cleanup finished: {removed} episode(s) removed ({len(results)} actions)",
+            f"Cleanup finished: {removed} show(s) removed ({len(results)} actions)",
             step="14", cycle=cycle, action_count=len(results), removed_count=removed,
         )
 
