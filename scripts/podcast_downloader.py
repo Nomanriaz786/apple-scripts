@@ -4259,6 +4259,43 @@ class PodcastsController:
         # System Events walk confirm (it's slow but authoritative).
         return self._find_downloaded_card_frame_sysevents()
 
+    def _find_downloaded_card_frame_native_only(self) -> tuple[int, int, int, int] | None:
+        """Same card search as _find_downloaded_card_frame, but WITHOUT the System
+        Events fallback (~15-30s) when nothing is found — just the ~1s native walk.
+
+        Used by the Recently Updated cleanup's own polling/verification steps
+        (_wait_card_gone, _recently_updated_confirmed_empty), which call this
+        repeatedly and don't need the authoritative-but-slow fallback on every
+        call: cleanup_all_from_recently_updated's main loop already does one full
+        (fallback-included) _find_downloaded_card_frame() call per iteration, so
+        that's where the "is a card genuinely there" authority lives.
+        """
+        nodes = self._ax_nodes()
+        win_x = win_y = win_w = win_h = 0
+        for role, _t, x, y, w, h in nodes:
+            if role == "AXWindow" and w > 400 and h > 400:
+                win_x, win_y, win_w, win_h = x, y, w, h
+                break
+        if win_w == 0:
+            return None
+        content_left = win_x + 240
+        content_top = win_y + 60
+        win_right = win_x + win_w
+        win_bottom = win_y + win_h
+        cards = [
+            (x, y, w, h) for role, _t, x, y, w, h in nodes
+            if x > content_left and y > content_top
+            and x < win_right and y < win_bottom
+            and 80 <= w <= 800 and 80 <= h <= 900
+            and h > w
+            and h < w * 4
+            and w < win_w - 100
+        ]
+        if not cards:
+            return None
+        cards.sort(key=lambda c: (c[1], c[0]))
+        return cards[0]
+
     def _find_downloaded_card_frame_sysevents(self) -> tuple[int, int, int, int] | None:
         """Fallback: System Events BFS for the first Downloaded card (~30s). Kept as a
         safety net for _find_downloaded_card_frame.
@@ -5426,16 +5463,21 @@ class PodcastsController:
 
         return results
 
-    def _wait_card_gone(self, prev_x: int, prev_y: int, timeout: int = 10) -> bool:
+    def _wait_card_gone(self, prev_x: int, prev_y: int, timeout: int = 5) -> bool:
         """Poll until the card previously at (prev_x, prev_y) is no longer the
         top-left card — i.e. it was actually removed from the grid (or a different
         show now occupies that slot). Used to verify a Recently Updated removal
         completed before moving on to the next show.
+
+        Uses the native-only card search (~1s) rather than the full
+        _find_downloaded_card_frame (which falls back to a ~15s System Events scan
+        on every "no card" result) — this is just a settle-time poll, not the
+        authoritative empty check, so a fast/cheap read is enough here.
         """
         deadline = time.time() + timeout
         while time.time() < deadline:
             time.sleep(1.0)
-            frame = self._find_downloaded_card_frame()
+            frame = self._find_downloaded_card_frame_native_only()
             if frame is None:
                 return True
             fx, fy, _fw, _fh = frame
@@ -5443,12 +5485,16 @@ class PodcastsController:
                 return True
         return False
 
-    def _recently_updated_confirmed_empty(self, checks: int = 2, delay: float = 1.2) -> bool:
-        """Re-confirm the Recently Updated grid is empty across a few re-scans.
+    def _recently_updated_confirmed_empty(self, checks: int = 1, delay: float = 1.2) -> bool:
+        """Re-confirm the Recently Updated grid is empty with one quick re-scan.
 
-        Reached only after _find_downloaded_card_frame already returned None; the
-        extra re-checks make the "no shows remain" decision resilient to a slow
-        async unfollow that might still be settling a card out.
+        Reached only after the caller's own _find_downloaded_card_frame() call
+        (the slow, authoritative one, with the System Events fallback) already
+        returned None. This re-check uses the fast native-only search — the
+        authority that a card is really gone was already established by the
+        caller; this just re-samples once after a short settle to catch a slow
+        async unfollow. If a card resurfaces anyway, the outer
+        cleanup_all_from_recently_updated loop catches it on its next iteration.
         """
         for _ in range(checks):
             time.sleep(delay)
@@ -5456,7 +5502,7 @@ class PodcastsController:
             if self._has_back_button():
                 self._click_back_button()
                 time.sleep(0.5)
-            if self._find_downloaded_card_frame() is not None:
+            if self._find_downloaded_card_frame_native_only() is not None:
                 return False
         return True
 
@@ -5514,11 +5560,11 @@ class PodcastsController:
                 results.append({"iteration": iteration + 1, "result": f"nav_failed:{nav}"})
                 break
 
+            # One authoritative find per iteration (native walk + System Events
+            # fallback if needed) — the "card may still be rendering" / "settling"
+            # retry is handled below by _recently_updated_confirmed_empty's fast
+            # native-only re-check instead of a second slow authoritative call here.
             frame = self._find_downloaded_card_frame()
-            if frame is None:
-                # Retry once — card may still be rendering after navigation.
-                time.sleep(0.5)
-                frame = self._find_downloaded_card_frame()
             if frame is None:
                 # No card found — determine whether the section is empty or we landed
                 # on a show's episode page instead of the grid. The episode page has a
@@ -5530,10 +5576,7 @@ class PodcastsController:
                     )
                     self._click_back_button()
                     time.sleep(0.8)
-                    frame = self._find_downloaded_card_frame()
-                    if frame is None:
-                        time.sleep(0.5)
-                        frame = self._find_downloaded_card_frame()
+                    frame = self._find_downloaded_card_frame_native_only()
             if frame is None:
                 # No card visible — but a previous unfollow may still be settling, so
                 # confirm the section is really empty across a few re-checks before
@@ -5609,7 +5652,7 @@ class PodcastsController:
                 )
 
             # Step 4: verify this show actually left Recently Updated before moving on.
-            settled = self._wait_card_gone(card_x, card_y, timeout=10)
+            settled = self._wait_card_gone(card_x, card_y, timeout=5)
 
             result_label = "removed:unfollowed" if unfollow_ok else "unfollow_failed"
             if not remove_ok:
