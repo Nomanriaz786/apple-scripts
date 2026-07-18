@@ -1,5 +1,5 @@
 {
-  "repeat": 5,
+  "repeat": 50,
   "vpn": {
     "enabled": true,
     "app": "ProtonVPN",
@@ -16,17 +16,29 @@
     {
       "tab": 1,
       "videos": [
-        1,
-        5,
-        20
+        1
       ]
     },
     {
       "tab": 2,
       "videos": [
         1,
-        7,
-        10
+        3
+      ]
+    },
+    {
+      "tab": 3,
+      "videos": [
+        1,
+        2
+      ]
+    },
+    {
+      "tab": 4,
+      "videos": [
+        1,
+        2,
+        3
       ]
     }
   ],
