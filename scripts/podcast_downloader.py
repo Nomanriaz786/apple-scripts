@@ -6474,13 +6474,103 @@ end tell
 
         # Navigate the System Settings panes by AX label (resolution/scaling-independent),
         # falling back to the old fixed coordinates only when AX can't resolve an element.
-        # 1) Apple Account sidebar row (labeled with the account name in the sidebar; the
-        #    pane header reads "Apple Account" on Sequoia+, "Apple ID" on older macOS).
-        acct_pos = _find_in_sys_settings(["Apple Account", "Apple ID"])
-        _qclick(*(acct_pos or (wx + 84, wy + 113)))
-        time.sleep(1.8)
+
+        def _find_profile_row_pos() -> "tuple[int, int] | None":
+            """Center of the Apple Account/Profile row at the TOP of the sidebar.
+
+            Prefers a label match ('Apple Account' / 'Apple ID' / the signed-in
+            email, which always contains '@') and explicitly excludes any
+            candidate whose text mentions 'General', so a stray substring match
+            can never resolve to the General row. If no label matches, falls back
+            to the topmost sidebar row (by y-position) that isn't 'General' — the
+            profile row is always first in the sidebar, above General — which is
+            reliable across window sizes/macOS versions, unlike a fixed pixel
+            offset.
+            """
+            if not _ax_ok:
+                return None
+            try:
+                ss_pid = int(subprocess.run(
+                    ["osascript", "-e",
+                     'tell application "System Events" to return unix id of process "System Settings"'],
+                    capture_output=True, text=True, timeout=5,
+                ).stdout.strip())
+            except Exception:
+                return None
+            root = AXUIElementCreateApplication(ss_pid)
+            stack = [root]
+            seen = 0
+            sidebar_right = wx + 220  # sidebar is the narrow left column
+            content_top = wy + 60     # excludes the toolbar AND the global menu bar
+                                       # (menu bar items report y=0, an absolute screen
+                                       # coordinate, which is otherwise indistinguishable
+                                       # from a real sidebar row by x alone)
+            candidates: "list[tuple[int, int, int, int, str]]" = []
+            while stack and seen < 12000:
+                el = stack.pop()
+                seen += 1
+                text = ""
+                for attr in (kAXDescriptionAttribute, kAXValueAttribute, kAXTitleAttribute):
+                    v = _attr(el, attr)
+                    if isinstance(v, str) and v.strip():
+                        text = v.strip()
+                        break
+                if text:
+                    pv = _attr(el, kAXPositionAttribute)
+                    sv = _attr(el, kAXSizeAttribute)
+                    if pv and sv:
+                        okp, pt = AXValueGetValue(pv, kAXValueCGPointType, None)
+                        oks, sz = AXValueGetValue(sv, kAXValueCGSizeType, None)
+                        if (okp and oks and int(pt.x) < sidebar_right
+                                and int(pt.y) >= content_top
+                                and 0 < int(sz.width)
+                                and 0 < int(sz.height) <= 50):  # single row, not a container
+                            candidates.append(
+                                (int(pt.y), int(pt.x), int(sz.width), int(sz.height), text))
+                ch = _attr(el, kAXChildrenAttribute)
+                if ch:
+                    stack.extend(ch)
+            if not candidates:
+                return None
+            candidates.sort(key=lambda c: c[0])
+            # Normalize non-breaking spaces (System Settings renders "Apple\xa0Account"
+            # with U+00A0, not a plain space) so the label match actually fires.
+            for y, x, w, h, text in candidates:
+                low = text.replace("\xa0", " ").lower()
+                if "general" in low:
+                    continue
+                if "apple account" in low or "apple id" in low or "@" in text:
+                    return x + w // 2, y + h // 2
+            for y, x, w, h, text in candidates:
+                if "general" not in text.replace("\xa0", " ").lower():
+                    return x + w // 2, y + h // 2
+            return None
+
+        # 1) Apple Account / Profile row — click, then VERIFY the correct pane
+        #    actually opened (its 'Media & Purchases' item becomes visible) before
+        #    proceeding. Retries the click (re-resolving the row each time) if the
+        #    pane didn't open, instead of continuing into whatever pane — e.g.
+        #    General — ended up open.
+        media_pos = None
+        for attempt in range(3):
+            acct_pos = _find_profile_row_pos()
+            _qclick(*(acct_pos or (wx + 84, wy + 113)))
+            time.sleep(1.8)
+            deadline = time.time() + 3.0
+            while time.time() < deadline:
+                media_pos = _find_in_sys_settings(["Media & Purchases", "Media and Purchases"])
+                if media_pos:
+                    break
+                time.sleep(0.4)
+            if media_pos:
+                break
+            self.logger.log(
+                f"Sign-out: Profile/Apple Account pane not confirmed on attempt "
+                f"{attempt + 1} (acct_pos={acct_pos}) — retrying",
+                step="14a",
+            )
+
         # 2) Media & Purchases (holds the Podcasts/media Sign Out button).
-        media_pos = _find_in_sys_settings(["Media & Purchases", "Media and Purchases"])
         _qclick(*(media_pos or (int(wx + ww * 0.65), int(wy + wh * 0.82))))
         time.sleep(2.0)
 
