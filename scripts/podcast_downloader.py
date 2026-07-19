@@ -3923,6 +3923,20 @@ class PodcastsController:
         self.logger.log(f"Clicked Downloaded sidebar at ({cx},{cy})", step="14")
         return "navigated"
 
+    def has_downloaded_cards(self) -> bool:
+        """Fast check: True if the Downloaded section currently shows at least one
+        show card. Navigates to Downloaded first, then uses the quick native-only
+        card search (~1s) rather than _find_downloaded_card_frame's System Events
+        fallback, so an already-empty grid is detected without a ~30s scan.
+        """
+        nav = self.navigate_to_downloaded_tab()
+        if nav != "navigated":
+            return False
+        if self._has_back_button():
+            self._click_back_button()
+            time.sleep(0.5)
+        return self._find_downloaded_card_frame_native_only() is not None
+
     def navigate_to_recently_updated_tab(self) -> str:
         """Navigate to the Recently Updated section in the Podcasts sidebar.
 
@@ -5728,23 +5742,28 @@ end tell
             except AutomationError:
                 pass
 
-            # Step 1: three-dot menu → Remove Download.
+            # Step 1: three-dot menu → Remove Download, when the show has one. Not
+            # every show exposes this item (e.g. it was never downloaded), so its
+            # absence must not interrupt cleanup.
             _open_three_dots_menu(three_x, three_y, artwork_cx, artwork_cy)
             remove_ok = self._click_remove_menu_item_ax()
             if remove_ok:
                 self._click_confirmation_remove(max_attempts=5)
+                # Step 2: wait for the removal to complete before continuing.
+                time.sleep(4)
+                # Step 3: re-open the three-dot menu on the same card → Unfollow
+                # Show (selecting Remove Download closed the menu that opened it).
+                _open_three_dots_menu(three_x, three_y, artwork_cx, artwork_cy)
             else:
+                # No Remove Download item — the menu opened above is still showing
+                # (nothing was clicked to dismiss it), so go straight to Unfollow
+                # Show in that same menu instead of reopening it.
                 self.logger.log(
                     f"Recently Updated cleanup card {iteration + 1}: "
-                    "Remove Download item not found via AX — continuing to Unfollow",
+                    "Remove Download item not found via AX — skipping straight to Unfollow",
                     step="14",
                 )
 
-            # Step 2: wait for the removal to complete before continuing.
-            time.sleep(4)
-
-            # Step 3: re-open the three-dot menu on the same card → Unfollow Show.
-            _open_three_dots_menu(three_x, three_y, artwork_cx, artwork_cy)
             unfollow_ok = self._click_unfollow_show_menu_item_ax()
             confirm = "no_sheet"
             if unfollow_ok:
@@ -7281,8 +7300,7 @@ class Orchestrator:
         self.state.mark_phase(cycle, "downloads_stable")
 
         # Remove every show from Recently Updated (Remove Download, then Unfollow
-        # Show) until the section is confirmed empty. The Downloaded section is left
-        # untouched — downloaded shows stay in place.
+        # Show) until the section is confirmed empty.
         results = self.podcasts.cleanup_all_from_recently_updated()
 
         for r in results:
@@ -7294,6 +7312,31 @@ class Orchestrator:
             f"Cleanup finished: {removed} show(s) removed ({len(results)} actions)",
             step="14", cycle=cycle, action_count=len(results), removed_count=removed,
         )
+
+        # Now that Recently Updated is confirmed empty, sweep the Downloaded
+        # section too — a fast card check first, so an already-empty grid is
+        # skipped immediately instead of paying for a cleanup pass.
+        if self.podcasts.has_downloaded_cards():
+            self.logger.log(
+                "Downloaded section: cards remaining — cleaning up", step="14", cycle=cycle,
+            )
+            downloaded_results = self.podcasts.cleanup_all_from_downloads_tab()
+            for r in downloaded_results:
+                self.state.add_cleanup_result(cycle=cycle, section="downloaded", **r)
+            downloaded_removed = sum(
+                1 for r in downloaded_results if "removed" in r.get("result", "")
+            )
+            self.state.mark_phase(cycle, "downloaded_cleanup_completed")
+            self.logger.log(
+                f"Downloaded section cleanup finished: {downloaded_removed} show(s) "
+                f"removed ({len(downloaded_results)} actions)",
+                step="14", cycle=cycle,
+                action_count=len(downloaded_results), removed_count=downloaded_removed,
+            )
+        else:
+            self.logger.log(
+                "Downloaded section: no cards remaining — skipping", step="14", cycle=cycle,
+            )
 
 
 # -----------------------------------------------------------------------------
