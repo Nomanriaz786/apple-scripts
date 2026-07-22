@@ -3681,6 +3681,42 @@ class PodcastsController:
         except AutomationError:
             return "no_dialog"
 
+    def _dismiss_failed_download_dialog(self) -> str:
+        """If a 'download failed' alert (Retry / Done buttons) is showing, dismiss
+        it by clicking Done — never Retry, so a failed episode is skipped instead
+        of automatically retried. Non-fatal no-op when no such dialog is present.
+
+        Returns 'dismissed:<x>,<y>' or 'no_dialog'.
+        """
+        nodes = self._ax_nodes()
+        has_retry = False
+        done_pos: "tuple[int, int] | None" = None
+        for role, text, x, y, w, h in nodes:
+            if role != "AXButton" or w <= 0 or h <= 0:
+                continue
+            low = text.strip().lower()
+            if low == "retry":
+                has_retry = True
+            elif low == "done":
+                done_pos = (x + w // 2, y + h // 2)
+        if not has_retry or done_pos is None:
+            return "no_dialog"
+
+        try:
+            import Quartz  # type: ignore[import]
+        except ImportError:
+            return "error:quartz_unavailable"
+
+        cx, cy = done_pos
+        pt = Quartz.CGPointMake(cx, cy)
+        for kind in (Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp):
+            ev = Quartz.CGEventCreateMouseEvent(None, kind, pt, Quartz.kCGMouseButtonLeft)
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+            time.sleep(0.05)
+        time.sleep(0.5)
+        self.logger.log(f"Download failed dialog: clicked Done at ({cx},{cy})", step="13")
+        return f"dismissed:{cx},{cy}"
+
     def cleanup_episode_row(self, video_no: int) -> str:
         """Remove a download via the episode-list ⋯ menu (Down×1+Enter = Remove Download).
 
@@ -4090,6 +4126,10 @@ class PodcastsController:
         deadline = t_open + wait_timeout
         while time.time() < deadline:
             time.sleep(3)
+            # A per-episode download failure shows a Retry/Done alert that would
+            # otherwise sit blocking this wait forever. Always dismiss it with
+            # Done — never Retry — then keep polling for the modal to close.
+            self._dismiss_failed_download_dialog()
             if not self._downloads_modal_open():
                 waited = int(time.time() - t_open)
                 self.logger.log(
@@ -4516,6 +4556,9 @@ class PodcastsController:
         deadline = time.time() + timeout
         while time.time() < deadline:
             time.sleep(2)
+            # Dismiss a per-episode download-failure alert with Done — never
+            # Retry — so it can't sit blocking this wait indefinitely.
+            self._dismiss_failed_download_dialog()
             elapsed = int(time.time() - t_start)
             still_active = self._find_downloading_button() is not None
             self.logger.log(f"Downloads in progress ({elapsed}s)", step="14")
@@ -5428,6 +5471,8 @@ end tell
 
         results: list[dict[str, Any]] = []
         removed = 0
+        stuck_pos: "tuple[int, int] | None" = None
+        stuck_count = 0
         for iteration in range(50):
             # Re-navigate each iteration — card removal may shift view focus.
             nav = self.navigate_to_downloaded_tab()
@@ -5475,6 +5520,29 @@ end tell
                 continue
 
             card_x, card_y, card_w, card_h = frame
+
+            # Detect a card that keeps failing to be removed: if the SAME card
+            # (same position) is found again after a removal attempt, retrying it
+            # blindly up to the full 50-iteration budget is what used to make
+            # cleanup appear "stuck" for many minutes. Bound the retries per card
+            # and give up loudly instead of silently spinning.
+            if (stuck_pos is not None
+                    and abs(card_x - stuck_pos[0]) <= 10
+                    and abs(card_y - stuck_pos[1]) <= 10):
+                stuck_count += 1
+            else:
+                stuck_count = 0
+                stuck_pos = (card_x, card_y)
+            if stuck_count >= 3:
+                self.logger.log(
+                    f"Downloads cleanup: card at ({card_x},{card_y}) still present "
+                    f"after {stuck_count} removal attempts — aborting to avoid an "
+                    "infinite loop",
+                    step="14",
+                )
+                results.append({"iteration": iteration + 1, "result": "stuck"})
+                break
+
             # Card count before this removal — used afterwards to confirm the (async)
             # removal actually took effect before we scan for the next card.
             cards_before = self._count_downloaded_cards()
@@ -5513,11 +5581,6 @@ end tell
                 Quartz.CGEventPost(Quartz.kCGHIDEventTap, mv)
                 time.sleep(0.05)
 
-            def _key(vk: int, down: bool) -> None:
-                ev = Quartz.CGEventCreateKeyboardEvent(None, vk, down)
-                Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
-                time.sleep(0.07)
-
             def _open_three_dots_menu() -> None:
                 """Hover artwork center → move to ⋯ → left-click to open context menu."""
                 _warp(artwork_cx, artwork_cy)
@@ -5540,23 +5603,34 @@ end tell
             ax_ok = self._click_unfollow_show_menu_item_ax()
             confirm = "no_sheet"
             actual_removed = False
+            remove_ok = False
 
             if not ax_ok:
-                # Keyboard fallback: 'Unfollow Show' is first item → Down×1 + Enter
+                # 'Unfollow Show' isn't in this menu (e.g. the show was already
+                # unfollowed elsewhere but still holds a local download) — skip
+                # that step entirely and go straight for Remove Download instead.
+                # The menu opened above is STILL OPEN (nothing was clicked to
+                # dismiss it, since Unfollow Show was never found), so reuse it
+                # directly instead of reopening — a second open-menu click here
+                # lands on an already-open menu and can dismiss it before Remove
+                # Download is ever found, which is what silently skipped removal.
                 self.logger.log(
-                    f"Downloads cleanup card {iteration + 1}: Unfollow Show not found via AX — keyboard fallback",
+                    f"Downloads cleanup card {iteration + 1}: Unfollow Show not "
+                    "found via AX — trying Remove Download instead",
                     step="14",
                 )
-                _key(0x7D, True); _key(0x7D, False)
-                time.sleep(0.3)
-                _key(0x24, True); _key(0x24, False)
-                time.sleep(0.8)
+                remove_ok = self._click_remove_menu_item_ax()
 
             time.sleep(0.4)
             confirm = self._click_confirmation_remove()
             actual_removed = True
 
-            result_label = "unfollowed:ax" if ax_ok else "unfollowed:keyboard"
+            if ax_ok:
+                result_label = "unfollowed:ax"
+            elif remove_ok:
+                result_label = "removed:ax"
+            else:
+                result_label = "unfollow_and_remove_not_found"
             if confirm not in ("no_sheet",):
                 result_label += f"+confirmed:{confirm}"
 
@@ -6842,6 +6916,16 @@ class Orchestrator:
             if self.config.clean_start:
                 self._startup_cleanup()
 
+            # Tracks how many accounts have actually been consumed so far in THIS
+            # run (only incremented for a cycle that actually executes below — see
+            # the skip-continue right below). Accounts are removed from the input
+            # file as each cycle finishes, so a fresh run always starts back at
+            # index 0 = the first remaining account; using `cycle` itself for this
+            # would incorrectly skip that first account whenever `completed_cycles`
+            # from an earlier run (against a longer account list) still contains
+            # low cycle numbers.
+            account_cursor = 0
+
             for cycle in range(1, self.config.repeat + 1):
                 if cycle in self.state.data["completed_cycles"]:
                     self.logger.log(f"Cycle {cycle} already completed — skipping", step="05",
@@ -6863,6 +6947,8 @@ class Orchestrator:
                 self.logger.log(f"Starting cycle {cycle}", step="05", cycle=cycle,
                                 skip_to_cleanup=skip_to_cleanup)
                 self.state.mark_phase(cycle, "cycle_started")
+                if self.config.accounts:
+                    self.state.data["current_account_index"] = account_cursor
 
                 if skip_to_cleanup:
                     self.logger.log(
@@ -6898,6 +6984,21 @@ class Orchestrator:
                             f"show_downloading_page error (non-fatal): {exc}",
                             step="13",
                         )
+
+                if not downloads_done:
+                    # Never sign out while downloads might still be in progress.
+                    # show_downloading_page() can return without confirming
+                    # completion (timeout/error), and a resumed run that skipped
+                    # straight to cleanup doesn't know either — in both cases
+                    # downloads_done is still False here, so verify completion now
+                    # using the same stability check the cleanup phase already
+                    # relies on, instead of signing out on an unconfirmed state.
+                    dl_status = self.podcasts.wait_for_downloads_stable(timeout=180)
+                    downloads_done = dl_status in ("completed", "completed_fast")
+                    self.logger.log(
+                        f"Download completion check before sign-out: {dl_status}",
+                        step="13", cycle=cycle, downloads_done=downloads_done,
+                    )
 
                 if self.config.accounts:
                     self.logger.log("Signing out before cleanup", step="14a")
@@ -6935,7 +7036,8 @@ class Orchestrator:
                 # on-disk file changes; the in-memory config is untouched so the
                 # remaining cycles keep their existing account indexing.
                 if self.config.accounts:
-                    used = self.config.accounts[(cycle - 1) % len(self.config.accounts)]
+                    used = self.config.accounts[account_cursor % len(self.config.accounts)]
+                    account_cursor += 1
                     remove_result = self._remove_account_from_input(used.email)
                     self.logger.log(
                         f"Removed account from input after cycle {cycle}: "
@@ -7222,7 +7324,15 @@ class Orchestrator:
         # sign_in_to_podcasts returns immediately if already on the correct account,
         # so calling it on every tab is safe — it's a no-op after the first tab.
         if self.config.accounts:
-            account = self.config.accounts[(cycle - 1) % len(self.config.accounts)]
+            # current_account_index is set once per cycle in run() — it tracks how
+            # many accounts have actually been consumed THIS run, independent of
+            # `cycle` (which can start past 1 on a resumed run against a shrunk
+            # account list, and previously caused the first remaining account to be
+            # skipped). Fall back to the old cycle-based index if it's ever unset.
+            account_idx = self.state.data.get("current_account_index")
+            if account_idx is None:
+                account_idx = cycle - 1
+            account = self.config.accounts[account_idx % len(self.config.accounts)]
             self.logger.log(f"Signing in with account {account.email}", step="10a")
             sign_in_result = self.podcasts.sign_in_to_podcasts(account.email, account.password)
             self.logger.log(
@@ -7234,6 +7344,23 @@ class Orchestrator:
                  "result": sign_in_result}
             )
             self.state.save()
+
+            # Verify the account session is actually ready before Follow/download
+            # touch it. A sign-in that takes longer than usual can still report
+            # success in the Account menu before the account is fully initialized,
+            # leaving Follow to silently miss. Poll the same reliable Account-menu
+            # check sign-in itself relies on, rather than adding a fixed delay.
+            ready_deadline = time.time() + 20
+            signed_in_email = ""
+            while time.time() < ready_deadline:
+                signed_in_email = self.podcasts.get_signed_in_email()
+                if account.email.lower() in signed_in_email.lower():
+                    break
+                time.sleep(2)
+            self.logger.log(
+                f"Account readiness check: signed_in_email={signed_in_email!r}",
+                step="10a", tab=tab_task.tab, expected_email=account.email,
+            )
 
         # The "What's New in Apple Podcasts" modal can appear right after a fresh
         # sign-in and blocks the Follow button — dismiss it before Follow.
