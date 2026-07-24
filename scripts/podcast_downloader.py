@@ -7024,17 +7024,15 @@ class Orchestrator:
 
                 self.podcasts.quit_app()
 
-                completed = list(self.state.data["completed_cycles"])
-                completed.append(cycle)
-                self.state.update(completed_cycles=completed,
-                                  current_tab=None, current_video=None)
-                self.state.mark_phase(cycle, "cycle_completed")
-                self.logger.log(f"Cycle {cycle} complete", step="15", cycle=cycle)
-
-                # This cycle's account is done — remove it from the input file so
-                # each ID is dropped right after its own cycle completes. Only the
-                # on-disk file changes; the in-memory config is untouched so the
-                # remaining cycles keep their existing account indexing.
+                # Remove this cycle's account from the input file BEFORE marking the
+                # cycle complete. If the process is interrupted between the two
+                # steps, this order guarantees the removal — the definitive signal
+                # that an ID was fully processed — has already happened; a resumed
+                # run then retries this same cycle number against the next
+                # available account instead of silently reusing account_cursor and
+                # leaving one ID unprocessed while completed_cycles still reports
+                # every cycle as done (cycle counter and account processing were
+                # able to go out of sync in the old order).
                 if self.config.accounts:
                     used = self.config.accounts[account_cursor % len(self.config.accounts)]
                     account_cursor += 1
@@ -7044,6 +7042,13 @@ class Orchestrator:
                         f"{used.email} → {remove_result}",
                         step="15", cycle=cycle, email=used.email, result=remove_result,
                     )
+
+                completed = list(self.state.data["completed_cycles"])
+                completed.append(cycle)
+                self.state.update(completed_cycles=completed,
+                                  current_tab=None, current_video=None)
+                self.state.mark_phase(cycle, "cycle_completed")
+                self.logger.log(f"Cycle {cycle} complete", step="15", cycle=cycle)
 
             self.logger.log("All cycles complete", step="16")
             return 0
