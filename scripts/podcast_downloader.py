@@ -3681,24 +3681,30 @@ class PodcastsController:
         except AutomationError:
             return "no_dialog"
 
-    def _dismiss_failed_download_dialog(self) -> str:
-        """If a 'download failed' alert (Retry / Done buttons) is showing, dismiss
-        it by clicking Done — never Retry, so a failed episode is skipped instead
-        of automatically retried. Non-fatal no-op when no such dialog is present.
+    def _dismiss_failed_download_dialog(self, verify_timeout: float = 5.0) -> str:
+        """If a 'download failed' alert (Retry / Done buttons, e.g. "Unable to
+        Download Podcast") is showing, dismiss it by clicking Done — never Retry,
+        so a failed episode is skipped instead of automatically retried. Waits
+        for the alert to actually disappear before returning, so callers can
+        trust the dialog is really gone rather than just having sent a click.
+        Non-fatal no-op when no such dialog is present.
 
-        Returns 'dismissed:<x>,<y>' or 'no_dialog'.
+        Returns 'dismissed' | 'dismiss_unconfirmed' | 'no_dialog' | 'error:...'.
         """
-        nodes = self._ax_nodes()
-        has_retry = False
-        done_pos: "tuple[int, int] | None" = None
-        for role, text, x, y, w, h in nodes:
-            if role != "AXButton" or w <= 0 or h <= 0:
-                continue
-            low = text.strip().lower()
-            if low == "retry":
-                has_retry = True
-            elif low == "done":
-                done_pos = (x + w // 2, y + h // 2)
+        def _find_retry_done() -> "tuple[bool, tuple[int, int] | None]":
+            has_retry = False
+            done_pos: "tuple[int, int] | None" = None
+            for role, text, x, y, w, h in self._ax_nodes():
+                if role != "AXButton" or w <= 0 or h <= 0:
+                    continue
+                low = text.strip().lower()
+                if low == "retry":
+                    has_retry = True
+                elif low == "done":
+                    done_pos = (x + w // 2, y + h // 2)
+            return has_retry, done_pos
+
+        has_retry, done_pos = _find_retry_done()
         if not has_retry or done_pos is None:
             return "no_dialog"
 
@@ -3713,9 +3719,24 @@ class PodcastsController:
             ev = Quartz.CGEventCreateMouseEvent(None, kind, pt, Quartz.kCGMouseButtonLeft)
             Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
             time.sleep(0.05)
-        time.sleep(0.5)
         self.logger.log(f"Download failed dialog: clicked Done at ({cx},{cy})", step="13")
-        return f"dismissed:{cx},{cy}"
+
+        # Verify the alert actually closed — handle slower UI updates by polling
+        # rather than trusting the click landed on the first try.
+        deadline = time.time() + verify_timeout
+        while time.time() < deadline:
+            time.sleep(0.4)
+            still_retry, _ = _find_retry_done()
+            if not still_retry:
+                self.logger.log("Download failed dialog: dismissed (verified)", step="13")
+                return "dismissed"
+
+        self.logger.log(
+            f"Download failed dialog: Done clicked but Retry button still "
+            f"present after {verify_timeout}s",
+            step="13",
+        )
+        return "dismiss_unconfirmed"
 
     def cleanup_episode_row(self, video_no: int) -> str:
         """Remove a download via the episode-list ⋯ menu (Down×1+Enter = Remove Download).
