@@ -68,16 +68,11 @@ class TabTask:
 
 @dataclass(frozen=True)
 class VPNCalibration:
-    """Per-device pixel geometry for the ProtonVPN server list.
-
-    These are the only machine-dependent numbers in the connect routine.  They
-    default to the values that work on the reference Mac, but differ across
-    machines/displays/ProtonVPN versions, so they can be overridden per device
-    via `vpn.calibration` in input/tasks.json (produced by scripts/calibrate.py).
-
-    All offsets are anchored to values the connect routine reads live at runtime
-    (the window's right edge and the US country-header row position `r2_top`), so
-    they stay correct even when the window is moved between runs.
+    """Legacy per-device pixel geometry, from the earlier ProtonVPN Quartz/hover
+    based connect routine (see git history). Unused by the current Surfshark
+    connector, which drives the location list with plain AX clicks and needs no
+    pixel calibration — kept only so an existing `vpn.calibration` block in
+    input/tasks.json still parses harmlessly instead of raising.
     """
     state_connect_offset_from_right: int = 110  # window_right_edge - Connect_btn_x on state row
     header_height: int = 48                     # US country-header row height
@@ -87,7 +82,7 @@ class VPNCalibration:
 @dataclass(frozen=True)
 class VPNConfig:
     enabled: bool
-    app: str = "Proton VPN"
+    app: str = "Surfshark"
     location: str = "United States"
     location_code: str = "US"
     servers: tuple[str, ...] = ()
@@ -117,7 +112,7 @@ def _parse_vpn(raw_vpn: Any) -> VPNConfig:
         raise ValueError("'vpn' must be a boolean or an object {enabled, app, location}")
 
     enabled = bool(raw_vpn.get("enabled", True))
-    app = str(raw_vpn.get("app", "Proton VPN")).strip() or "Proton VPN"
+    app = str(raw_vpn.get("app", "Surfshark")).strip() or "Surfshark"
     location = str(raw_vpn.get("location", "United States")).strip() or "United States"
     location_code = _COUNTRY_CODE_FALLBACK.get(location.lower(), location.upper()[:2] or "US")
 
@@ -131,7 +126,7 @@ def _parse_vpn(raw_vpn: Any) -> VPNConfig:
 
     cal_raw = raw_vpn.get("calibration", {})
     if not isinstance(cal_raw, dict):
-        raise ValueError("'vpn.calibration' must be an object (see scripts/calibrate.py)")
+        raise ValueError("'vpn.calibration' must be an object")
     defaults = VPNCalibration()
     calibration = VPNCalibration(
         state_connect_offset_from_right=int(cal_raw.get(
@@ -839,6 +834,8 @@ class VPNController:
     def _provider_token(app_name: str) -> str:
         """Substring expected to appear in ipinfo.org for the provider."""
         n = app_name.lower()
+        if "surfshark" in n:
+            return "surfshark"
         if "proton" in n:
             return "proton"
         if "mullvad" in n:
@@ -874,341 +871,40 @@ class VPNController:
                 seen.append(n)
         return ", ".join('"' + n.replace('"', '\\"') + '"' for n in seen)
 
-    def _discover_servers(
-        self, location: str, location_code: str, app_name: str = "ProtonVPN"
-    ) -> list[str]:
-        """Discover the real number of available servers by expanding the country list.
+    def _surfshark_table_path(self) -> str:
+        """AppleScript expression for Surfshark's Locations table.
 
-        Runs the same Phase 1-3 ProtonVPN UI setup as _connect_via_slot to obtain
-        window coordinates, then expands the country row and counts server rows via:
-          1. AX table row count (works on the *filtered* list, which has ~50-100 rows,
-             not the unfiltered 6000+ row table).
-          2. Pixel brightness sampling fallback if AX times out.
-
-        Returns positional slot tokens (e.g. US-SLOT-1 … US-SLOT-N) because ProtonVPN
-        lazy-renders label text — real server names are only readable after hover.
-        Leaves ProtonVPN in the expanded/filtered state so the immediately following
-        _connect_via_slot(slot=1) call finds the list already expanded.
+        window 1 > list 1 (whole left panel) > UI element 4 ("Locations" wrapper)
+        > list 1 (inner) > scroll area 1 > table 1. Unlike ProtonVPN's Mac Catalyst
+        list, this table is a plain, fully AX-accessible NSTableView-style control:
+        every row (not just the visible ones) is exposed, and each row's Connect
+        button is a normal AXPress button rather than a hover-only control — so no
+        Quartz mouse simulation or pixel calibration is needed to drive it.
         """
-        try:
-            import Quartz  # type: ignore[import]
-        except ImportError:
-            self.logger.log(
-                f"Quartz unavailable for discovery — using 5 positional slots",
-                step="06", location=location,
-            )
-            return [f"{location_code.upper()}-SLOT-{i + 1}" for i in range(5)]
-
-        process_list = self._process_name_candidates(app_name)
-
-        def _dmouse(kind, x, y):
-            pt = Quartz.CGPoint(x=float(x), y=float(y))
-            ev = Quartz.CGEventCreateMouseEvent(None, kind, pt, Quartz.kCGMouseButtonLeft)
-            Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
-            time.sleep(0.05)
-
-        def _dkey(vk, down, flags=0):
-            src = Quartz.CGEventSourceCreate(Quartz.kCGEventSourceStateCombinedSessionState)
-            ev = Quartz.CGEventCreateKeyboardEvent(src, vk, down)
-            if flags:
-                Quartz.CGEventSetFlags(ev, flags)
-            Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
-            time.sleep(0.05)
-
-        def _fallback(n: int = 5) -> list[str]:
-            return [f"{location_code.upper()}-SLOT-{i + 1}" for i in range(n)]
-
-        # ── Phase 1: get search-field + window coordinates ────────────────────
-        p1_script = f"""
-        tell application "System Events"
-            set procName to ""
-            repeat with candidate in {{{process_list}}}
-                if exists process (candidate as text) then
-                    set procName to candidate as text
-                    exit repeat
-                end if
-            end repeat
-            if procName is "" then return "ERROR:no_process"
-            tell process procName
-                set frontmost to true
-                delay 0.5
-                if not (exists window 1) then return "ERROR:no_window"
-                if not (exists text field 1 of group 1 of window 1) then return "ERROR:no_sf"
-                set sf to text field 1 of group 1 of window 1
-                set sfPos to position of sf
-                set sfSz to size of sf
-                set wPos to position of window 1
-                set wSz to size of window 1
-                return "SF:" & (item 1 of sfPos) & "," & (item 2 of sfPos) & "," & ¬
-                                (item 1 of sfSz) & "," & (item 2 of sfSz) & ¬
-                       "|W:" & (item 1 of wPos) & "," & (item 2 of wPos) & "," & ¬
-                               (item 1 of wSz)  & "," & (item 2 of wSz)
-            end tell
-        end tell
-        """
-        try:
-            p1 = run_osascript(p1_script, timeout=30, label=f"discover-p1 {location}")
-        except AutomationError as exc:
-            self.logger.log(f"Discovery p1 failed ({exc}) — using 5 slots", step="06")
-            return _fallback()
-
-        if p1.startswith("ERROR:"):
-            self.logger.log(f"Discovery p1 error: {p1} — using 5 slots", step="06")
-            return _fallback()
-
-        sf_x = sf_y = sf_w = sf_h = 0
-        w_x = w_y = w_w = w_h = 0
-        for chunk in p1.split("|"):
-            if chunk.startswith("SF:"):
-                parts = chunk[3:].split(",")
-                if len(parts) == 4:
-                    sf_x, sf_y, sf_w, sf_h = (int(p) for p in parts)
-            elif chunk.startswith("W:"):
-                parts = chunk[2:].split(",")
-                if len(parts) == 4:
-                    w_x, w_y, w_w, w_h = (int(p) for p in parts)
-
-        if sf_w == 0 or w_w == 0:
-            self.logger.log(f"Discovery p1 bad data: {p1!r} — using 5 slots", step="06")
-            return _fallback()
-
-        # ── Phase 2: type the search filter character by character ────────────────────
-        sf_cx, sf_cy = sf_x + sf_w // 2, sf_y + sf_h // 2
-        _dmouse(Quartz.kCGEventLeftMouseDown, sf_cx, sf_cy)
-        _dmouse(Quartz.kCGEventLeftMouseUp,   sf_cx, sf_cy)
-        time.sleep(0.4)
-        _dkey(0x00, True,  Quartz.kCGEventFlagMaskCommand)   # Cmd+A
-        _dkey(0x00, False, Quartz.kCGEventFlagMaskCommand)
-        time.sleep(0.1)
-        _dkey(0x33, True); _dkey(0x33, False)                # Delete
-        time.sleep(0.3)
-        _dvk = {
-            'a': 0x00, 's': 0x01, 'd': 0x02, 'f': 0x03, 'h': 0x04,
-            'g': 0x05, 'z': 0x06, 'x': 0x07, 'c': 0x08, 'v': 0x09,
-            'b': 0x0B, 'q': 0x0C, 'w': 0x0D, 'e': 0x0E, 'r': 0x0F,
-            'y': 0x10, 't': 0x11, 'u': 0x20, 'i': 0x22, 'o': 0x1F,
-            'p': 0x23, 'l': 0x25, 'j': 0x26, 'k': 0x28, 'n': 0x2D,
-            'm': 0x2E, ' ': 0x31,
-        }
-        unmapped_d = [c for c in location if c.lower() not in _dvk]
-        if not unmapped_d:
-            for char in location:
-                lc = char.lower()
-                flags = Quartz.kCGEventFlagMaskShift if char != lc else 0
-                _dkey(_dvk[lc], True,  flags)
-                _dkey(_dvk[lc], False, 0)
-            self.logger.log(f"Discovery: search filter typed '{location}'", step="06")
-        else:
-            old_clip = subprocess.run(["pbpaste"], capture_output=True).stdout
-            try:
-                subprocess.run(["pbcopy"], input=location.encode(), check=True)
-                _dkey(0x09, True,  Quartz.kCGEventFlagMaskCommand)   # Cmd+V
-                _dkey(0x09, False, Quartz.kCGEventFlagMaskCommand)
-                self.logger.log(
-                    f"Discovery: search filter pasted (unmapped {unmapped_d}): '{location}'",
-                    step="06",
-                )
-            finally:
-                subprocess.run(["pbcopy"], input=old_clip, check=False)
-        time.sleep(2.5)  # wait for ProtonVPN to filter + auto-expand the country row
-
-        # ── Phase 3: scroll to top, get first-state position ─────────────────
-        p3_script = f"""
-        tell application "System Events"
-            set procName to ""
-            repeat with candidate in {{{process_list}}}
-                if exists process (candidate as text) then
-                    set procName to candidate as text
-                    exit repeat
-                end if
-            end repeat
-            if procName is "" then return "ERROR:no_process"
-            tell process procName
-                if not (exists group 1 of window 1) then return "ERROR:no_group"
-                if not (exists scroll area 1 of group 1 of window 1) then return "ERROR:no_scroll"
-                set sc to scroll area 1 of group 1 of window 1
-                -- Do NOT reset scroll bar — it clears the search filter.
-                if not (exists UI element 1 of sc) then return "ERROR:no_outer_list"
-                set outerList to UI element 1 of sc
-                set wPos to position of window 1
-                set wSz to size of window 1
-                -- Case A: filter active + country expanded — outerList IS the state list.
-                set outerDD to ""
-                try
-                    set outerDD to description of outerList as text
-                end try
-                if outerDD is "list" then
-                    if not (exists UI element 1 of outerList) then return "ERROR:empty_state_list"
-                    set firstElem to UI element 1 of outerList
-                    set fPos to position of firstElem
-                    return "R2:" & (item 2 of fPos) & "|W:" & (item 1 of wPos) & "," & (item 2 of wPos) & "," & (item 1 of wSz) & "," & (item 2 of wSz) & "|EXP:1"
-                end if
-                -- Case B: collapsed or unfiltered — walk children.
-                set stateList to missing value
-                set headerY to 0
-                repeat with c in UI elements of outerList
-                    set cdd to ""
-                    try
-                        set cdd to description of c as text
-                    end try
-                    if (class of c as text) is "button" and headerY = 0 then
-                        try
-                            set csz to size of c
-                            if (item 1 of csz) > 100 then
-                                set cpos to position of c
-                                set headerY to (item 2 of cpos) as integer
-                            end if
-                        end try
-                    end if
-                    if cdd is "list" and stateList is missing value then
-                        set stateList to c
-                    end if
-                end repeat
-                if stateList is missing value then
-                    return "R2:" & headerY & "|W:" & (item 1 of wPos) & "," & (item 2 of wPos) & "," & (item 1 of wSz) & "," & (item 2 of wSz) & "|EXP:0"
-                end if
-                if not (exists UI element 1 of stateList) then return "ERROR:empty_state_list"
-                set firstElem to UI element 1 of stateList
-                set fPos to position of firstElem
-                return "R2:" & (item 2 of fPos) & "|W:" & (item 1 of wPos) & "," & (item 2 of wPos) & "," & (item 1 of wSz) & "," & (item 2 of wSz) & "|EXP:1"
-            end tell
-        end tell
-        """
-        try:
-            p3 = run_osascript(p3_script, timeout=20, label=f"discover-p3 {location}")
-        except AutomationError as exc:
-            self.logger.log(f"Discovery p3 failed ({exc}) — using 5 slots", step="06")
-            return _fallback()
-
-        if p3.startswith("ERROR:"):
-            self.logger.log(f"Discovery p3 error: {p3} — using 5 slots", step="06")
-            return _fallback()
-
-        r2_top = 0
-        is_expanded_p3 = False
-        for chunk in p3.split("|"):
-            if chunk.startswith("R2:"):
-                try:
-                    r2_top = int(chunk[3:])
-                except ValueError:
-                    pass
-            elif chunk.startswith("W:"):
-                parts = chunk[2:].split(",")
-                if len(parts) == 4:
-                    w_x, w_y, w_w, w_h = (int(p) for p in parts)
-            elif chunk.startswith("EXP:"):
-                is_expanded_p3 = chunk[4:].strip() == "1"
-
-        if r2_top == 0:
-            self.logger.log(f"Discovery p3 bad data: {p3!r} — using 5 slots", step="06")
-            return _fallback()
-
-        # New Mac: row height = 44px; US header height ≈ row height.
-        SERVER_ROW_H = 44
-        expand_x = w_x + w_w // 2
-        expand_y = r2_top + SERVER_ROW_H // 2
-
-        # ── Phase 4: expand if needed, then count state rows ─────────────────
-        subprocess.run(
-            ["osascript", "-e",
-             f'tell application "System Events" to set frontmost of process "ProtonVPN" to true'],
-            timeout=4, check=False,
+        return (
+            "table 1 of (scroll area 1 of (item 1 of (UI elements of "
+            "(item 4 of (UI elements of (list 1 of window 1))))))"
         )
-        time.sleep(0.2)
 
-        self.logger.log(f"Discovery: p3 expanded={is_expanded_p3}", step="06")
-        if not is_expanded_p3:
-            _dmouse(Quartz.kCGEventLeftMouseDown, expand_x, expand_y)
-            _dmouse(Quartz.kCGEventLeftMouseUp,   expand_x, expand_y)
-            time.sleep(1.5)
+    def _surfshark_find_and_expand(
+        self, app_name: str, location: str, cached_idx: int = 0
+    ) -> dict[str, Any]:
+        """Locate `location`'s row in Surfshark's Locations table, expand it
+        (reveal its individual city rows) if not already expanded, and return
+        its row index plus the ordered list of real city names under it.
 
-        # ── Count server rows ─────────────────────────────────────────────────
-        # Primary: AX row count (fast on the *filtered* table, ~50-100 rows max).
-        # After filtering to a single country the table is small; the 6000+ row
-        # problem only appears on the unfiltered table.
-        count_script = f"""
-        tell application "System Events"
-            set procName to ""
-            repeat with candidate in {{{process_list}}}
-                if exists process (candidate as text) then
-                    set procName to candidate as text
-                    exit repeat
-                end if
-            end repeat
-            if procName is "" then return "ERROR:no_process"
-            tell process procName
-                if not (exists scroll area 1 of group 1 of window 1) then return "ERROR:no_scroll"
-                set sc to scroll area 1 of group 1 of window 1
-                if not (exists UI element 1 of sc) then return "ERROR:no_outer_list"
-                set outerList to UI element 1 of sc
-                set stateList to missing value
-                repeat with c in UI elements of outerList
-                    set cdd to ""
-                    try
-                        set cdd to description of c as text
-                    end try
-                    if cdd is "list" then
-                        set stateList to c
-                        exit repeat
-                    end if
-                end repeat
-                if stateList is missing value then return "ERROR:no_state_list"
-                -- Each state has 2 elements (name button + three-dot button)
-                set elemCount to count of UI elements of stateList
-                set stateCount to elemCount div 2
-                if stateCount < 1 then set stateCount to 1
-                return stateCount as text
-            end tell
-        end tell
+        Jumping straight to a previously-cached row index is fast (~1-3s).
+        (Re)locating a country from scratch uses a binary search over the
+        alphabetically-sorted country list (~5-8 direct-index probes, ~15-25s)
+        rather than a linear scan — each `item N of rows` is an independent
+        AX round-trip that costs about the same regardless of N, but a linear
+        "check every row 1..N" scan still adds up to minutes on a ~100-150 row
+        list. This only runs once (first discovery) or if the cache ever
+        proves stale; every later lookup reuses the cached index and is fast.
         """
-        server_count = 0
-        try:
-            cr = run_osascript(count_script, timeout=15, label=f"discover-count {location}")
-            cr = cr.strip()
-            if not cr.startswith("ERROR:"):
-                server_count = int(cr)
-                self.logger.log(
-                    f"Discovery: AX element count → {server_count} states for {location}",
-                    step="06",
-                )
-        except (AutomationError, ValueError) as exc:
-            self.logger.log(
-                f"Discovery: AX count failed ({exc}) — defaulting to 10 states",
-                step="06",
-            )
-
-        if server_count <= 0:
-            server_count = 10
-            self.logger.log(
-                f"Discovery: AX count returned 0 — using default {server_count} states",
-                step="06",
-            )
-
-        server_count = max(server_count, 1)
-        slots = [f"{location_code.upper()}-SLOT-{i + 1}" for i in range(server_count)]
-        self.logger.log(
-            f"Discovery complete: {len(slots)} positional slots for {location}",
-            step="06", location=location, slot_count=len(slots),
-        )
-        return slots
-
-    def _click_server_by_name(
-        self, app_name: str, server: str, location: str = "", force_retype: bool = False,
-        calibration: "VPNCalibration | None" = None,
-    ) -> str:
-        """Route to slot-based connect or (future) named-server connect."""
-        if "-SLOT-" in server:
-            try:
-                slot_num = int(server.split("-SLOT-")[1])
-            except (ValueError, IndexError):
-                slot_num = 1
-            return self._connect_via_slot(
-                app_name, location or server.split("-SLOT-")[0], slot_num,
-                force_retype=force_retype, calibration=calibration,
-            )
-        # Named server fallback (not normally reached with slot discovery).
         process_list = self._process_name_candidates(app_name)
-        server_esc = server.replace('"', '\\"')
+        loc_esc = location.replace('"', '\\"')
+        tbl_path = self._surfshark_table_path()
         script = f"""
         tell application "System Events"
             set procName to ""
@@ -1218,459 +914,478 @@ class VPNController:
                     exit repeat
                 end if
             end repeat
-            if procName is "" then return "vpn_process_not_found"
+            if procName is "" then return "ERROR:vpn_process_not_found"
             tell process procName
                 set frontmost to true
-                delay 0.5
-                if not (exists window 1) then return "no_window"
-                if not (exists text field 1 of group 1 of window 1) then return "search_field_not_found"
-                set sf to text field 1 of group 1 of window 1
-                try
-                    set focused of sf to true
-                    delay 0.1
-                end try
-                set value of sf to "{server_esc}"
                 delay 0.2
-                key code 36
-                delay 1.5
-                set tbl to table 1 of scroll area 1 of window 1
-                if (count of rows of tbl) > 0 then
-                    click row 1 of tbl
-                    return "row_clicked"
+                if not (exists window 1) then return "ERROR:no_window"
+                try
+                    set tbl to {tbl_path}
+                on error
+                    return "ERROR:no_table"
+                end try
+                set rws to rows of tbl
+                set rCount to count of rws
+
+                set countryIdx to 0
+                if {cached_idx} > 0 and {cached_idx} ≤ rCount then
+                    set cel to item 1 of (UI elements of (item {cached_idx} of rws))
+                    set kids to UI elements of cel
+                    if (count of kids) ≥ 2 then
+                        set nm to ""
+                        try
+                            set nm to value of (item 2 of kids) as text
+                        end try
+                        if nm is "{loc_esc}" then set countryIdx to {cached_idx}
+                    end if
                 end if
-                return "server_not_found"
+
+                if countryIdx is 0 then
+                    -- Binary search: the "Locations" section is alphabetically sorted,
+                    -- so this needs ~log2(row count) probes instead of a linear scan —
+                    -- a linear "repeat with i from 1 to rCount" scan of the ~100-150 row
+                    -- unfiltered list is O(n^2) in practice (each `item i of rws` re-walks
+                    -- the AX hierarchy) and can take minutes; direct-index probes stay
+                    -- fast (~1-3s each) regardless of list size.
+                    -- If the target country is already expanded, some probes land on its
+                    -- OWN city rows (subtitle = target's name) rather than the header —
+                    -- that's detected explicitly and treated as "header is to the left",
+                    -- since city names otherwise sort arbitrarily relative to the target
+                    -- and would misdirect a plain name-only comparison.
+                    set lo to 1
+                    set hi to rCount
+                    repeat 24 times
+                        if lo > hi then exit repeat
+                        set mid to lo + ((hi - lo) div 2)
+                        set cel to item 1 of (UI elements of (item mid of rws))
+                        set kids to UI elements of cel
+                        set nm to ""
+                        set subTxt to ""
+                        if (count of kids) ≥ 2 then
+                            try
+                                set nm to value of (item 2 of kids) as text
+                            end try
+                        end if
+                        if (count of kids) ≥ 3 then
+                            try
+                                set subTxt to value of (item 3 of kids) as text
+                            end try
+                        end if
+                        if nm is "{loc_esc}" then
+                            set countryIdx to mid
+                            exit repeat
+                        else if subTxt is "{loc_esc}" then
+                            set hi to mid - 1
+                        else if nm is "" then
+                            set lo to mid + 1
+                        else if nm < "{loc_esc}" then
+                            set lo to mid + 1
+                        else
+                            set hi to mid - 1
+                        end if
+                    end repeat
+                end if
+                if countryIdx is 0 then return "ERROR:country_not_found"
+
+                set alreadyExpanded to false
+                if (countryIdx + 1) ≤ rCount then
+                    set nCel to item 1 of (UI elements of (item (countryIdx + 1) of rws))
+                    set nKids to UI elements of nCel
+                    if (count of nKids) ≥ 3 then
+                        set subTxt to ""
+                        try
+                            set subTxt to value of (item 3 of nKids) as text
+                        end try
+                        if subTxt is "{loc_esc}" then set alreadyExpanded to true
+                    end if
+                end if
+
+                if not alreadyExpanded then
+                    set cCel to item 1 of (UI elements of (item countryIdx of rws))
+                    set cKids to UI elements of cCel
+                    -- Row layout: [flag, name, subtitle, Connect(4), icon, Expand(6), icon, Favorite(8)]
+                    if (count of cKids) < 6 then return "ERROR:no_expand_control"
+                    click item 6 of cKids
+                    delay 0.6
+                    set rws to rows of tbl
+                    set rCount to count of rws
+                end if
+
+                set cityStr to ""
+                set i to countryIdx + 1
+                repeat while i ≤ rCount
+                    set cel to item 1 of (UI elements of (item i of rws))
+                    set kids to UI elements of cel
+                    if (count of kids) < 3 then exit repeat
+                    set subTxt to ""
+                    try
+                        set subTxt to value of (item 3 of kids) as text
+                    end try
+                    if subTxt is not "{loc_esc}" then exit repeat
+                    set cityNm to ""
+                    try
+                        set cityNm to value of (item 2 of kids) as text
+                    end try
+                    set cityStr to cityStr & cityNm & "⁣"
+                    set i to i + 1
+                end repeat
+
+                return "OK|" & countryIdx & "|" & cityStr
             end tell
         end tell
         """
-        return run_osascript(script, timeout=20, label=f"click server {server}")
+        try:
+            raw = run_osascript(script, timeout=120, label=f"surfshark locate {location}")
+        except AutomationError as exc:
+            return {"error": str(exc)}
+        if raw.startswith("ERROR:"):
+            return {"error": raw}
+        try:
+            _, idx_s, cities_s = raw.split("|", 2)
+            country_idx = int(idx_s)
+        except ValueError:
+            return {"error": f"bad_response:{raw!r}"}
+        cities = [c for c in cities_s.split("⁣") if c]
+        return {"country_idx": country_idx, "cities": cities}
+
+    def _surfshark_connect_city(
+        self, app_name: str, location: str, cached_idx: int = 0,
+        slot_num: int | None = None, target_name: str = "", total_count: int = 0,
+    ) -> dict[str, Any]:
+        """Expand `location` (reusing the cached row index when possible) and
+        click the Connect button of the Nth city under it (`slot_num`, 1-based,
+        wrapping — mirrors the ProtonVPN slot semantics exactly) or of the city
+        named `target_name`. Exactly one of slot_num/target_name is used.
+
+        When `total_count` (the already-known number of cities for this
+        location, from the cached discovery list) is given, the target row is
+        reached with a single direct-index jump — no per-connect enumeration.
+        Without it (total_count=0, e.g. before discovery has ever populated
+        the cache), city rows are enumerated live to determine the count /
+        resolve `target_name`, which costs one AX round-trip per city and is
+        noticeably slower on a large list — a one-time cost, not a per-cycle one.
+        """
+        process_list = self._process_name_candidates(app_name)
+        loc_esc = location.replace('"', '\\"')
+        name_esc = target_name.replace('"', '\\"')
+        by_name = "true" if (target_name and total_count <= 0) else "false"
+        slot_val = slot_num if slot_num is not None else 1
+        tbl_path = self._surfshark_table_path()
+        fast_path = total_count > 0
+        script = f"""
+        tell application "System Events"
+            set procName to ""
+            repeat with candidate in {{{process_list}}}
+                if exists process (candidate as text) then
+                    set procName to candidate as text
+                    exit repeat
+                end if
+            end repeat
+            if procName is "" then return "ERROR:vpn_process_not_found"
+            tell process procName
+                set frontmost to true
+                delay 0.2
+                if not (exists window 1) then return "ERROR:no_window"
+                try
+                    set tbl to {tbl_path}
+                on error
+                    return "ERROR:no_table"
+                end try
+                set rws to rows of tbl
+                set rCount to count of rws
+
+                set countryIdx to 0
+                if {cached_idx} > 0 and {cached_idx} ≤ rCount then
+                    set cel to item 1 of (UI elements of (item {cached_idx} of rws))
+                    set kids to UI elements of cel
+                    if (count of kids) ≥ 2 then
+                        set nm to ""
+                        try
+                            set nm to value of (item 2 of kids) as text
+                        end try
+                        if nm is "{loc_esc}" then set countryIdx to {cached_idx}
+                    end if
+                end if
+
+                if countryIdx is 0 then
+                    -- Binary search: the "Locations" section is alphabetically sorted,
+                    -- so this needs ~log2(row count) probes instead of a linear scan —
+                    -- a linear "repeat with i from 1 to rCount" scan of the ~100-150 row
+                    -- unfiltered list is O(n^2) in practice (each `item i of rws` re-walks
+                    -- the AX hierarchy) and can take minutes; direct-index probes stay
+                    -- fast (~1-3s each) regardless of list size.
+                    -- If the target country is already expanded, some probes land on its
+                    -- OWN city rows (subtitle = target's name) rather than the header —
+                    -- that's detected explicitly and treated as "header is to the left",
+                    -- since city names otherwise sort arbitrarily relative to the target
+                    -- and would misdirect a plain name-only comparison.
+                    set lo to 1
+                    set hi to rCount
+                    repeat 24 times
+                        if lo > hi then exit repeat
+                        set mid to lo + ((hi - lo) div 2)
+                        set cel to item 1 of (UI elements of (item mid of rws))
+                        set kids to UI elements of cel
+                        set nm to ""
+                        set subTxt to ""
+                        if (count of kids) ≥ 2 then
+                            try
+                                set nm to value of (item 2 of kids) as text
+                            end try
+                        end if
+                        if (count of kids) ≥ 3 then
+                            try
+                                set subTxt to value of (item 3 of kids) as text
+                            end try
+                        end if
+                        if nm is "{loc_esc}" then
+                            set countryIdx to mid
+                            exit repeat
+                        else if subTxt is "{loc_esc}" then
+                            set hi to mid - 1
+                        else if nm is "" then
+                            set lo to mid + 1
+                        else if nm < "{loc_esc}" then
+                            set lo to mid + 1
+                        else
+                            set hi to mid - 1
+                        end if
+                    end repeat
+                end if
+                if countryIdx is 0 then return "ERROR:country_not_found"
+
+                set alreadyExpanded to false
+                if (countryIdx + 1) ≤ rCount then
+                    set nCel to item 1 of (UI elements of (item (countryIdx + 1) of rws))
+                    set nKids to UI elements of nCel
+                    if (count of nKids) ≥ 3 then
+                        set subTxt to ""
+                        try
+                            set subTxt to value of (item 3 of nKids) as text
+                        end try
+                        if subTxt is "{loc_esc}" then set alreadyExpanded to true
+                    end if
+                end if
+
+                if not alreadyExpanded then
+                    set cCel to item 1 of (UI elements of (item countryIdx of rws))
+                    set cKids to UI elements of cCel
+                    if (count of cKids) < 6 then return "ERROR:no_expand_control"
+                    click item 6 of cKids
+                    delay 0.6
+                    set rws to rows of tbl
+                    set rCount to count of rws
+                end if
+
+                set cityCount to 0
+                set targetIdx to 0
+                if {"true" if fast_path else "false"} then
+                    -- Fast path: the city count is already known (from the cached
+                    -- discovery list), so jump straight to the target row instead
+                    -- of enumerating every city — one AX round-trip instead of one
+                    -- per city (cuts a ~24-city connect from ~60-80s down to ~5-10s).
+                    set cityCount to {max(total_count, 1)}
+                    set effSlot to ((({slot_val} - 1) mod cityCount) + 1)
+                    set targetIdx to countryIdx + effSlot
+                    if targetIdx > rCount then return "ERROR:target_out_of_range"
+                else
+                    set cityNames to {{}}
+                    set i to countryIdx + 1
+                    repeat while i ≤ rCount
+                        set cel to item 1 of (UI elements of (item i of rws))
+                        set kids to UI elements of cel
+                        if (count of kids) < 3 then exit repeat
+                        set subTxt to ""
+                        try
+                            set subTxt to value of (item 3 of kids) as text
+                        end try
+                        if subTxt is not "{loc_esc}" then exit repeat
+                        set cityNm to ""
+                        try
+                            set cityNm to value of (item 2 of kids) as text
+                        end try
+                        set end of cityNames to cityNm
+                        set i to i + 1
+                    end repeat
+                    set cityCount to count of cityNames
+                    if cityCount is 0 then return "ERROR:no_cities_found"
+
+                    if {by_name} then
+                        set j to 0
+                        repeat with cn in cityNames
+                            set j to j + 1
+                            if cn is "{name_esc}" then
+                                set targetIdx to countryIdx + j
+                                exit repeat
+                            end if
+                        end repeat
+                        if targetIdx is 0 then return "ERROR:city_not_found"
+                    else
+                        set effSlot to ((({slot_val} - 1) mod cityCount) + 1)
+                        set targetIdx to countryIdx + effSlot
+                    end if
+                end if
+
+                set tCel to item 1 of (UI elements of (item targetIdx of rws))
+                set tKids to UI elements of tCel
+                if (count of tKids) < 4 then return "ERROR:bad_city_row"
+                set clickedCity to ""
+                try
+                    set clickedCity to value of (item 2 of tKids) as text
+                end try
+                click item 4 of tKids
+                return "OK|" & countryIdx & "|" & cityCount & "|" & clickedCity
+            end tell
+        end tell
+        """
+        try:
+            raw = run_osascript(script, timeout=120, label=f"surfshark connect {location}")
+        except AutomationError as exc:
+            return {"error": str(exc)}
+        if raw.startswith("ERROR:"):
+            return {"error": raw}
+        try:
+            _, idx_s, count_s, city = raw.split("|", 3)
+            return {"country_idx": int(idx_s), "city_count": int(count_s), "city": city}
+        except ValueError:
+            return {"error": f"bad_response:{raw!r}"}
+
+    def _discover_servers(
+        self, location: str, location_code: str, app_name: str = "Surfshark"
+    ) -> list[str]:
+        """Discover the real Surfshark city servers available for `location`.
+
+        Expands `location`'s row in the Locations table and reads the real
+        city names of the rows revealed underneath (e.g. "Atlanta", "Chicago",
+        "New York", ...) — these are genuine, individually-connectable
+        servers, not synthetic slot placeholders, because Surfshark's list
+        (unlike ProtonVPN's) is fully AX-accessible with no lazy rendering.
+        Also caches the country row's table index (`surfshark_country_row_index`
+        in state) so later connects can jump straight to it instead of
+        re-scanning the full list each time.
+        """
+        idx_cache = self.state.data.setdefault("surfshark_country_row_index", {})
+        cached_idx = int(idx_cache.get(location, 0))
+
+        result = self._surfshark_find_and_expand(app_name, location, cached_idx)
+        if "error" in result:
+            self.logger.log(
+                f"Surfshark discovery failed for {location}: {result['error']} — "
+                f"using 5 positional slots",
+                step="06", location=location,
+            )
+            return [f"{location_code.upper()}-SLOT-{i + 1}" for i in range(5)]
+
+        idx_cache[location] = result["country_idx"]
+        self.state.save()
+
+        cities = result["cities"]
+        if not cities:
+            self.logger.log(
+                f"Surfshark discovery found {location} but no city rows under it — "
+                f"using 5 positional slots",
+                step="06", location=location,
+            )
+            return [f"{location_code.upper()}-SLOT-{i + 1}" for i in range(5)]
+
+        self.logger.log(
+            f"Discovered {len(cities)} Surfshark servers for {location} "
+            f"(row {result['country_idx']}): {cities[:5]}"
+            + ("..." if len(cities) > 5 else ""),
+            step="06", location=location, server_count=len(cities),
+        )
+        return cities
+
+    def _click_server_by_name(
+        self, app_name: str, server: str, location: str = "", force_retype: bool = False,
+        calibration: "VPNCalibration | None" = None,
+    ) -> str:
+        """Route to slot-based connect (used when vpn.state_count overrides
+        discovery with synthetic "{CC}-SLOT-{n}" tokens) or named-city connect
+        (the normal path — Surfshark discovery returns real city names)."""
+        if "-SLOT-" in server:
+            try:
+                slot_num = int(server.split("-SLOT-")[1])
+            except (ValueError, IndexError):
+                slot_num = 1
+            return self._connect_via_slot(
+                app_name, location or server.split("-SLOT-")[0], slot_num,
+                force_retype=force_retype, calibration=calibration,
+            )
+        idx_cache = self.state.data.setdefault("surfshark_country_row_index", {})
+        cached_idx = int(idx_cache.get(location, 0))
+
+        # If `server` is in the cached discovery list, its position there is the
+        # city's slot number — pass that plus the known count so the connect can
+        # jump straight to the row instead of enumerating every city live.
+        cached_servers = self.state.data.get("discovered_servers_by_location", {}).get(location, [])
+        if server in cached_servers:
+            result = self._surfshark_connect_city(
+                app_name, location, cached_idx=cached_idx,
+                slot_num=cached_servers.index(server) + 1, total_count=len(cached_servers),
+            )
+        else:
+            result = self._surfshark_connect_city(
+                app_name, location, cached_idx=cached_idx, target_name=server,
+            )
+        if "error" in result:
+            self.logger.log(f"Surfshark connect '{server}' failed: {result['error']}", step="06")
+            return "server_not_found"
+        idx_cache[location] = result["country_idx"]
+        self.state.save()
+        self.logger.log(
+            f"Surfshark: clicked Connect for '{result['city']}' "
+            f"({location} row {result['country_idx']}, {result['city_count']} cities)",
+            step="06", server=result["city"],
+        )
+        return "connect_button_clicked"
 
     def _connect_via_slot(
         self, app_name: str, location: str, slot_num: int, force_retype: bool = False,
         calibration: "VPNCalibration | None" = None,
     ) -> str:
-        """Search for location in ProtonVPN, expand the country row via Quartz click,
-        then hover+click the Nth server row's Connect button.
+        """Connect to the Nth (1-based, wrapping) city under `location` in
+        Surfshark's Locations list — same slot semantics as before
+        (effective_slot = ((slot_num - 1) % total) + 1), just resolved via
+        Surfshark's plain AX table instead of ProtonVPN's hover-only rows.
 
-        All accessibility reads happen BEFORE expansion (table has 2 rows, fast).
-        After expansion the table has 6000+ rows and any accessibility op times out,
-        so Quartz handles both the expansion click and the Connect hover+click.
+        Used when vpn.state_count overrides discovery with synthetic
+        "{CC}-SLOT-{n}" tokens; the normal path (real Surfshark city names)
+        goes through the named-server branch of _click_server_by_name instead.
 
-        Row heights are empirically fixed in ProtonVPN 4.x:
-          - "All locations" header: 32 px
-          - Country header row:     48 px
-          - Individual server rows: 48 px
-        Connect button appears at right_edge - 38 px on hover (default; see
-        VPNCalibration / scripts/calibrate.py for per-device overrides).
+        `calibration`/`force_retype` are accepted for call-site compatibility
+        with connect_with_config's rotation logic but are unused — Surfshark's
+        location list needs no per-device pixel geometry or search re-typing.
         """
-        if calibration is None:
-            calibration = VPNCalibration()
-        process_list = self._process_name_candidates(app_name)
+        idx_cache = self.state.data.setdefault("surfshark_country_row_index", {})
+        cached_idx = int(idx_cache.get(location, 0))
+        # _connect_via_slot is only reached with synthetic "{CC}-SLOT-{n}" tokens
+        # (vpn.state_count override, or _discover_servers' own error fallback) —
+        # the cached discovered_servers_by_location list in that case holds those
+        # placeholder tokens, not real city names, so its length is NOT the real
+        # city count. Pass total_count=0 so the connect falls back to live
+        # enumeration, which finds the real count itself rather than trusting it.
+        cached_servers = self.state.data.get("discovered_servers_by_location", {}).get(location, [])
+        total_count = 0 if any("-SLOT-" in s for s in cached_servers) else len(cached_servers)
 
-        # ProtonVPN Mac Catalyst text field accepts NEITHER AppleScript keystroke NOR
-        # Quartz CGEventKeyboardSetUnicodeString — both are silently swallowed.
-        # The ONLY reliable input path is clipboard paste (Cmd+V) after a Quartz click
-        # focuses the field.  So we:
-        #   Phase 1 – AppleScript: focus ProtonVPN, return sf pixel position + window pos.
-        #   Phase 2 – Quartz:     click sf, Cmd+A+Del to clear, Cmd+V to paste location.
-        #   Phase 3 – AppleScript: scroll-to-top, read row-2 position (filter already applied).
-        #   Phase 4 – Quartz:     expansion click (if needed), hover, click Connect button.
-
-        try:
-            import Quartz  # type: ignore[import]
-        except ImportError:
-            self.logger.log("Quartz unavailable — cannot connect", step="06")
-            return "quartz_unavailable"
-
-        def _mouse(kind, x, y):
-            pt = Quartz.CGPoint(x=float(x), y=float(y))
-            ev = Quartz.CGEventCreateMouseEvent(None, kind, pt, Quartz.kCGMouseButtonLeft)
-            Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
-            time.sleep(0.05)
-
-        def _warp(x, y):
-            # Move the REAL hardware cursor, then post a mouse-moved event.
-            # ProtonVPN's Mac Catalyst Connect button is rendered only while the
-            # cursor hovers the row (an NSTrackingArea), and tracking follows the
-            # *actual* cursor position — a synthetic kCGEventMouseMoved alone does
-            # not reliably enter the tracking area on every Mac (it worked on one
-            # mini, not another, where the button never appeared and the click hit
-            # nothing).  CGWarpMouseCursorPosition guarantees the cursor is really
-            # over the row so the button paints before we click it.
-            pt = Quartz.CGPoint(x=float(x), y=float(y))
-            Quartz.CGWarpMouseCursorPosition(pt)
-            ev = Quartz.CGEventCreateMouseEvent(None, Quartz.kCGEventMouseMoved, pt,
-                                                Quartz.kCGMouseButtonLeft)
-            Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
-            time.sleep(0.05)
-
-        def _key(vk, down, flags=0):
-            src = Quartz.CGEventSourceCreate(Quartz.kCGEventSourceStateCombinedSessionState)
-            ev = Quartz.CGEventCreateKeyboardEvent(src, vk, down)
-            if flags:
-                Quartz.CGEventSetFlags(ev, flags)
-            Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
-            time.sleep(0.05)
-
-        # ── Phase 1: get sf + window coordinates ─────────────────────────────────────
-        phase1_script = f"""
-        tell application "System Events"
-            set procName to ""
-            repeat with candidate in {{{process_list}}}
-                if exists process (candidate as text) then
-                    set procName to candidate as text
-                    exit repeat
-                end if
-            end repeat
-            if procName is "" then return "ERROR:vpn_process_not_found"
-            tell process procName
-                set frontmost to true
-                delay 0.5
-                if not (exists window 1) then return "ERROR:no_window"
-                if not (exists text field 1 of group 1 of window 1) then return "ERROR:no_search_field"
-                set sf to text field 1 of group 1 of window 1
-                set sfPos to position of sf
-                set sfSz to size of sf
-                set sfX to (item 1 of sfPos) as integer
-                set sfY to (item 2 of sfPos) as integer
-                set sfW to (item 1 of sfSz) as integer
-                set sfH to (item 2 of sfSz) as integer
-                set wPos to position of window 1
-                set wSz to size of window 1
-                set wX to (item 1 of wPos) as integer
-                set wY to (item 2 of wPos) as integer
-                set wW to (item 1 of wSz) as integer
-                return "SF:" & sfX & "," & sfY & "," & sfW & "," & sfH & "|W:" & wX & "," & wY & "," & wW
-            end tell
-        end tell
-        """
-        try:
-            p1 = run_osascript(phase1_script, timeout=30, label=f"slot-connect phase1 {location}")
-        except AutomationError as exc:
-            self.logger.log(f"Slot connect phase1 failed: {exc}", step="06", status="slot_setup_failed")
-            if "Accessibility permission required" in str(exc):
-                raise
-            return "slot_setup_failed"
-
-        if p1.startswith("ERROR:"):
-            self.logger.log(f"Slot connect phase1: {p1}", step="06", status=p1)
-            return p1
-
-        sf_x = sf_y = sf_w = sf_h = 0
-        w_x = w_y = w_w = 0
-        for chunk in p1.split("|"):
-            if chunk.startswith("SF:"):
-                nums = chunk[3:].split(",")
-                if len(nums) == 4:
-                    sf_x, sf_y, sf_w, sf_h = int(nums[0]), int(nums[1]), int(nums[2]), int(nums[3])
-            elif chunk.startswith("W:"):
-                nums = chunk[2:].split(",")
-                if len(nums) == 3:
-                    w_x, w_y, w_w = int(nums[0]), int(nums[1]), int(nums[2])
-
-        if sf_w == 0 or w_w == 0:
-            self.logger.log(f"Bad phase1 data: {p1!r}", step="06")
-            return "bad_anchor_data"
-
-        # ── Phase 2: type the search filter character by character ────────────────────
-        # Typing via real VK-code key events (same mechanism as the working Cmd+A and
-        # Delete above) mirrors actual keyboard input and reliably triggers ProtonVPN's
-        # incremental search filter via UITextField's insertText: / editingChanged path.
-        # Clipboard paste (Cmd+V) is kept only as a fallback for unmappable characters.
-        sf_cx = sf_x + sf_w // 2
-        sf_cy = sf_y + sf_h // 2
-
-        # Click search field to focus it.
-        _mouse(Quartz.kCGEventLeftMouseDown, sf_cx, sf_cy)
-        _mouse(Quartz.kCGEventLeftMouseUp,   sf_cx, sf_cy)
-        time.sleep(0.4)
-
-        # Cmd+A + Delete to clear existing content.
-        _key(0x00, True,  Quartz.kCGEventFlagMaskCommand)   # Cmd+A
-        _key(0x00, False, Quartz.kCGEventFlagMaskCommand)
-        time.sleep(0.1)
-        _key(0x33, True); _key(0x33, False)                 # Delete
-        time.sleep(0.3)
-
-        # macOS US-layout virtual key codes for a–z and space.
-        _vk = {
-            'a': 0x00, 's': 0x01, 'd': 0x02, 'f': 0x03, 'h': 0x04,
-            'g': 0x05, 'z': 0x06, 'x': 0x07, 'c': 0x08, 'v': 0x09,
-            'b': 0x0B, 'q': 0x0C, 'w': 0x0D, 'e': 0x0E, 'r': 0x0F,
-            'y': 0x10, 't': 0x11, 'u': 0x20, 'i': 0x22, 'o': 0x1F,
-            'p': 0x23, 'l': 0x25, 'j': 0x26, 'k': 0x28, 'n': 0x2D,
-            'm': 0x2E, ' ': 0x31,
-        }
-        unmapped = [c for c in location if c.lower() not in _vk]
-        if not unmapped:
-            for char in location:
-                lc = char.lower()
-                flags = Quartz.kCGEventFlagMaskShift if char != lc else 0
-                _key(_vk[lc], True,  flags)
-                _key(_vk[lc], False, 0)
-            self.logger.log(f"Search filter typed: '{location}'", step="06")
-        else:
-            # Fallback: clipboard paste for locations with characters outside the VK map.
-            old_clip = subprocess.run(["pbpaste"], capture_output=True).stdout
-            try:
-                subprocess.run(["pbcopy"], input=location.encode(), check=True)
-                _key(0x09, True,  Quartz.kCGEventFlagMaskCommand)   # Cmd+V
-                _key(0x09, False, Quartz.kCGEventFlagMaskCommand)
-                self.logger.log(
-                    f"Search filter pasted (unmapped chars {unmapped}): '{location}'", step="06",
-                )
-            finally:
-                subprocess.run(["pbcopy"], input=old_clip, check=False)
-
-        time.sleep(2.5)  # wait for ProtonVPN to filter + auto-expand the country row
-
-        # ── Phase 3: scroll to top, read state-list position ────────────────────────────
-        # New Mac AX structure: scroll area is inside group 1 (not a direct window child).
-        # The list uses nested UI elements instead of a table with rows.
-        phase3_script = f"""
-        tell application "System Events"
-            set procName to ""
-            repeat with candidate in {{{process_list}}}
-                if exists process (candidate as text) then
-                    set procName to candidate as text
-                    exit repeat
-                end if
-            end repeat
-            if procName is "" then return "ERROR:vpn_process_not_found"
-            tell process procName
-                if not (exists group 1 of window 1) then return "ERROR:no_group"
-                if not (exists scroll area 1 of group 1 of window 1) then return "ERROR:no_scroll_area"
-                set sc to scroll area 1 of group 1 of window 1
-                -- Do NOT reset scroll bar here — setting its value clears ProtonVPN's
-                -- search filter, causing all 147 countries to reappear instead of the
-                -- filtered result (e.g. "United States").
-                if not (exists UI element 1 of sc) then return "ERROR:no_outer_list"
-                set outerList to UI element 1 of sc
-                set wPos to position of window 1
-                set wSz to size of window 1
-                set wX to (item 1 of wPos) as integer
-                set wY to (item 2 of wPos) as integer
-                set wW to (item 1 of wSz) as integer
-                set wH to (item 2 of wSz) as integer
-                -- Case A: filter active + country already expanded.
-                -- outerList itself IS the state list (description="list"); its children
-                -- are the per-state buttons directly (no extra nesting).
-                set outerDD to ""
-                try
-                    set outerDD to description of outerList as text
-                end try
-                if outerDD is "list" then
-                    if not (exists UI element 1 of outerList) then return "ERROR:empty_state_list"
-                    set firstElem to UI element 1 of outerList
-                    set fPos to position of firstElem
-                    set fSz to size of firstElem
-                    set firstY to (item 2 of fPos) as integer
-                    set rowH to (item 2 of fSz) as integer
-                    set stateCount to (count of UI elements of outerList) div 2
-                    if stateCount < 1 then set stateCount to 1
-                    return "R2:0," & firstY & "|W:" & wX & "," & wY & "," & wW & "," & wH & "|EXP:1|RH:" & rowH & "|SC:" & stateCount
-                end if
-                -- Case B: filter active + country collapsed, OR filter not applied.
-                -- Walk outerList children: find country header button (first wide button)
-                -- and optional nested state list (dd="list").
-                set stateList to missing value
-                set headerY to 0
-                repeat with c in UI elements of outerList
-                    set cdd to ""
-                    try
-                        set cdd to description of c as text
-                    end try
-                    if (class of c as text) is "button" and headerY = 0 then
-                        try
-                            set csz to size of c
-                            if (item 1 of csz) > 100 then
-                                set cpos to position of c
-                                set headerY to (item 2 of cpos) as integer
-                            end if
-                        end try
-                    end if
-                    if cdd is "list" and stateList is missing value then
-                        set stateList to c
-                    end if
-                end repeat
-                if stateList is missing value then
-                    return "R2:0," & headerY & "|W:" & wX & "," & wY & "," & wW & "," & wH & "|EXP:0|RH:44|SC:0"
-                end if
-                if not (exists UI element 1 of stateList) then return "ERROR:empty_state_list"
-                set firstElem to UI element 1 of stateList
-                set fPos to position of firstElem
-                set fSz to size of firstElem
-                set firstY to (item 2 of fPos) as integer
-                set rowH to (item 2 of fSz) as integer
-                set stateCount to (count of UI elements of stateList) div 2
-                if stateCount < 1 then set stateCount to 1
-                return "R2:0," & firstY & "|W:" & wX & "," & wY & "," & wW & "," & wH & "|EXP:1|RH:" & rowH & "|SC:" & stateCount
-            end tell
-        end tell
-        """
-        try:
-            p3 = run_osascript(phase3_script, timeout=20, label=f"slot-connect phase3 {location}")
-        except AutomationError as exc:
-            self.logger.log(f"Slot connect phase3 failed: {exc}", step="06", status="slot_setup_failed")
-            if "Accessibility permission required" in str(exc):
-                raise
-            return "slot_setup_failed"
-
-        if p3.startswith("ERROR:"):
-            self.logger.log(f"Slot connect phase3: {p3}", step="06", status=p3)
-            return p3
-
-        r2_x = r2_top = 0
-        w_x2 = w_y2 = w_w2 = w_h2 = 0
-        already_expanded = False
-        row_h_from_p3 = 0
-        state_count_from_p3 = 0
-        for chunk in p3.split("|"):
-            if chunk.startswith("R2:"):
-                nums = chunk[3:].split(",")
-                if len(nums) == 2:
-                    r2_x, r2_top = int(nums[0]), int(nums[1])
-            elif chunk.startswith("W:"):
-                nums = chunk[2:].split(",")
-                if len(nums) >= 4:
-                    w_x2, w_y2, w_w2, w_h2 = (
-                        int(nums[0]), int(nums[1]), int(nums[2]), int(nums[3])
-                    )
-                elif len(nums) == 3:
-                    w_x2, w_y2, w_w2 = int(nums[0]), int(nums[1]), int(nums[2])
-            elif chunk.startswith("EXP:"):
-                already_expanded = chunk[4:].strip() == "1"
-            elif chunk.startswith("RH:"):
-                try:
-                    row_h_from_p3 = int(chunk[3:])
-                except ValueError:
-                    pass
-            elif chunk.startswith("SC:"):
-                try:
-                    state_count_from_p3 = int(chunk[3:])
-                except ValueError:
-                    pass
-
-        # Use phase3 window coords if available (most current), fall back to phase1.
-        w_h = w_h2  # window height (phase1 does not capture it; 0 disables scroll)
-        if w_w2 > 0:
-            w_x, w_y, w_w = w_x2, w_y2, w_w2
-
-        if r2_top == 0 or w_w == 0:
-            self.logger.log(f"Bad phase3 data: {p3!r}", step="06")
-            return "bad_anchor_data"
-
-        # Row height comes from Phase 3 AX measurement; calibration is the fallback.
-        SERVER_ROW_H = row_h_from_p3 if row_h_from_p3 > 0 else calibration.row_height
-
-        # Use discovered server count as the authoritative slot count.
-        # state_count_from_p3 is the number of visible STATE groups (e.g. New York, LA),
-        # not the number of individual servers within the expanded state — using it would
-        # cause incorrect wrapping (e.g. 2 states → every slot > 2 wraps back to 1/2).
-        cached_count = len(
-            self.state.data.get("discovered_servers_by_location", {}).get(location, [])
+        result = self._surfshark_connect_city(
+            app_name, location, cached_idx=cached_idx, slot_num=slot_num,
+            total_count=total_count,
         )
-        total_slots = cached_count or state_count_from_p3 or slot_num
-        effective_slot = ((slot_num - 1) % total_slots) + 1 if total_slots > 1 else slot_num
-
-        # State N centre y — r2_top is the first state's y when already_expanded,
-        # or the country-header y when collapsed (states start one row_h below).
-        if already_expanded:
-            state_y = r2_top + (effective_slot - 1) * SERVER_ROW_H + SERVER_ROW_H // 2
-        else:
-            state_y = r2_top + SERVER_ROW_H + (effective_slot - 1) * SERVER_ROW_H + SERVER_ROW_H // 2
-
-        # Connect button x: inside the ProtonVPN window, left of the three-dot (60 px from right).
-        state_connect_x = w_x + w_w - calibration.state_connect_offset_from_right
-
-        self.logger.log(
-            f"Slot {slot_num} (eff {effective_slot}/{total_slots}): r2=({r2_x},{r2_top}) "
-            f"w=({w_x},{w_y},{w_w}) row_h={SERVER_ROW_H} "
-            f"already_expanded={already_expanded} state_y={state_y} connect_x={state_connect_x}",
-            step="06", slot=slot_num,
-        )
-
-        # ── Phase 4: hover state N → click its Connect button ────────────────────────────────
-        # State rows accept Quartz clicks without resetting the search filter (only clicking
-        # the search field or the scroll-area root resets it).  Hovering the row reveals the
-        # Connect button; we then click at the calibrated x position inside the window.
-
-        subprocess.run(
-            ["osascript", "-e",
-             'tell application "System Events" to set frontmost of process "ProtonVPN" to true'],
-            timeout=4, check=False,
-        )
-        time.sleep(0.3)
-
-        Quartz.CGAssociateMouseAndMouseCursorPosition(True)
-
-        # If the country row is not yet expanded, expand it first so state rows are visible.
-        if not already_expanded:
-            expand_x = w_x + w_w // 2
-            expand_y = r2_top + SERVER_ROW_H // 2
-            _mouse(Quartz.kCGEventLeftMouseDown, expand_x, expand_y)
-            _mouse(Quartz.kCGEventLeftMouseUp,   expand_x, expand_y)
-            time.sleep(1.5)
+        if "error" in result:
             self.logger.log(
-                f"Slot {slot_num}: expanded country at ({expand_x},{expand_y})", step="06",
+                f"Slot {slot_num} connect failed: {result['error']}",
+                step="06", slot=slot_num,
             )
+            return "server_not_found"
 
-        # Scroll so that state N is within the visible window area.
-        # w_h comes from Phase 3 (window height); if 0, skip scroll check.
-        # ProtonVPN (Mac Catalyst) routes scroll events by actual cursor position,
-        # so we _warp the cursor into the list first, then send small scroll chunks
-        # to avoid UIKit momentum overshoot.
-        row_center_x = w_x + w_w // 2
-        if w_h > 0:
-            # Target: bring state N to the vertical centre of the visible list area.
-            list_top    = r2_top                  # y of first state row (from Phase 3)
-            list_bottom = w_y + w_h - SERVER_ROW_H
-            list_center = (list_top + list_bottom) // 2
-
-            need_scroll = 0
-            if state_y > list_bottom:
-                need_scroll = state_y - list_center   # scroll DOWN (positive → negative delta)
-            elif state_y < list_top:
-                need_scroll = state_y - list_center   # scroll UP (negative → positive delta)
-
-            if need_scroll != 0:
-                # Warp cursor over the list so ProtonVPN's scroll area receives the events.
-                list_area_y = (list_top + list_bottom) // 2
-                _warp(row_center_x, list_area_y)
-                time.sleep(0.15)
-
-                # Send in row-sized chunks so UIKit processes each increment cleanly.
-                remaining = abs(need_scroll)
-                sign = -1 if need_scroll > 0 else 1   # negative = scroll down
-                while remaining > 0:
-                    chunk = min(SERVER_ROW_H, remaining)
-                    ev = Quartz.CGEventCreateScrollWheelEvent(
-                        None, Quartz.kCGScrollEventUnitPixel, 1, sign * chunk)
-                    Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
-                    time.sleep(0.06)
-                    remaining -= chunk
-                time.sleep(0.5)   # let the list settle after scrolling
-
-                state_y -= need_scroll
-                self.logger.log(
-                    f"Slot {slot_num}: scrolled {need_scroll:+d}px → state_y now {state_y}",
-                    step="06", slot=slot_num,
-                )
-
-        # Hover over state N row to reveal the Connect button.
-        _warp(row_center_x, state_y - 20)   # approach from just above
-        time.sleep(0.15)
-        _warp(row_center_x, state_y)         # settle on row centre
-        time.sleep(0.5)                       # wait for Connect button to paint
-
-        # Click the Connect button.
-        _mouse(Quartz.kCGEventLeftMouseDown, state_connect_x, state_y)
-        time.sleep(0.1)
-        _mouse(Quartz.kCGEventLeftMouseUp,   state_connect_x, state_y)
+        idx_cache[location] = result["country_idx"]
+        self.state.save()
         self.logger.log(
-            f"Slot {slot_num}: Connect clicked at ({state_connect_x},{state_y})",
-            step="06", slot=slot_num,
+            f"Slot {slot_num}: clicked Connect for '{result['city']}' "
+            f"({location} row {result['country_idx']}, {result['city_count']} cities)",
+            step="06", slot=slot_num, server=result["city"],
         )
-        time.sleep(0.5)
         return "connect_button_clicked"
 
     def _record_ip(self, ip: str | None) -> None:
@@ -1682,9 +1397,16 @@ class VPNController:
         self.state.save()
 
     def _click_disconnect(self, app_name: str) -> str:
+        """Click Surfshark's Disconnect button.
+
+        Surfshark's connect/disconnect control is an icon-only button with no
+        accessible name/title (unlike ProtonVPN's named "Disconnect"/"Cancel"
+        buttons), so it can't be found by button-name lookup. Instead: the
+        "VPN Information" group shows exactly one button (Connect) while
+        disconnected, and two buttons (Disconnect + a secondary action) while
+        connected or connecting — the first (leftmost) of the pair is Disconnect.
+        """
         process_list = self._process_name_candidates(app_name)
-        # Avoid deep tree walk (which hits the 6000+ row server table and times out).
-        # Try the Disconnect button at shallow known paths only.
         script = f"""
         tell application "System Events"
             set procName to ""
@@ -1698,37 +1420,35 @@ class VPNController:
 
             tell process procName
                 set frontmost to true
-                delay 0.4
+                delay 0.3
                 if not (exists window 1) then return "no_window"
 
-                -- Try "Disconnect" and "Cancel" (shown during Connecting state)
-                -- at window and two group levels.  Skip scroll areas to avoid
-                -- hitting the 6000+ row server table which causes timeouts.
-                set targetBtns to {{"Disconnect", "Cancel"}}
-                repeat with btnName in targetBtns
+                set vpnGrp to missing value
+                repeat with g in UI elements of window 1
+                    set gd to ""
                     try
-                        if exists button (btnName as text) of window 1 then
-                            click button (btnName as text) of window 1
-                            return "disconnect_clicked"
-                        end if
+                        set gd to description of g as text
                     end try
-                    try
-                        repeat with g in groups of window 1
-                            if exists button (btnName as text) of g then
-                                click button (btnName as text) of g
-                                return "disconnect_clicked"
-                            end if
-                            try
-                                repeat with gg in groups of g
-                                    if exists button (btnName as text) of gg then
-                                        click button (btnName as text) of gg
-                                        return "disconnect_clicked"
-                                    end if
-                                end repeat
-                            end try
-                        end repeat
-                    end try
+                    if gd is "VPN Information" then
+                        set vpnGrp to g
+                        exit repeat
+                    end if
                 end repeat
+                if vpnGrp is missing value then return "no_disconnect_button"
+
+                set btnList to {{}}
+                repeat with k in UI elements of vpnGrp
+                    set c to ""
+                    try
+                        set c to class of k as text
+                    end try
+                    if c is "button" then set end of btnList to k
+                end repeat
+
+                if (count of btnList) ≥ 2 then
+                    click item 1 of btnList
+                    return "disconnect_clicked"
+                end if
 
                 return "no_disconnect_button"
             end tell

@@ -30,7 +30,7 @@ if [ ! -f "$INPUT_FILE" ]; then
   exit 1
 fi
 
-# Detect Python, create .venv, and install deps (shared with calibrate.command).
+# Detect Python, create .venv, and install deps.
 # Sets VENV_PY on success.
 source "$SCRIPT_DIR/scripts/bootstrap_venv.sh"
 if ! ensure_venv "$SCRIPT_DIR"; then

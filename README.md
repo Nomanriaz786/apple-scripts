@@ -22,7 +22,7 @@ macOS 12 Monterey and later. Tested on macOS 13 Ventura and 14 Sonoma.
 |-----|----------|-------|
 | Google Chrome | Yes | Must be open with Podcasts tabs loaded |
 | Apple Podcasts | Yes | Pre-installed on macOS |
-| ProtonVPN | Only if `vpn.enabled: true` | Must be signed in |
+| Surfshark | Only if `vpn.enabled: true` | Must be signed in |
 | Python 3.9+ | Yes | `python3 --version` to check |
 
 ---
@@ -70,7 +70,7 @@ Edit `input/tasks.json`. Only these keys are used:
   "repeat": 2,
   "vpn": {
     "enabled": true,
-    "app": "ProtonVPN",
+    "app": "Surfshark",
     "location": "United States",
     "require_provider_in_org": false
   },
@@ -88,10 +88,9 @@ Edit `input/tasks.json`. Only these keys are used:
 | `repeat` | int ≥ 1 | Number of full cycles to run |
 | `vpn` | object or `false` | VPN settings. Set to `false` to disable |
 | `vpn.enabled` | bool | Enable VPN gate |
-| `vpn.app` | string | VPN app name (default: `"ProtonVPN"`) |
+| `vpn.app` | string | VPN app name (default: `"Surfshark"`) |
 | `vpn.location` | string | Target location (default: `"United States"`) |
 | `vpn.require_provider_in_org` | bool | Require VPN provider name in IP org field |
-| `vpn.calibration` | object | Per-device ProtonVPN click geometry — set by `calibrate.command` (see §6a). Optional; sensible defaults are used if absent |
 | `tabs` | array | Chrome tab numbers and episode row indexes to download |
 | `tabs[].tab` | int ≥ 1 | Chrome tab number (1-based, in front window) |
 | `tabs[].videos` | int[] | Episode row numbers to download (1 = top row) |
@@ -100,30 +99,9 @@ Edit `input/tasks.json`. Only these keys are used:
 
 Everything else (server names, show URLs, VPN servers) is auto-detected and saved in state.
 
-## 6a. Per-Device ProtonVPN Calibration
-
-ProtonVPN's per-server **Connect** button is drawn only on hover and is not exposed
-to Accessibility, so the automation must click it by pixel coordinates. Those
-coordinates differ across Macs, displays, and ProtonVPN versions. Run the
-calibration **once on each Mac**:
-
-1. Open ProtonVPN, sign in, and **disconnect**.
-2. Double-click **`calibrate.command`** (or run `python3 scripts/calibrate.py`).
-3. It searches "United States" and expands the list, then asks you to hover the
-   **Connect** button of the **first** and **second** US servers — just hover and
-   hold still; it captures automatically (no clicking).
-4. It writes `vpn.calibration` into `input/tasks.json` (a `.json.bak` backup is
-   kept). Then run `run.command` as normal.
-
-`vpn.calibration` fields (all pixels):
-
-| Field | Meaning |
-|-------|---------|
-| `connect_offset_from_right` | window right edge − Connect button x |
-| `header_height` | US country-header row height |
-| `row_height` | individual server row height |
-
-If `vpn.calibration` is absent, the reference-Mac defaults (`38 / 48 / 48`) are used.
+Surfshark's location list is fully Accessibility-exposed (no hover-only Connect
+button, unlike ProtonVPN), so no per-device pixel calibration step is needed —
+there's nothing to run once per Mac before `run.command`.
 
 ---
 
@@ -300,7 +278,7 @@ This activates Podcasts, navigates to the Downloaded tab, dumps the full AX tree
 
 - **Mac Catalyst context menus**: The ⋯ menu in the Downloaded card is not AX-accessible as a standard menu. AX Remove selection is attempted first; keyboard Down×3+Enter is the fallback. When keyboard is used, `cleanup_fallback_keyboard_used=true` is logged in state.
 - **Show name capture**: Relies on Podcasts window title or first AX static text in content area. If the title is missing or wrong, cleanup falls back to generic card detection.
-- **VPN slot reliability**: Some ProtonVPN server slots may time out during connection setup. The script tries all available slots before giving up.
+- **VPN slot reliability**: Some Surfshark servers may time out during connection setup. The script tries all available servers before giving up.
 - **AXProgressIndicator**: If Podcasts does not expose progress indicators in the AX tree, download wait falls back to 45s flat wait (`stable_unknown`).
 
 ---
@@ -314,7 +292,7 @@ Run these steps on **3 Macs** before deploying to 100+:
 - [ ] Accessibility permission granted for Terminal (or launcher)
 - [ ] Automation permission granted for Terminal
 - [ ] Google Chrome open with Apple Podcasts tabs in position
-- [ ] ProtonVPN installed and signed in (if `vpn.enabled: true`)
+- [ ] Surfshark installed and signed in (if `vpn.enabled: true`)
 - [ ] `input/tasks.json` deployed to each Mac
 - [ ] `state/` and `logs/` directories writable by the running user
 - [ ] Run test sequence 1–5 (vpn=false) on each Mac before enabling VPN
@@ -343,8 +321,8 @@ Test sequence (in order):
 **`Accessibility permission not granted`**
 → System Settings → Privacy & Security → Accessibility → enable Terminal
 
-**`Required app not found: ProtonVPN`**
-→ Install ProtonVPN from the App Store or protonvpn.com. Sign in before running.
+**`Required app not found: Surfshark`**
+→ Install Surfshark from the App Store or surfshark.com. Sign in before running.
 
 **`Configured Chrome tab N was not found`**
 → Chrome must have at least N tabs open in its front window before you run the script.
@@ -356,7 +334,7 @@ Test sequence (in order):
 → Check `logs/ax-dump-cleanup_card_not_found_*.txt` for the AX tree at the time of failure. Run `--diagnose-ax` to get a fresh dump.
 
 **`vpn_verify_level` is empty in state**
-→ VPN verification timed out. Check ProtonVPN is connected, try `--test-vpn-connect` to isolate.
+→ VPN verification timed out. Check Surfshark is connected, try `--test-vpn-connect` to isolate.
 
 **`cleanup_fallback_keyboard_used: true`**
 → Normal — Mac Catalyst menus are not always AX-accessible. The keyboard fallback works correctly. If cleanup is still failing, check `ax-dump` files.
