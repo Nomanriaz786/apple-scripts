@@ -3681,63 +3681,6 @@ class PodcastsController:
         except AutomationError:
             return "no_dialog"
 
-    def _dismiss_failed_download_dialog(self, verify_timeout: float = 5.0) -> str:
-        """If a 'download failed' alert (Retry / Done buttons, e.g. "Unable to
-        Download Podcast") is showing, dismiss it by clicking Done — never Retry,
-        so a failed episode is skipped instead of automatically retried. Waits
-        for the alert to actually disappear before returning, so callers can
-        trust the dialog is really gone rather than just having sent a click.
-        Non-fatal no-op when no such dialog is present.
-
-        Returns 'dismissed' | 'dismiss_unconfirmed' | 'no_dialog' | 'error:...'.
-        """
-        def _find_retry_done() -> "tuple[bool, tuple[int, int] | None]":
-            has_retry = False
-            done_pos: "tuple[int, int] | None" = None
-            for role, text, x, y, w, h in self._ax_nodes():
-                if role != "AXButton" or w <= 0 or h <= 0:
-                    continue
-                low = text.strip().lower()
-                if low == "retry":
-                    has_retry = True
-                elif low == "done":
-                    done_pos = (x + w // 2, y + h // 2)
-            return has_retry, done_pos
-
-        has_retry, done_pos = _find_retry_done()
-        if not has_retry or done_pos is None:
-            return "no_dialog"
-
-        try:
-            import Quartz  # type: ignore[import]
-        except ImportError:
-            return "error:quartz_unavailable"
-
-        cx, cy = done_pos
-        pt = Quartz.CGPointMake(cx, cy)
-        for kind in (Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp):
-            ev = Quartz.CGEventCreateMouseEvent(None, kind, pt, Quartz.kCGMouseButtonLeft)
-            Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
-            time.sleep(0.05)
-        self.logger.log(f"Download failed dialog: clicked Done at ({cx},{cy})", step="13")
-
-        # Verify the alert actually closed — handle slower UI updates by polling
-        # rather than trusting the click landed on the first try.
-        deadline = time.time() + verify_timeout
-        while time.time() < deadline:
-            time.sleep(0.4)
-            still_retry, _ = _find_retry_done()
-            if not still_retry:
-                self.logger.log("Download failed dialog: dismissed (verified)", step="13")
-                return "dismissed"
-
-        self.logger.log(
-            f"Download failed dialog: Done clicked but Retry button still "
-            f"present after {verify_timeout}s",
-            step="13",
-        )
-        return "dismiss_unconfirmed"
-
     def cleanup_episode_row(self, video_no: int) -> str:
         """Remove a download via the episode-list ⋯ menu (Down×1+Enter = Remove Download).
 
@@ -3980,20 +3923,6 @@ class PodcastsController:
         self.logger.log(f"Clicked Downloaded sidebar at ({cx},{cy})", step="14")
         return "navigated"
 
-    def has_downloaded_cards(self) -> bool:
-        """Fast check: True if the Downloaded section currently shows at least one
-        show card. Navigates to Downloaded first, then uses the quick native-only
-        card search (~1s) rather than _find_downloaded_card_frame's System Events
-        fallback, so an already-empty grid is detected without a ~30s scan.
-        """
-        nav = self.navigate_to_downloaded_tab()
-        if nav != "navigated":
-            return False
-        if self._has_back_button():
-            self._click_back_button()
-            time.sleep(0.5)
-        return self._find_downloaded_card_frame_native_only() is not None
-
     def navigate_to_recently_updated_tab(self) -> str:
         """Navigate to the Recently Updated section in the Podcasts sidebar.
 
@@ -4147,10 +4076,6 @@ class PodcastsController:
         deadline = t_open + wait_timeout
         while time.time() < deadline:
             time.sleep(3)
-            # A per-episode download failure shows a Retry/Done alert that would
-            # otherwise sit blocking this wait forever. Always dismiss it with
-            # Done — never Retry — then keep polling for the modal to close.
-            self._dismiss_failed_download_dialog()
             if not self._downloads_modal_open():
                 waited = int(time.time() - t_open)
                 self.logger.log(
@@ -4577,9 +4502,6 @@ class PodcastsController:
         deadline = time.time() + timeout
         while time.time() < deadline:
             time.sleep(2)
-            # Dismiss a per-episode download-failure alert with Done — never
-            # Retry — so it can't sit blocking this wait indefinitely.
-            self._dismiss_failed_download_dialog()
             elapsed = int(time.time() - t_start)
             still_active = self._find_downloading_button() is not None
             self.logger.log(f"Downloads in progress ({elapsed}s)", step="14")
@@ -5492,8 +5414,6 @@ end tell
 
         results: list[dict[str, Any]] = []
         removed = 0
-        stuck_pos: "tuple[int, int] | None" = None
-        stuck_count = 0
         for iteration in range(50):
             # Re-navigate each iteration — card removal may shift view focus.
             nav = self.navigate_to_downloaded_tab()
@@ -5541,29 +5461,6 @@ end tell
                 continue
 
             card_x, card_y, card_w, card_h = frame
-
-            # Detect a card that keeps failing to be removed: if the SAME card
-            # (same position) is found again after a removal attempt, retrying it
-            # blindly up to the full 50-iteration budget is what used to make
-            # cleanup appear "stuck" for many minutes. Bound the retries per card
-            # and give up loudly instead of silently spinning.
-            if (stuck_pos is not None
-                    and abs(card_x - stuck_pos[0]) <= 10
-                    and abs(card_y - stuck_pos[1]) <= 10):
-                stuck_count += 1
-            else:
-                stuck_count = 0
-                stuck_pos = (card_x, card_y)
-            if stuck_count >= 3:
-                self.logger.log(
-                    f"Downloads cleanup: card at ({card_x},{card_y}) still present "
-                    f"after {stuck_count} removal attempts — aborting to avoid an "
-                    "infinite loop",
-                    step="14",
-                )
-                results.append({"iteration": iteration + 1, "result": "stuck"})
-                break
-
             # Card count before this removal — used afterwards to confirm the (async)
             # removal actually took effect before we scan for the next card.
             cards_before = self._count_downloaded_cards()
@@ -5602,6 +5499,11 @@ end tell
                 Quartz.CGEventPost(Quartz.kCGHIDEventTap, mv)
                 time.sleep(0.05)
 
+            def _key(vk: int, down: bool) -> None:
+                ev = Quartz.CGEventCreateKeyboardEvent(None, vk, down)
+                Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+                time.sleep(0.07)
+
             def _open_three_dots_menu() -> None:
                 """Hover artwork center → move to ⋯ → left-click to open context menu."""
                 _warp(artwork_cx, artwork_cy)
@@ -5624,34 +5526,23 @@ end tell
             ax_ok = self._click_unfollow_show_menu_item_ax()
             confirm = "no_sheet"
             actual_removed = False
-            remove_ok = False
 
             if not ax_ok:
-                # 'Unfollow Show' isn't in this menu (e.g. the show was already
-                # unfollowed elsewhere but still holds a local download) — skip
-                # that step entirely and go straight for Remove Download instead.
-                # The menu opened above is STILL OPEN (nothing was clicked to
-                # dismiss it, since Unfollow Show was never found), so reuse it
-                # directly instead of reopening — a second open-menu click here
-                # lands on an already-open menu and can dismiss it before Remove
-                # Download is ever found, which is what silently skipped removal.
+                # Keyboard fallback: 'Unfollow Show' is first item → Down×1 + Enter
                 self.logger.log(
-                    f"Downloads cleanup card {iteration + 1}: Unfollow Show not "
-                    "found via AX — trying Remove Download instead",
+                    f"Downloads cleanup card {iteration + 1}: Unfollow Show not found via AX — keyboard fallback",
                     step="14",
                 )
-                remove_ok = self._click_remove_menu_item_ax()
+                _key(0x7D, True); _key(0x7D, False)
+                time.sleep(0.3)
+                _key(0x24, True); _key(0x24, False)
+                time.sleep(0.8)
 
             time.sleep(0.4)
             confirm = self._click_confirmation_remove()
             actual_removed = True
 
-            if ax_ok:
-                result_label = "unfollowed:ax"
-            elif remove_ok:
-                result_label = "removed:ax"
-            else:
-                result_label = "unfollow_and_remove_not_found"
+            result_label = "unfollowed:ax" if ax_ok else "unfollowed:keyboard"
             if confirm not in ("no_sheet",):
                 result_label += f"+confirmed:{confirm}"
 
@@ -5837,28 +5728,23 @@ end tell
             except AutomationError:
                 pass
 
-            # Step 1: three-dot menu → Remove Download, when the show has one. Not
-            # every show exposes this item (e.g. it was never downloaded), so its
-            # absence must not interrupt cleanup.
+            # Step 1: three-dot menu → Remove Download.
             _open_three_dots_menu(three_x, three_y, artwork_cx, artwork_cy)
             remove_ok = self._click_remove_menu_item_ax()
             if remove_ok:
                 self._click_confirmation_remove(max_attempts=5)
-                # Step 2: wait for the removal to complete before continuing.
-                time.sleep(4)
-                # Step 3: re-open the three-dot menu on the same card → Unfollow
-                # Show (selecting Remove Download closed the menu that opened it).
-                _open_three_dots_menu(three_x, three_y, artwork_cx, artwork_cy)
             else:
-                # No Remove Download item — the menu opened above is still showing
-                # (nothing was clicked to dismiss it), so go straight to Unfollow
-                # Show in that same menu instead of reopening it.
                 self.logger.log(
                     f"Recently Updated cleanup card {iteration + 1}: "
-                    "Remove Download item not found via AX — skipping straight to Unfollow",
+                    "Remove Download item not found via AX — continuing to Unfollow",
                     step="14",
                 )
 
+            # Step 2: wait for the removal to complete before continuing.
+            time.sleep(4)
+
+            # Step 3: re-open the three-dot menu on the same card → Unfollow Show.
+            _open_three_dots_menu(three_x, three_y, artwork_cx, artwork_cy)
             unfollow_ok = self._click_unfollow_show_menu_item_ax()
             confirm = "no_sheet"
             if unfollow_ok:
@@ -6569,103 +6455,13 @@ end tell
 
         # Navigate the System Settings panes by AX label (resolution/scaling-independent),
         # falling back to the old fixed coordinates only when AX can't resolve an element.
-
-        def _find_profile_row_pos() -> "tuple[int, int] | None":
-            """Center of the Apple Account/Profile row at the TOP of the sidebar.
-
-            Prefers a label match ('Apple Account' / 'Apple ID' / the signed-in
-            email, which always contains '@') and explicitly excludes any
-            candidate whose text mentions 'General', so a stray substring match
-            can never resolve to the General row. If no label matches, falls back
-            to the topmost sidebar row (by y-position) that isn't 'General' — the
-            profile row is always first in the sidebar, above General — which is
-            reliable across window sizes/macOS versions, unlike a fixed pixel
-            offset.
-            """
-            if not _ax_ok:
-                return None
-            try:
-                ss_pid = int(subprocess.run(
-                    ["osascript", "-e",
-                     'tell application "System Events" to return unix id of process "System Settings"'],
-                    capture_output=True, text=True, timeout=5,
-                ).stdout.strip())
-            except Exception:
-                return None
-            root = AXUIElementCreateApplication(ss_pid)
-            stack = [root]
-            seen = 0
-            sidebar_right = wx + 220  # sidebar is the narrow left column
-            content_top = wy + 60     # excludes the toolbar AND the global menu bar
-                                       # (menu bar items report y=0, an absolute screen
-                                       # coordinate, which is otherwise indistinguishable
-                                       # from a real sidebar row by x alone)
-            candidates: "list[tuple[int, int, int, int, str]]" = []
-            while stack and seen < 12000:
-                el = stack.pop()
-                seen += 1
-                text = ""
-                for attr in (kAXDescriptionAttribute, kAXValueAttribute, kAXTitleAttribute):
-                    v = _attr(el, attr)
-                    if isinstance(v, str) and v.strip():
-                        text = v.strip()
-                        break
-                if text:
-                    pv = _attr(el, kAXPositionAttribute)
-                    sv = _attr(el, kAXSizeAttribute)
-                    if pv and sv:
-                        okp, pt = AXValueGetValue(pv, kAXValueCGPointType, None)
-                        oks, sz = AXValueGetValue(sv, kAXValueCGSizeType, None)
-                        if (okp and oks and int(pt.x) < sidebar_right
-                                and int(pt.y) >= content_top
-                                and 0 < int(sz.width)
-                                and 0 < int(sz.height) <= 50):  # single row, not a container
-                            candidates.append(
-                                (int(pt.y), int(pt.x), int(sz.width), int(sz.height), text))
-                ch = _attr(el, kAXChildrenAttribute)
-                if ch:
-                    stack.extend(ch)
-            if not candidates:
-                return None
-            candidates.sort(key=lambda c: c[0])
-            # Normalize non-breaking spaces (System Settings renders "Apple\xa0Account"
-            # with U+00A0, not a plain space) so the label match actually fires.
-            for y, x, w, h, text in candidates:
-                low = text.replace("\xa0", " ").lower()
-                if "general" in low:
-                    continue
-                if "apple account" in low or "apple id" in low or "@" in text:
-                    return x + w // 2, y + h // 2
-            for y, x, w, h, text in candidates:
-                if "general" not in text.replace("\xa0", " ").lower():
-                    return x + w // 2, y + h // 2
-            return None
-
-        # 1) Apple Account / Profile row — click, then VERIFY the correct pane
-        #    actually opened (its 'Media & Purchases' item becomes visible) before
-        #    proceeding. Retries the click (re-resolving the row each time) if the
-        #    pane didn't open, instead of continuing into whatever pane — e.g.
-        #    General — ended up open.
-        media_pos = None
-        for attempt in range(3):
-            acct_pos = _find_profile_row_pos()
-            _qclick(*(acct_pos or (wx + 84, wy + 113)))
-            time.sleep(1.8)
-            deadline = time.time() + 3.0
-            while time.time() < deadline:
-                media_pos = _find_in_sys_settings(["Media & Purchases", "Media and Purchases"])
-                if media_pos:
-                    break
-                time.sleep(0.4)
-            if media_pos:
-                break
-            self.logger.log(
-                f"Sign-out: Profile/Apple Account pane not confirmed on attempt "
-                f"{attempt + 1} (acct_pos={acct_pos}) — retrying",
-                step="14a",
-            )
-
+        # 1) Apple Account sidebar row (labeled with the account name in the sidebar; the
+        #    pane header reads "Apple Account" on Sequoia+, "Apple ID" on older macOS).
+        acct_pos = _find_in_sys_settings(["Apple Account", "Apple ID"])
+        _qclick(*(acct_pos or (wx + 84, wy + 113)))
+        time.sleep(1.8)
         # 2) Media & Purchases (holds the Podcasts/media Sign Out button).
+        media_pos = _find_in_sys_settings(["Media & Purchases", "Media and Purchases"])
         _qclick(*(media_pos or (int(wx + ww * 0.65), int(wy + wh * 0.82))))
         time.sleep(2.0)
 
@@ -6937,16 +6733,6 @@ class Orchestrator:
             if self.config.clean_start:
                 self._startup_cleanup()
 
-            # Tracks how many accounts have actually been consumed so far in THIS
-            # run (only incremented for a cycle that actually executes below — see
-            # the skip-continue right below). Accounts are removed from the input
-            # file as each cycle finishes, so a fresh run always starts back at
-            # index 0 = the first remaining account; using `cycle` itself for this
-            # would incorrectly skip that first account whenever `completed_cycles`
-            # from an earlier run (against a longer account list) still contains
-            # low cycle numbers.
-            account_cursor = 0
-
             for cycle in range(1, self.config.repeat + 1):
                 if cycle in self.state.data["completed_cycles"]:
                     self.logger.log(f"Cycle {cycle} already completed — skipping", step="05",
@@ -6968,8 +6754,6 @@ class Orchestrator:
                 self.logger.log(f"Starting cycle {cycle}", step="05", cycle=cycle,
                                 skip_to_cleanup=skip_to_cleanup)
                 self.state.mark_phase(cycle, "cycle_started")
-                if self.config.accounts:
-                    self.state.data["current_account_index"] = account_cursor
 
                 if skip_to_cleanup:
                     self.logger.log(
@@ -7006,21 +6790,6 @@ class Orchestrator:
                             step="13",
                         )
 
-                if not downloads_done:
-                    # Never sign out while downloads might still be in progress.
-                    # show_downloading_page() can return without confirming
-                    # completion (timeout/error), and a resumed run that skipped
-                    # straight to cleanup doesn't know either — in both cases
-                    # downloads_done is still False here, so verify completion now
-                    # using the same stability check the cleanup phase already
-                    # relies on, instead of signing out on an unconfirmed state.
-                    dl_status = self.podcasts.wait_for_downloads_stable(timeout=180)
-                    downloads_done = dl_status in ("completed", "completed_fast")
-                    self.logger.log(
-                        f"Download completion check before sign-out: {dl_status}",
-                        step="13", cycle=cycle, downloads_done=downloads_done,
-                    )
-
                 if self.config.accounts:
                     self.logger.log("Signing out before cleanup", step="14a")
                     self.podcasts.activate()
@@ -7045,31 +6814,25 @@ class Orchestrator:
 
                 self.podcasts.quit_app()
 
-                # Remove this cycle's account from the input file BEFORE marking the
-                # cycle complete. If the process is interrupted between the two
-                # steps, this order guarantees the removal — the definitive signal
-                # that an ID was fully processed — has already happened; a resumed
-                # run then retries this same cycle number against the next
-                # available account instead of silently reusing account_cursor and
-                # leaving one ID unprocessed while completed_cycles still reports
-                # every cycle as done (cycle counter and account processing were
-                # able to go out of sync in the old order).
-                if self.config.accounts:
-                    used = self.config.accounts[account_cursor % len(self.config.accounts)]
-                    account_cursor += 1
-                    remove_result = self._remove_account_from_input(used.email)
-                    self.logger.log(
-                        f"Removed account from input after cycle {cycle}: "
-                        f"{used.email} → {remove_result}",
-                        step="15", cycle=cycle, email=used.email, result=remove_result,
-                    )
-
                 completed = list(self.state.data["completed_cycles"])
                 completed.append(cycle)
                 self.state.update(completed_cycles=completed,
                                   current_tab=None, current_video=None)
                 self.state.mark_phase(cycle, "cycle_completed")
                 self.logger.log(f"Cycle {cycle} complete", step="15", cycle=cycle)
+
+                # This cycle's account is done — remove it from the input file so
+                # each ID is dropped right after its own cycle completes. Only the
+                # on-disk file changes; the in-memory config is untouched so the
+                # remaining cycles keep their existing account indexing.
+                if self.config.accounts:
+                    used = self.config.accounts[(cycle - 1) % len(self.config.accounts)]
+                    remove_result = self._remove_account_from_input(used.email)
+                    self.logger.log(
+                        f"Removed account from input after cycle {cycle}: "
+                        f"{used.email} → {remove_result}",
+                        step="15", cycle=cycle, email=used.email, result=remove_result,
+                    )
 
             self.logger.log("All cycles complete", step="16")
             return 0
@@ -7350,15 +7113,7 @@ class Orchestrator:
         # sign_in_to_podcasts returns immediately if already on the correct account,
         # so calling it on every tab is safe — it's a no-op after the first tab.
         if self.config.accounts:
-            # current_account_index is set once per cycle in run() — it tracks how
-            # many accounts have actually been consumed THIS run, independent of
-            # `cycle` (which can start past 1 on a resumed run against a shrunk
-            # account list, and previously caused the first remaining account to be
-            # skipped). Fall back to the old cycle-based index if it's ever unset.
-            account_idx = self.state.data.get("current_account_index")
-            if account_idx is None:
-                account_idx = cycle - 1
-            account = self.config.accounts[account_idx % len(self.config.accounts)]
+            account = self.config.accounts[(cycle - 1) % len(self.config.accounts)]
             self.logger.log(f"Signing in with account {account.email}", step="10a")
             sign_in_result = self.podcasts.sign_in_to_podcasts(account.email, account.password)
             self.logger.log(
@@ -7370,23 +7125,6 @@ class Orchestrator:
                  "result": sign_in_result}
             )
             self.state.save()
-
-            # Verify the account session is actually ready before Follow/download
-            # touch it. A sign-in that takes longer than usual can still report
-            # success in the Account menu before the account is fully initialized,
-            # leaving Follow to silently miss. Poll the same reliable Account-menu
-            # check sign-in itself relies on, rather than adding a fixed delay.
-            ready_deadline = time.time() + 20
-            signed_in_email = ""
-            while time.time() < ready_deadline:
-                signed_in_email = self.podcasts.get_signed_in_email()
-                if account.email.lower() in signed_in_email.lower():
-                    break
-                time.sleep(2)
-            self.logger.log(
-                f"Account readiness check: signed_in_email={signed_in_email!r}",
-                step="10a", tab=tab_task.tab, expected_email=account.email,
-            )
 
         # The "What's New in Apple Podcasts" modal can appear right after a fresh
         # sign-in and blocks the Follow button — dismiss it before Follow.
@@ -7543,7 +7281,8 @@ class Orchestrator:
         self.state.mark_phase(cycle, "downloads_stable")
 
         # Remove every show from Recently Updated (Remove Download, then Unfollow
-        # Show) until the section is confirmed empty.
+        # Show) until the section is confirmed empty. The Downloaded section is left
+        # untouched — downloaded shows stay in place.
         results = self.podcasts.cleanup_all_from_recently_updated()
 
         for r in results:
@@ -7555,31 +7294,6 @@ class Orchestrator:
             f"Cleanup finished: {removed} show(s) removed ({len(results)} actions)",
             step="14", cycle=cycle, action_count=len(results), removed_count=removed,
         )
-
-        # Now that Recently Updated is confirmed empty, sweep the Downloaded
-        # section too — a fast card check first, so an already-empty grid is
-        # skipped immediately instead of paying for a cleanup pass.
-        if self.podcasts.has_downloaded_cards():
-            self.logger.log(
-                "Downloaded section: cards remaining — cleaning up", step="14", cycle=cycle,
-            )
-            downloaded_results = self.podcasts.cleanup_all_from_downloads_tab()
-            for r in downloaded_results:
-                self.state.add_cleanup_result(cycle=cycle, section="downloaded", **r)
-            downloaded_removed = sum(
-                1 for r in downloaded_results if "removed" in r.get("result", "")
-            )
-            self.state.mark_phase(cycle, "downloaded_cleanup_completed")
-            self.logger.log(
-                f"Downloaded section cleanup finished: {downloaded_removed} show(s) "
-                f"removed ({len(downloaded_results)} actions)",
-                step="14", cycle=cycle,
-                action_count=len(downloaded_results), removed_count=downloaded_removed,
-            )
-        else:
-            self.logger.log(
-                "Downloaded section: no cards remaining — skipping", step="14", cycle=cycle,
-            )
 
 
 # -----------------------------------------------------------------------------
