@@ -1,5 +1,5 @@
 #!/bin/bash
-# Shared virtualenv bootstrap for run.command and calibrate.command.
+# Shared virtualenv bootstrap for run.command.
 #
 # Usage:
 #   source "$SCRIPT_DIR/scripts/bootstrap_venv.sh"

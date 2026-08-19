@@ -92,7 +92,7 @@ check_app() {
     fi
 }
 check_app "Google Chrome"
-check_app "ProtonVPN"
+check_app "Surfshark"
 echo "✓ Podcasts (built into macOS)"
 
 # ── 8. macOS permissions reminder ─────────────────────────────────────────────
@@ -144,5 +144,5 @@ echo ""
 echo "Before first run:"
 echo "  • Edit input/tasks.json with your podcast URLs and VPN settings"
 echo "  • Open Google Chrome with Apple Podcasts show pages in the right tabs"
-echo "  • Connect ProtonVPN manually once to confirm it works"
+echo "  • Connect Surfshark manually once to confirm it works"
 echo "  • Grant Accessibility + Screen Recording permissions (see above)"

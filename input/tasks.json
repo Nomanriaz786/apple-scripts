@@ -1,8 +1,8 @@
 {
-  "repeat": 1,
+  "repeat": 3,
   "vpn": {
     "enabled": true,
-    "app": "ProtonVPN",
+    "app": "Surfshark",
     "location": "United States",
     "require_provider_in_org": false,
     "state_count": 20,
