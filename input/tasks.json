@@ -2,7 +2,7 @@
   "repeat": 3,
   "vpn": {
     "enabled": true,
-    "app": "Surfshark",
+    "app": "NordVPN",
     "location": "United States",
     "require_provider_in_org": false
   },
