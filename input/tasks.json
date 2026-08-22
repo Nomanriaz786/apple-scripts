@@ -2,15 +2,9 @@
   "repeat": 3,
   "vpn": {
     "enabled": true,
-    "app": "Surfshark",
+    "app": "NordVPN",
     "location": "United States",
-    "require_provider_in_org": false,
-    "state_count": 20,
-    "calibration": {
-      "state_connect_offset_from_right": 110,
-      "header_height": 64,
-      "row_height": 28
-    }
+    "require_provider_in_org": false
   },
   "tabs": [
     {

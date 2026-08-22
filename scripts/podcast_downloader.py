@@ -69,10 +69,11 @@ class TabTask:
 @dataclass(frozen=True)
 class VPNCalibration:
     """Legacy per-device pixel geometry, from the earlier ProtonVPN Quartz/hover
-    based connect routine (see git history). Unused by the current Surfshark
-    connector, which drives the location list with plain AX clicks and needs no
-    pixel calibration — kept only so an existing `vpn.calibration` block in
-    input/tasks.json still parses harmlessly instead of raising.
+    based connect routine (see git history). Unused by the current NordVPN
+    connector: its location list, like Surfshark's before it, is driven by
+    real AX row/element coordinates read fresh each time rather than fixed
+    per-device pixel offsets — kept only so an existing `vpn.calibration`
+    block in input/tasks.json still parses harmlessly instead of raising.
     """
     state_connect_offset_from_right: int = 110  # window_right_edge - Connect_btn_x on state row
     header_height: int = 48                     # US country-header row height
@@ -82,7 +83,7 @@ class VPNCalibration:
 @dataclass(frozen=True)
 class VPNConfig:
     enabled: bool
-    app: str = "Surfshark"
+    app: str = "NordVPN"
     location: str = "United States"
     location_code: str = "US"
     servers: tuple[str, ...] = ()
@@ -119,7 +120,7 @@ def _parse_vpn(raw_vpn: Any) -> VPNConfig:
         raise ValueError("'vpn' must be a boolean or an object {enabled, app, location}")
 
     enabled = bool(raw_vpn.get("enabled", True))
-    app = str(raw_vpn.get("app", "Surfshark")).strip() or "Surfshark"
+    app = str(raw_vpn.get("app", "NordVPN")).strip() or "NordVPN"
     location = str(raw_vpn.get("location", "United States")).strip() or "United States"
     location_code = _COUNTRY_CODE_FALLBACK.get(location.lower(), location.upper()[:2] or "US")
 
@@ -650,7 +651,7 @@ class VPNController:
             discovered = self.state.data.setdefault("discovered_servers_by_location", {})
             cached = discovered.get(vpn_cfg.location, [])
             # Use the cache only if it has >1 server.  A single-server cache means
-            # the previous discovery run was incomplete (Surfshark's US list has many
+            # the previous discovery run was incomplete (NordVPN's US list has many
             # cities); with only 1 server the rotation index never advances and the
             # same IP is used on every cycle.  Treat it as stale and re-discover.
             if cached and len(cached) > 1:
@@ -733,7 +734,7 @@ class VPNController:
                         ui_connection_state=ui_state)
 
         # Re-capture baseline AFTER disconnect so baseline_ip reflects the bare (non-VPN) IP.
-        # This handles the case where Surfshark auto-reconnects during the subsequent setup
+        # This handles the case where the VPN app auto-reconnects during the subsequent setup
         # AppleScript (which can take several seconds): the post-connect IP equals the
         # pre-disconnect VPN IP, making ip==baseline_ip (even though connection succeeded).
         # If the IP hasn't changed yet (auto-reconnect or slow teardown), disable the
@@ -912,41 +913,62 @@ class VPNController:
                 seen.append(n)
         return ", ".join('"' + n.replace('"', '\\"') + '"' for n in seen)
 
-    def _surfshark_table_path(self) -> str:
-        """AppleScript expression for Surfshark's Locations table.
+    # Fixed offset (dx, dy) from the "Pause connection" button's own AX-reported
+    # top-left corner to the "Disconnect" item in the popover it opens. NordVPN's
+    # SwiftUI popover is a genuine on-screen AXPopover but System Events cannot
+    # enumerate its contents (confirmed: the popover shows up as a window-level
+    # UI element with zero readable children), so — like the legacy ProtonVPN
+    # connector `VPNCalibration` was built for — this one interaction needs a
+    # calibrated pixel offset rather than an AX lookup. Empirically measured;
+    # everything else in this connector is driven by live AX coordinates.
+    _NORD_DISCONNECT_MENU_OFFSET = (53.0, 290.0)
 
-        window 1 > list 1 (whole left panel) > UI element 4 ("Locations" wrapper)
-        > list 1 (inner) > scroll area 1 > table 1. Unlike ProtonVPN's Mac Catalyst
-        list, this table is a plain, fully AX-accessible NSTableView-style control:
-        every row (not just the visible ones) is exposed, and each row's Connect
-        button is a normal AXPress button rather than a hover-only control — so no
-        Quartz mouse simulation or pixel calibration is needed to drive it.
+    @staticmethod
+    def _quartz_click(x: float, y: float) -> None:
+        """Synthesize a real mouse click at a screen point via Quartz.
+
+        NordVPN's custom SwiftUI controls (location rows, expand chevrons,
+        the Pause/Disconnect popover) do not respond to AXPress — the `click`
+        AppleScript/System Events command silently no-ops on them — so every
+        interaction with them is driven by a genuine Quartz mouse-down/up
+        event at the control's AX-reported position instead.
         """
-        return (
-            "table 1 of (scroll area 1 of (item 1 of (UI elements of "
-            "(item 4 of (UI elements of (list 1 of window 1))))))"
-        )
+        import Quartz  # type: ignore[import]
 
-    def _surfshark_find_and_expand(
-        self, app_name: str, location: str, cached_idx: int = 0
-    ) -> dict[str, Any]:
-        """Locate `location`'s row in Surfshark's Locations table, expand it
-        (reveal its individual city rows) if not already expanded, and return
-        its row index plus the ordered list of real city names under it.
+        def _mouse(kind: Any, px: float, py: float) -> None:
+            pt = Quartz.CGPointMake(px, py)
+            ev = Quartz.CGEventCreateMouseEvent(None, kind, pt, Quartz.kCGMouseButtonLeft)
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
 
-        Jumping straight to a previously-cached row index is fast (~1-3s).
-        (Re)locating a country from scratch uses a binary search over the
-        alphabetically-sorted country list (~5-8 direct-index probes, ~15-25s)
-        rather than a linear scan — each `item N of rows` is an independent
-        AX round-trip that costs about the same regardless of N, but a linear
-        "check every row 1..N" scan still adds up to minutes on a ~100-150 row
-        list. This only runs once (first discovery) or if the cache ever
-        proves stale; every later lookup reuses the cached index and is fast.
+        _mouse(Quartz.kCGEventMouseMoved, x, y)
+        time.sleep(0.08)
+        _mouse(Quartz.kCGEventLeftMouseDown, x, y)
+        time.sleep(0.05)
+        _mouse(Quartz.kCGEventLeftMouseUp, x, y)
+
+    def _nordvpn_list_path(self) -> str:
+        """AppleScript expression for NordVPN's flat location list.
+
+        window 1 > UI element 1 (root content group) > UI element 5 (the
+        scrollable "Country" list on the "All locations" screen) — a flat,
+        fully AX-accessible list where each row exposes real country/city
+        names directly. Expanding a country inserts its city rows immediately
+        after it (same positional semantics Surfshark's table used).
+        """
+        return "item 5 of (UI elements of (item 1 of (UI elements of window 1)))"
+
+    def _nordvpn_ensure_all_locations(self, app_name: str) -> str:
+        """Navigate to NordVPN's "All locations" (Country) browse screen if
+        not already there. Every successful connect click snaps the app back
+        to the Dashboard/map view, so this re-navigates at the start of each
+        discovery/connect attempt.
+
+        The "All locations" link lives on the Dashboard; it's found by role
+        (AXLink — the only one on that screen) rather than a fixed index, since
+        the Dashboard's element count shifts slightly across connected states.
         """
         process_list = self._process_name_candidates(app_name)
-        loc_esc = location.replace('"', '\\"')
-        tbl_path = self._surfshark_table_path()
-        script = f"""
+        probe = f"""
         tell application "System Events"
             set procName to ""
             repeat with candidate in {{{process_list}}}
@@ -958,162 +980,293 @@ class VPNController:
             if procName is "" then return "ERROR:vpn_process_not_found"
             tell process procName
                 set frontmost to true
-                delay 0.2
+                delay 0.4
+                if not (exists window 1) then return "ERROR:no_window"
+                set mg to item 1 of (UI elements of window 1)
+                try
+                    set lg to item 5 of (UI elements of mg)
+                    set firstRow to item 1 of (UI elements of lg)
+                    set fname to name of firstRow as text
+                    if fname contains "Select a location" then return "OK:already_open"
+                end try
+                try
+                    set contentGrp to item 7 of (UI elements of mg)
+                    set sa to item 1 of (UI elements of contentGrp)
+                    repeat with el in (UI elements of sa)
+                        set rr to ""
+                        try
+                            set rr to role of el as text
+                        end try
+                        if rr is "AXLink" then
+                            set p to position of el
+                            set s to size of el
+                            return "CLICK:" & (item 1 of p) & "," & (item 2 of p) & "," & (item 1 of s) & "," & (item 2 of s)
+                        end if
+                    end repeat
+                end try
+                return "ERROR:all_locations_link_not_found"
+            end tell
+        end tell
+        """
+        attempts = 7
+        for attempt in range(attempts):
+            try:
+                raw = run_osascript(probe, timeout=15, label=f"{app_name} locate all-locations")
+            except AutomationError as exc:
+                return f"ERROR:{exc}"
+            if raw == "OK:already_open":
+                return "OK"
+            if raw.startswith("CLICK:"):
+                try:
+                    x, y, w, h = (float(v) for v in raw[len("CLICK:"):].split(","))
+                except ValueError:
+                    return f"ERROR:bad_response:{raw!r}"
+                self._quartz_click(x + w / 2, y + h / 2)
+                time.sleep(1.3)
+                continue
+            # ERROR: — likely a transient race right after a state change (the
+            # Dashboard's element layout briefly shifts around a connect/
+            # disconnect animation); retry with growing patience before giving up.
+            if attempt < attempts - 1:
+                time.sleep(0.5 + 0.3 * attempt)
+                continue
+            return raw
+        return "ERROR:all_locations_navigation_failed"
+
+    def _nordvpn_locate_and_expand(
+        self, app_name: str, location: str, cached_idx: int = 0
+    ) -> dict[str, Any]:
+        """Locate `location`'s row in NordVPN's Country list, expand it
+        (reveal its individual city rows) if not already expanded, and return
+        its row index plus the ordered list of real city names under it
+        (excluding the non-deterministic "Fastest server" shortcut row).
+
+        NordVPN's Country list, unlike Surfshark's, is not alphabetically
+        sorted (it's ordered by popularity/recommendation), so this uses a
+        linear scan rather than a binary search — the row count (~100-150,
+        before any expansion) is small enough that a scan still finishes in
+        a few seconds. A cached row index (from a previous discovery this
+        run) skips the scan entirely.
+        """
+        open_status = self._nordvpn_ensure_all_locations(app_name)
+        if open_status != "OK":
+            return {"error": open_status}
+
+        process_list = self._process_name_candidates(app_name)
+        loc_esc = location.replace('"', '\\"')
+        list_path = self._nordvpn_list_path()
+        locate_script = f"""
+        tell application "System Events"
+            set procName to ""
+            repeat with candidate in {{{process_list}}}
+                if exists process (candidate as text) then
+                    set procName to candidate as text
+                    exit repeat
+                end if
+            end repeat
+            if procName is "" then return "ERROR:vpn_process_not_found"
+            tell process procName
+                set frontmost to true
                 if not (exists window 1) then return "ERROR:no_window"
                 try
-                    set tbl to {tbl_path}
+                    set lg to {list_path}
                 on error
-                    return "ERROR:no_table"
+                    return "ERROR:no_list"
                 end try
-                set rws to rows of tbl
+                -- Snapshot the row list ONCE: re-evaluating "UI elements of lg"
+                -- on every loop iteration re-walks the whole (~150+ row) AX
+                -- hierarchy each time, turning an O(n) scan into O(n^2) — slow
+                -- enough to time out. `rws` is reused for every index below.
+                set rws to UI elements of lg
                 set rCount to count of rws
+                if rCount < 10 then return "ERROR:list_not_loaded"
 
                 set countryIdx to 0
                 if {cached_idx} > 0 and {cached_idx} ≤ rCount then
-                    set cel to item 1 of (UI elements of (item {cached_idx} of rws))
-                    set kids to UI elements of cel
-                    if (count of kids) ≥ 2 then
+                    set r to item {cached_idx} of rws
+                    set kids to {{}}
+                    try
+                        set kids to UI elements of r
+                    end try
+                    if (count of kids) ≥ 1 then
                         set nm to ""
                         try
-                            set nm to value of (item 2 of kids) as text
+                            set nm to name of (item 1 of kids) as text
                         end try
                         if nm is "{loc_esc}" then set countryIdx to {cached_idx}
                     end if
                 end if
 
                 if countryIdx is 0 then
-                    -- Binary search: the "Locations" section is alphabetically sorted,
-                    -- so this needs ~log2(row count) probes instead of a linear scan —
-                    -- a linear "repeat with i from 1 to rCount" scan of the ~100-150 row
-                    -- unfiltered list is O(n^2) in practice (each `item i of rws` re-walks
-                    -- the AX hierarchy) and can take minutes; direct-index probes stay
-                    -- fast (~1-3s each) regardless of list size.
-                    -- If the target country is already expanded, some probes land on its
-                    -- OWN city rows (subtitle = target's name) rather than the header —
-                    -- that's detected explicitly and treated as "header is to the left",
-                    -- since city names otherwise sort arbitrarily relative to the target
-                    -- and would misdirect a plain name-only comparison.
-                    set lo to 1
-                    set hi to rCount
-                    repeat 24 times
-                        if lo > hi then exit repeat
-                        set mid to lo + ((hi - lo) div 2)
-                        set cel to item 1 of (UI elements of (item mid of rws))
-                        set kids to UI elements of cel
-                        set nm to ""
-                        set subTxt to ""
-                        if (count of kids) ≥ 2 then
+                    -- Linear scan: NordVPN's Country list is NOT alphabetically
+                    -- sorted (ordered by popularity instead), so a binary search
+                    -- can't be used here. Each probe is a cheap direct-index AX
+                    -- read; ~150 rows scans in a few seconds.
+                    set i to 1
+                    repeat while i ≤ rCount
+                        set r to item i of rws
+                        set kids to {{}}
+                        try
+                            set kids to UI elements of r
+                        end try
+                        if (count of kids) is 3 then
+                            set nm to ""
                             try
-                                set nm to value of (item 2 of kids) as text
+                                set nm to name of (item 1 of kids) as text
                             end try
+                            if nm is "{loc_esc}" then
+                                set countryIdx to i
+                                exit repeat
+                            end if
                         end if
-                        if (count of kids) ≥ 3 then
-                            try
-                                set subTxt to value of (item 3 of kids) as text
-                            end try
-                        end if
-                        if nm is "{loc_esc}" then
-                            set countryIdx to mid
-                            exit repeat
-                        else if subTxt is "{loc_esc}" then
-                            set hi to mid - 1
-                        else if nm is "" then
-                            set lo to mid + 1
-                        else if nm < "{loc_esc}" then
-                            set lo to mid + 1
-                        else
-                            set hi to mid - 1
-                        end if
+                        set i to i + 1
                     end repeat
                 end if
                 if countryIdx is 0 then return "ERROR:country_not_found"
 
+                -- A collapsed country header's next row is another 3-kid country
+                -- header; an expanded one is followed by the 2-kid "Fastest
+                -- server" row (or a 1-kid city row if "Fastest server" itself
+                -- doesn't apply) — either way, not 3 kids means already expanded.
                 set alreadyExpanded to false
                 if (countryIdx + 1) ≤ rCount then
-                    set nCel to item 1 of (UI elements of (item (countryIdx + 1) of rws))
-                    set nKids to UI elements of nCel
-                    if (count of nKids) ≥ 3 then
-                        set subTxt to ""
-                        try
-                            set subTxt to value of (item 3 of nKids) as text
-                        end try
-                        if subTxt is "{loc_esc}" then set alreadyExpanded to true
-                    end if
+                    set nr to item (countryIdx + 1) of rws
+                    set nKids to {{}}
+                    try
+                        set nKids to UI elements of nr
+                    end try
+                    if (count of nKids) is not 3 then set alreadyExpanded to true
                 end if
 
                 if not alreadyExpanded then
-                    set cCel to item 1 of (UI elements of (item countryIdx of rws))
-                    set cKids to UI elements of cCel
-                    -- Row layout: [flag, name, subtitle, Connect(4), icon, Expand(6), icon, Favorite(8)]
-                    if (count of cKids) < 6 then return "ERROR:no_expand_control"
-                    click item 6 of cKids
-                    delay 0.6
-                    set rws to rows of tbl
-                    set rCount to count of rws
+                    set cRow to item countryIdx of rws
+                    set cKids to UI elements of cRow
+                    if (count of cKids) < 3 then return "ERROR:no_expand_control"
+                    set chev to item 3 of cKids
+                    set p to position of chev
+                    set s to size of chev
+                    return "EXPAND|" & countryIdx & "|" & (item 1 of p) & "," & (item 2 of p) & "," & (item 1 of s) & "," & (item 2 of s)
                 end if
 
+                return "READY|" & countryIdx
+            end tell
+        end tell
+        """
+        country_idx = 0
+        for attempt in range(3):
+            raw = run_osascript(locate_script, timeout=60, label=f"nordvpn locate {location}")
+            if raw == "ERROR:list_not_loaded":
+                time.sleep(0.5)
+                continue
+            if raw.startswith("ERROR:"):
+                return {"error": raw}
+            if raw.startswith("EXPAND|"):
+                _, idx_s, coords = raw.split("|", 2)
+                country_idx = int(idx_s)
+                try:
+                    x, y, w, h = (float(v) for v in coords.split(","))
+                except ValueError:
+                    return {"error": f"bad_response:{raw!r}"}
+                self._quartz_click(x + w / 2, y + h / 2)
+                time.sleep(0.7)
+            elif raw.startswith("READY|"):
+                country_idx = int(raw.split("|", 1)[1])
+            else:
+                return {"error": f"bad_response:{raw!r}"}
+            break
+        else:
+            return {"error": "ERROR:list_not_loaded"}
+
+        enumerate_script = f"""
+        tell application "System Events"
+            set procName to ""
+            repeat with candidate in {{{process_list}}}
+                if exists process (candidate as text) then
+                    set procName to candidate as text
+                    exit repeat
+                end if
+            end repeat
+            if procName is "" then return "ERROR:vpn_process_not_found"
+            tell process procName
+                if not (exists window 1) then return "ERROR:no_window"
+                try
+                    set lg to {list_path}
+                on error
+                    return "ERROR:no_list"
+                end try
+                -- Snapshot once — see the matching comment in the locate
+                -- script for why re-evaluating "UI elements of lg" per
+                -- iteration is an O(n^2) trap that times out on a big list.
+                set rws to UI elements of lg
+                set rCount to count of rws
                 set cityStr to ""
-                set i to countryIdx + 1
+                -- Row (countryIdx+1) is the "Fastest server" shortcut, not a
+                -- real pickable city — individually-connectable cities start
+                -- right after it, at (countryIdx+2).
+                set i to {country_idx} + 2
                 repeat while i ≤ rCount
-                    set cel to item 1 of (UI elements of (item i of rws))
-                    set kids to UI elements of cel
-                    if (count of kids) < 3 then exit repeat
-                    set subTxt to ""
+                    set r to item i of rws
+                    set kids to {{}}
                     try
-                        set subTxt to value of (item 3 of kids) as text
+                        set kids to UI elements of r
                     end try
-                    if subTxt is not "{loc_esc}" then exit repeat
+                    if (count of kids) is not 1 then exit repeat
                     set cityNm to ""
                     try
-                        set cityNm to value of (item 2 of kids) as text
+                        set cityNm to name of (item 1 of kids) as text
                     end try
                     set cityStr to cityStr & cityNm & "⁣"
                     set i to i + 1
                 end repeat
-
-                return "OK|" & countryIdx & "|" & cityStr
+                return "OK|" & cityStr
             end tell
         end tell
         """
-        try:
-            raw = run_osascript(script, timeout=120, label=f"surfshark locate {location}")
-        except AutomationError as exc:
-            return {"error": str(exc)}
-        if raw.startswith("ERROR:"):
-            return {"error": raw}
-        try:
-            _, idx_s, cities_s = raw.split("|", 2)
-            country_idx = int(idx_s)
-        except ValueError:
-            return {"error": f"bad_response:{raw!r}"}
+        raw2 = run_osascript(enumerate_script, timeout=60, label=f"nordvpn enumerate {location}")
+        if raw2.startswith("ERROR:"):
+            return {"error": raw2}
+        _, cities_s = raw2.split("|", 1)
         cities = [c for c in cities_s.split("⁣") if c]
         return {"country_idx": country_idx, "cities": cities}
 
-    def _surfshark_connect_city(
+    def _nordvpn_connect_city(
         self, app_name: str, location: str, cached_idx: int = 0,
         slot_num: int | None = None, target_name: str = "", total_count: int = 0,
     ) -> dict[str, Any]:
         """Expand `location` (reusing the cached row index when possible) and
-        click the Connect button of the Nth city under it (`slot_num`, 1-based,
-        wrapping — mirrors the ProtonVPN slot semantics exactly) or of the city
-        named `target_name`. Exactly one of slot_num/target_name is used.
+        click the Nth city under it (`slot_num`, 1-based, wrapping — mirrors
+        the Surfshark/legacy slot semantics exactly) or the city named
+        `target_name`. Exactly one of slot_num/target_name is used.
 
-        When `total_count` (the already-known number of cities for this
-        location, from the cached discovery list) is given, the target row is
-        reached with a single direct-index jump — no per-connect enumeration.
-        Without it (total_count=0, e.g. before discovery has ever populated
-        the cache), city rows are enumerated live to determine the count /
-        resolve `target_name`, which costs one AX round-trip per city and is
-        noticeably slower on a large list — a one-time cost, not a per-cycle one.
+        NordVPN returns every city name for a location in a single AppleScript
+        round trip (`_nordvpn_locate_and_expand`), unlike Surfshark's
+        per-city enumeration — so there's no separate "fast path" here;
+        `total_count` is accepted for call-site compatibility and used only
+        to skip re-deriving the count from the returned list.
         """
+        result = self._nordvpn_locate_and_expand(app_name, location, cached_idx)
+        if "error" in result:
+            return result
+        country_idx = result["country_idx"]
+        cities = result["cities"]
+        if not cities:
+            return {"error": "ERROR:no_cities_found"}
+
+        if target_name:
+            try:
+                city_pos = cities.index(target_name)
+            except ValueError:
+                return {"error": "ERROR:city_not_found"}
+        else:
+            slot = slot_num if slot_num is not None else 1
+            city_pos = (slot - 1) % len(cities)
+        # +1 to step past the country header row, +1 more to step past the
+        # "Fastest server" shortcut row, then land on the Nth real city.
+        target_idx = country_idx + 2 + city_pos
+
         process_list = self._process_name_candidates(app_name)
-        loc_esc = location.replace('"', '\\"')
-        name_esc = target_name.replace('"', '\\"')
-        by_name = "true" if (target_name and total_count <= 0) else "false"
-        slot_val = slot_num if slot_num is not None else 1
-        tbl_path = self._surfshark_table_path()
-        fast_path = total_count > 0
-        script = f"""
+        list_path = self._nordvpn_list_path()
+        click_script = f"""
         tell application "System Events"
             set procName to ""
             repeat with candidate in {{{process_list}}}
@@ -1125,193 +1278,67 @@ class VPNController:
             if procName is "" then return "ERROR:vpn_process_not_found"
             tell process procName
                 set frontmost to true
-                delay 0.2
                 if not (exists window 1) then return "ERROR:no_window"
                 try
-                    set tbl to {tbl_path}
+                    set lg to {list_path}
                 on error
-                    return "ERROR:no_table"
+                    return "ERROR:no_list"
                 end try
-                set rws to rows of tbl
-                set rCount to count of rws
-
-                set countryIdx to 0
-                if {cached_idx} > 0 and {cached_idx} ≤ rCount then
-                    set cel to item 1 of (UI elements of (item {cached_idx} of rws))
-                    set kids to UI elements of cel
-                    if (count of kids) ≥ 2 then
-                        set nm to ""
-                        try
-                            set nm to value of (item 2 of kids) as text
-                        end try
-                        if nm is "{loc_esc}" then set countryIdx to {cached_idx}
-                    end if
-                end if
-
-                if countryIdx is 0 then
-                    -- Binary search: the "Locations" section is alphabetically sorted,
-                    -- so this needs ~log2(row count) probes instead of a linear scan —
-                    -- a linear "repeat with i from 1 to rCount" scan of the ~100-150 row
-                    -- unfiltered list is O(n^2) in practice (each `item i of rws` re-walks
-                    -- the AX hierarchy) and can take minutes; direct-index probes stay
-                    -- fast (~1-3s each) regardless of list size.
-                    -- If the target country is already expanded, some probes land on its
-                    -- OWN city rows (subtitle = target's name) rather than the header —
-                    -- that's detected explicitly and treated as "header is to the left",
-                    -- since city names otherwise sort arbitrarily relative to the target
-                    -- and would misdirect a plain name-only comparison.
-                    set lo to 1
-                    set hi to rCount
-                    repeat 24 times
-                        if lo > hi then exit repeat
-                        set mid to lo + ((hi - lo) div 2)
-                        set cel to item 1 of (UI elements of (item mid of rws))
-                        set kids to UI elements of cel
-                        set nm to ""
-                        set subTxt to ""
-                        if (count of kids) ≥ 2 then
-                            try
-                                set nm to value of (item 2 of kids) as text
-                            end try
-                        end if
-                        if (count of kids) ≥ 3 then
-                            try
-                                set subTxt to value of (item 3 of kids) as text
-                            end try
-                        end if
-                        if nm is "{loc_esc}" then
-                            set countryIdx to mid
-                            exit repeat
-                        else if subTxt is "{loc_esc}" then
-                            set hi to mid - 1
-                        else if nm is "" then
-                            set lo to mid + 1
-                        else if nm < "{loc_esc}" then
-                            set lo to mid + 1
-                        else
-                            set hi to mid - 1
-                        end if
-                    end repeat
-                end if
-                if countryIdx is 0 then return "ERROR:country_not_found"
-
-                set alreadyExpanded to false
-                if (countryIdx + 1) ≤ rCount then
-                    set nCel to item 1 of (UI elements of (item (countryIdx + 1) of rws))
-                    set nKids to UI elements of nCel
-                    if (count of nKids) ≥ 3 then
-                        set subTxt to ""
-                        try
-                            set subTxt to value of (item 3 of nKids) as text
-                        end try
-                        if subTxt is "{loc_esc}" then set alreadyExpanded to true
-                    end if
-                end if
-
-                if not alreadyExpanded then
-                    set cCel to item 1 of (UI elements of (item countryIdx of rws))
-                    set cKids to UI elements of cCel
-                    if (count of cKids) < 6 then return "ERROR:no_expand_control"
-                    click item 6 of cKids
-                    delay 0.6
-                    set rws to rows of tbl
-                    set rCount to count of rws
-                end if
-
-                set cityCount to 0
-                set targetIdx to 0
-                if {"true" if fast_path else "false"} then
-                    -- Fast path: the city count is already known (from the cached
-                    -- discovery list), so jump straight to the target row instead
-                    -- of enumerating every city — one AX round-trip instead of one
-                    -- per city (cuts a ~24-city connect from ~60-80s down to ~5-10s).
-                    set cityCount to {max(total_count, 1)}
-                    set effSlot to ((({slot_val} - 1) mod cityCount) + 1)
-                    set targetIdx to countryIdx + effSlot
-                    if targetIdx > rCount then return "ERROR:target_out_of_range"
-                else
-                    set cityNames to {{}}
-                    set i to countryIdx + 1
-                    repeat while i ≤ rCount
-                        set cel to item 1 of (UI elements of (item i of rws))
-                        set kids to UI elements of cel
-                        if (count of kids) < 3 then exit repeat
-                        set subTxt to ""
-                        try
-                            set subTxt to value of (item 3 of kids) as text
-                        end try
-                        if subTxt is not "{loc_esc}" then exit repeat
-                        set cityNm to ""
-                        try
-                            set cityNm to value of (item 2 of kids) as text
-                        end try
-                        set end of cityNames to cityNm
-                        set i to i + 1
-                    end repeat
-                    set cityCount to count of cityNames
-                    if cityCount is 0 then return "ERROR:no_cities_found"
-
-                    if {by_name} then
-                        set j to 0
-                        repeat with cn in cityNames
-                            set j to j + 1
-                            if cn is "{name_esc}" then
-                                set targetIdx to countryIdx + j
-                                exit repeat
-                            end if
-                        end repeat
-                        if targetIdx is 0 then return "ERROR:city_not_found"
-                    else
-                        set effSlot to ((({slot_val} - 1) mod cityCount) + 1)
-                        set targetIdx to countryIdx + effSlot
-                    end if
-                end if
-
-                set tCel to item 1 of (UI elements of (item targetIdx of rws))
-                set tKids to UI elements of tCel
-                if (count of tKids) < 4 then return "ERROR:bad_city_row"
-                set clickedCity to ""
-                try
-                    set clickedCity to value of (item 2 of tKids) as text
-                end try
-                click item 4 of tKids
-                return "OK|" & countryIdx & "|" & cityCount & "|" & clickedCity
+                if {target_idx} > (count of (UI elements of lg)) then return "ERROR:target_out_of_range"
+                set r to item {target_idx} of (UI elements of lg)
+                set p to position of r
+                set s to size of r
+                return "OK|" & (item 1 of p) & "," & (item 2 of p) & "," & (item 1 of s) & "," & (item 2 of s)
             end tell
         end tell
         """
-        try:
-            raw = run_osascript(script, timeout=120, label=f"surfshark connect {location}")
-        except AutomationError as exc:
-            return {"error": str(exc)}
+        raw = run_osascript(click_script, timeout=30, label=f"nordvpn row-pos {location}")
         if raw.startswith("ERROR:"):
             return {"error": raw}
+        _, coords = raw.split("|", 1)
         try:
-            _, idx_s, count_s, city = raw.split("|", 3)
-            return {"country_idx": int(idx_s), "city_count": int(count_s), "city": city}
+            x, y, w, h = (float(v) for v in coords.split(","))
         except ValueError:
             return {"error": f"bad_response:{raw!r}"}
+        self._quartz_click(x + w / 2, y + h / 2)
+        return {"country_idx": country_idx, "city_count": len(cities), "city": cities[city_pos]}
 
     def _discover_servers(
-        self, location: str, location_code: str, app_name: str = "Surfshark"
+        self, location: str, location_code: str, app_name: str = "NordVPN"
     ) -> list[str]:
-        """Discover the real Surfshark city servers available for `location`.
+        """Discover the real NordVPN city servers available for `location`.
 
-        Expands `location`'s row in the Locations table and reads the real
-        city names of the rows revealed underneath (e.g. "Atlanta", "Chicago",
-        "New York", ...) — these are genuine, individually-connectable
-        servers, not synthetic slot placeholders, because Surfshark's list
-        (unlike ProtonVPN's) is fully AX-accessible with no lazy rendering.
-        Also caches the country row's table index (`surfshark_country_row_index`
-        in state) so later connects can jump straight to it instead of
-        re-scanning the full list each time.
+        Expands `location`'s row in the Country list and reads the real city
+        names of the rows revealed underneath (e.g. "Atlanta", "Chicago",
+        "New York", ...) — genuine, individually-connectable servers, not
+        synthetic slot placeholders, because NordVPN's list (like Surfshark's
+        before it) is fully AX-accessible with no lazy rendering. Also caches
+        the country row's list index (`nordvpn_country_row_index` in state)
+        so later connects can jump straight to it instead of re-scanning the
+        full list each time.
         """
-        idx_cache = self.state.data.setdefault("surfshark_country_row_index", {})
+        idx_cache = self.state.data.setdefault("nordvpn_country_row_index", {})
         cached_idx = int(idx_cache.get(location, 0))
 
-        result = self._surfshark_find_and_expand(app_name, location, cached_idx)
+        # A failed discovery here falls back to 5 synthetic slots, and the
+        # caller (connect_with_config) persists whatever this returns — so a
+        # transient AX hiccup would otherwise permanently truncate the
+        # rotation to 5 of NordVPN's ~50+ real cities. Retry a few times
+        # before accepting that fallback.
+        result: dict[str, Any] = {"error": "ERROR:not_attempted"}
+        for discovery_attempt in range(3):
+            result = self._nordvpn_locate_and_expand(app_name, location, cached_idx)
+            if "error" not in result:
+                break
+            self.logger.log(
+                f"NordVPN discovery attempt {discovery_attempt + 1}/3 failed for "
+                f"{location}: {result['error']}",
+                step="06", location=location,
+            )
+            time.sleep(1.0)
         if "error" in result:
             self.logger.log(
-                f"Surfshark discovery failed for {location}: {result['error']} — "
+                f"NordVPN discovery failed for {location}: {result['error']} — "
                 f"using 5 positional slots",
                 step="06", location=location,
             )
@@ -1323,14 +1350,14 @@ class VPNController:
         cities = result["cities"]
         if not cities:
             self.logger.log(
-                f"Surfshark discovery found {location} but no city rows under it — "
+                f"NordVPN discovery found {location} but no city rows under it — "
                 f"using 5 positional slots",
                 step="06", location=location,
             )
             return [f"{location_code.upper()}-SLOT-{i + 1}" for i in range(5)]
 
         self.logger.log(
-            f"Discovered {len(cities)} Surfshark servers for {location} "
+            f"Discovered {len(cities)} NordVPN servers for {location} "
             f"(row {result['country_idx']}): {cities[:5]}"
             + ("..." if len(cities) > 5 else ""),
             step="06", location=location, server_count=len(cities),
@@ -1343,7 +1370,7 @@ class VPNController:
     ) -> str:
         """Route to slot-based connect (used when vpn.state_count overrides
         discovery with synthetic "{CC}-SLOT-{n}" tokens) or named-city connect
-        (the normal path — Surfshark discovery returns real city names)."""
+        (the normal path — NordVPN discovery returns real city names)."""
         if "-SLOT-" in server:
             try:
                 slot_num = int(server.split("-SLOT-")[1])
@@ -1353,29 +1380,29 @@ class VPNController:
                 app_name, location or server.split("-SLOT-")[0], slot_num,
                 force_retype=force_retype, calibration=calibration,
             )
-        idx_cache = self.state.data.setdefault("surfshark_country_row_index", {})
+        idx_cache = self.state.data.setdefault("nordvpn_country_row_index", {})
         cached_idx = int(idx_cache.get(location, 0))
 
         # If `server` is in the cached discovery list, its position there is the
         # city's slot number — pass that plus the known count so the connect can
-        # jump straight to the row instead of enumerating every city live.
+        # skip re-deriving it from a fresh enumeration.
         cached_servers = self.state.data.get("discovered_servers_by_location", {}).get(location, [])
         if server in cached_servers:
-            result = self._surfshark_connect_city(
+            result = self._nordvpn_connect_city(
                 app_name, location, cached_idx=cached_idx,
                 slot_num=cached_servers.index(server) + 1, total_count=len(cached_servers),
             )
         else:
-            result = self._surfshark_connect_city(
+            result = self._nordvpn_connect_city(
                 app_name, location, cached_idx=cached_idx, target_name=server,
             )
         if "error" in result:
-            self.logger.log(f"Surfshark connect '{server}' failed: {result['error']}", step="06")
+            self.logger.log(f"NordVPN connect '{server}' failed: {result['error']}", step="06")
             return "server_not_found"
         idx_cache[location] = result["country_idx"]
         self.state.save()
         self.logger.log(
-            f"Surfshark: clicked Connect for '{result['city']}' "
+            f"NordVPN: clicked Connect for '{result['city']}' "
             f"({location} row {result['country_idx']}, {result['city_count']} cities)",
             step="06", server=result["city"],
         )
@@ -1386,30 +1413,28 @@ class VPNController:
         calibration: "VPNCalibration | None" = None,
     ) -> str:
         """Connect to the Nth (1-based, wrapping) city under `location` in
-        Surfshark's Locations list — same slot semantics as before
-        (effective_slot = ((slot_num - 1) % total) + 1), just resolved via
-        Surfshark's plain AX table instead of ProtonVPN's hover-only rows.
+        NordVPN's Country list (effective_slot = ((slot_num - 1) % total) + 1).
 
         Used when vpn.state_count overrides discovery with synthetic
-        "{CC}-SLOT-{n}" tokens; the normal path (real Surfshark city names)
+        "{CC}-SLOT-{n}" tokens; the normal path (real NordVPN city names)
         goes through the named-server branch of _click_server_by_name instead.
 
         `calibration`/`force_retype` are accepted for call-site compatibility
-        with connect_with_config's rotation logic but are unused — Surfshark's
+        with connect_with_config's rotation logic but are unused — NordVPN's
         location list needs no per-device pixel geometry or search re-typing.
         """
-        idx_cache = self.state.data.setdefault("surfshark_country_row_index", {})
+        idx_cache = self.state.data.setdefault("nordvpn_country_row_index", {})
         cached_idx = int(idx_cache.get(location, 0))
         # _connect_via_slot is only reached with synthetic "{CC}-SLOT-{n}" tokens
         # (vpn.state_count override, or _discover_servers' own error fallback) —
         # the cached discovered_servers_by_location list in that case holds those
         # placeholder tokens, not real city names, so its length is NOT the real
-        # city count. Pass total_count=0 so the connect falls back to live
+        # city count. Pass total_count=0 so the connect falls back to a fresh
         # enumeration, which finds the real count itself rather than trusting it.
         cached_servers = self.state.data.get("discovered_servers_by_location", {}).get(location, [])
         total_count = 0 if any("-SLOT-" in s for s in cached_servers) else len(cached_servers)
 
-        result = self._surfshark_connect_city(
+        result = self._nordvpn_connect_city(
             app_name, location, cached_idx=cached_idx, slot_num=slot_num,
             total_count=total_count,
         )
@@ -1438,14 +1463,23 @@ class VPNController:
         self.state.save()
 
     def _click_disconnect(self, app_name: str) -> str:
-        """Click Surfshark's Disconnect button.
+        """Disconnect NordVPN's active connection.
 
-        Surfshark's connect/disconnect control is an icon-only button with no
-        accessible name/title (unlike ProtonVPN's named "Disconnect"/"Cancel"
-        buttons), so it can't be found by button-name lookup. Instead: the
-        "VPN Information" group shows exactly one button (Connect) while
-        disconnected, and two buttons (Disconnect + a secondary action) while
-        connected or connecting — the first (leftmost) of the pair is Disconnect.
+        NordVPN's Dashboard shows a "Pause connection" button (~260x48, role
+        AXButton) only while connected or connecting; disconnected, that
+        space instead holds a "Secure my connection" control (role
+        AXUnknown, not AXButton) — so the Pause button is found by scanning
+        for the first sufficiently-wide AXButton, and its absence means
+        there's nothing to disconnect. Clicking it opens a popover (Pause for
+        5/15/30 min, 1/24 hours, Disconnect); the "Disconnect" item is then
+        reached via `_NORD_DISCONNECT_MENU_OFFSET` (see its docstring for why).
+
+        A discovery pass (`_discover_servers`) leaves the app parked on the
+        "All locations" browse screen rather than the Dashboard — and
+        `connect_with_config` calls this right after discovery — so this
+        first checks for that screen (same "Select a location" heading marker
+        `_nordvpn_ensure_all_locations` uses) and, if found, clicks the back
+        arrow to return to the Dashboard before looking for Pause connection.
         """
         process_list = self._process_name_candidates(app_name)
         script = f"""
@@ -1463,39 +1497,62 @@ class VPNController:
                 set frontmost to true
                 delay 0.3
                 if not (exists window 1) then return "no_window"
+                set mg to item 1 of (UI elements of window 1)
 
-                set vpnGrp to missing value
-                repeat with g in UI elements of window 1
-                    set gd to ""
-                    try
-                        set gd to description of g as text
-                    end try
-                    if gd is "VPN Information" then
-                        set vpnGrp to g
-                        exit repeat
+                try
+                    set lg to item 5 of (UI elements of mg)
+                    set firstRow to item 1 of (UI elements of lg)
+                    set fname to name of firstRow as text
+                    if fname contains "Select a location" then
+                        set backBtn to item 2 of (UI elements of mg)
+                        set p to position of backBtn
+                        set s to size of backBtn
+                        return "BACK|" & (item 1 of p) & "," & (item 2 of p) & "," & (item 1 of s) & "," & (item 2 of s)
                     end if
-                end repeat
-                if vpnGrp is missing value then return "no_disconnect_button"
+                end try
 
-                set btnList to {{}}
-                repeat with k in UI elements of vpnGrp
-                    set c to ""
-                    try
-                        set c to class of k as text
-                    end try
-                    if c is "button" then set end of btnList to k
-                end repeat
-
-                if (count of btnList) ≥ 2 then
-                    click item 1 of btnList
-                    return "disconnect_clicked"
-                end if
+                try
+                    set contentGrp to item 7 of (UI elements of mg)
+                    set sa to item 1 of (UI elements of contentGrp)
+                    repeat with el in (UI elements of sa)
+                        set rr to ""
+                        try
+                            set rr to role of el as text
+                        end try
+                        if rr is "AXButton" then
+                            set s to size of el
+                            if (item 1 of s) > 150 then
+                                set p to position of el
+                                return "PAUSE|" & (item 1 of p) & "," & (item 2 of p) & "," & (item 1 of s) & "," & (item 2 of s)
+                            end if
+                        end if
+                    end repeat
+                end try
 
                 return "no_disconnect_button"
             end tell
         end tell
         """
-        return run_osascript(script, timeout=10, label=f"{app_name} disconnect")
+        raw = run_osascript(script, timeout=10, label=f"{app_name} disconnect")
+        if raw.startswith("BACK|"):
+            try:
+                x, y, w, h = (float(v) for v in raw[len("BACK|"):].split(","))
+            except ValueError:
+                return f"bad_response:{raw!r}"
+            self._quartz_click(x + w / 2, y + h / 2)
+            time.sleep(1.0)
+            raw = run_osascript(script, timeout=10, label=f"{app_name} disconnect (post-back)")
+        if not raw.startswith("PAUSE|"):
+            return raw
+        try:
+            x, y, w, h = (float(v) for v in raw[len("PAUSE|"):].split(","))
+        except ValueError:
+            return f"bad_response:{raw!r}"
+        self._quartz_click(x + w / 2, y + h / 2)
+        time.sleep(0.5)
+        dx, dy = self._NORD_DISCONNECT_MENU_OFFSET
+        self._quartz_click(x + dx, y + dy)
+        return "disconnect_clicked"
 
 
     def _click_quick_connect(self, app_name: str) -> str:
@@ -1667,7 +1724,7 @@ class VPNController:
             # ── Level 2: route changed ─────────────────────────────────────────
             current_route = self.net.default_route_gateway()
             # Accept three conditions: route changed to new value, OR route is gone
-            # (Surfshark kill-switch drops the default route while tunnel is active).
+            # (a VPN kill-switch drops the default route while the tunnel is active).
             # Baseline may also be empty on cycle 2+ if previous VPN left no default route.
             route_changed = (
                 (bool(current_route) and current_route != baseline_route)
