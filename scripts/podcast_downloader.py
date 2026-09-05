@@ -38,6 +38,13 @@ DEFAULT_VERIFY_TIMEOUT_SEC = 30
 DEFAULT_SEE_ALL_BUDGET_SEC = 60
 DEFAULT_ACCESSIBILITY_DEPTH = 20
 DEFAULT_OSASCRIPT_TIMEOUT = 30
+# Hard ceiling on total wall-clock time connect_with_config will spend rotating
+# through servers for ONE cycle. Every individual VPN operation already has its
+# own bounded timeout, so this loop cannot literally hang — but a large server
+# list where every attempt fails slowly (e.g. a stale/mismatched AX lookup on a
+# different Mac) could otherwise churn for a very long time before giving up.
+# This bounds the worst case independent of how many servers are in the list.
+DEFAULT_VPN_CYCLE_BUDGET_SEC = 900
 # Gap between consecutive episode download clicks — firing them back-to-back can
 # make Podcasts drop/queue-fail the next download.
 DOWNLOAD_GAP_SEC = 5.5
@@ -90,7 +97,6 @@ class VPNConfig:
     require_provider_in_org: bool = True
     verify_timeout: int = DEFAULT_VERIFY_TIMEOUT_SEC
     calibration: VPNCalibration = field(default_factory=VPNCalibration)
-    state_count: int = 0  # 0 = auto-discover; >0 overrides AX discovery count
 
 
 @dataclass(frozen=True)
@@ -152,7 +158,6 @@ def _parse_vpn(raw_vpn: Any) -> VPNConfig:
         require_provider_in_org=require,
         verify_timeout=int(raw_vpn.get("verify_timeout", DEFAULT_VERIFY_TIMEOUT_SEC)),
         calibration=calibration,
-        state_count=int(raw_vpn.get("state_count", 0)),
     )
 
 
@@ -479,6 +484,150 @@ end textOfElement
 """
 
 
+_NORD_BOUNDED_HELPERS = r"""
+on findNordLocationList(rootElem, maxDepth)
+    tell application "System Events"
+        set stack to {{rootElem, 0}}
+        repeat while (count of stack) > 0
+            set lastPair to item -1 of stack
+            if (count of stack) > 1 then
+                set stack to items 1 thru -2 of stack
+            else
+                set stack to {}
+            end if
+            set elem to item 1 of lastPair
+            set d to item 2 of lastPair
+            set kids to {}
+            try
+                set kids to UI elements of elem
+            end try
+            -- Signature: the Country/location list is the only element with
+            -- a large row count whose first row is the "Select a location"
+            -- heading — true regardless of which sibling index it lives at.
+            if (count of kids) ≥ 10 then
+                try
+                    if (name of (item 1 of kids) as text) contains "Select a location" then return elem
+                end try
+            end if
+            if d < maxDepth then
+                repeat with k in kids
+                    set end of stack to {k, d + 1}
+                end repeat
+            end if
+        end repeat
+    end tell
+    return missing value
+end findNordLocationList
+
+on findFirstByRole(rootElem, roleWanted, maxDepth)
+    tell application "System Events"
+        set stack to {{rootElem, 0}}
+        repeat while (count of stack) > 0
+            set lastPair to item -1 of stack
+            if (count of stack) > 1 then
+                set stack to items 1 thru -2 of stack
+            else
+                set stack to {}
+            end if
+            set elem to item 1 of lastPair
+            set d to item 2 of lastPair
+            set kids to {}
+            try
+                set kids to UI elements of elem
+            end try
+            repeat with k in kids
+                set rr to ""
+                try
+                    set rr to role of k as text
+                end try
+                if rr is roleWanted then return k
+            end repeat
+            if d < maxDepth then
+                repeat with k in kids
+                    set end of stack to {k, d + 1}
+                end repeat
+            end if
+        end repeat
+    end tell
+    return missing value
+end findFirstByRole
+
+on findNordSearchResults(rootElem, maxDepth)
+    -- The search-results pane. Signature: the container whose first row is a
+    -- "Heading. Countries" / "Heading. Cities" static text (NordVPN labels every
+    -- search-result section that way). Found by that label rather than a sibling
+    -- index so it keeps working across app versions/window sizes.
+    tell application "System Events"
+        set stack to {{rootElem, 0}}
+        repeat while (count of stack) > 0
+            set lastPair to item -1 of stack
+            if (count of stack) > 1 then
+                set stack to items 1 thru -2 of stack
+            else
+                set stack to {}
+            end if
+            set elem to item 1 of lastPair
+            set d to item 2 of lastPair
+            set kids to {}
+            try
+                set kids to UI elements of elem
+            end try
+            if (count of kids) ≥ 1 then
+                try
+                    if ((name of (item 1 of kids)) as text) starts with "Heading." then return elem
+                end try
+            end if
+            if d < maxDepth then
+                repeat with k in kids
+                    set end of stack to {k, d + 1}
+                end repeat
+            end if
+        end repeat
+    end tell
+    return missing value
+end findNordSearchResults
+
+on findWideButton(rootElem, minWidth, maxDepth)
+    tell application "System Events"
+        set stack to {{rootElem, 0}}
+        repeat while (count of stack) > 0
+            set lastPair to item -1 of stack
+            if (count of stack) > 1 then
+                set stack to items 1 thru -2 of stack
+            else
+                set stack to {}
+            end if
+            set elem to item 1 of lastPair
+            set d to item 2 of lastPair
+            set kids to {}
+            try
+                set kids to UI elements of elem
+            end try
+            repeat with k in kids
+                set rr to ""
+                try
+                    set rr to role of k as text
+                end try
+                if rr is "AXButton" then
+                    set s to {0, 0}
+                    try
+                        set s to size of k
+                    end try
+                    if (item 1 of s) > minWidth then return k
+                end if
+            end repeat
+            if d < maxDepth then
+                repeat with k in kids
+                    set end of stack to {k, d + 1}
+                end repeat
+            end if
+        end repeat
+    end tell
+    return missing value
+end findWideButton
+"""
+
+
 # -----------------------------------------------------------------------------
 # Network State
 # -----------------------------------------------------------------------------
@@ -645,67 +794,20 @@ class VPNController:
         """Top-level entry point. Handles cache lookup, discovery, rotation, and verification."""
         provider_token = self._provider_token(vpn_cfg.app)
 
-        # Pick the server list: explicit override > cached discovery > fresh discovery.
-        servers = list(vpn_cfg.servers)
-        if not servers:
-            discovered = self.state.data.setdefault("discovered_servers_by_location", {})
-            cached = discovered.get(vpn_cfg.location, [])
-            # Use the cache only if it has >1 server.  A single-server cache means
-            # the previous discovery run was incomplete (NordVPN's US list has many
-            # cities); with only 1 server the rotation index never advances and the
-            # same IP is used on every cycle.  Treat it as stale and re-discover.
-            if cached and len(cached) > 1:
-                servers = list(cached)
-                self.logger.log(
-                    f"Using cached server list for {vpn_cfg.location} ({len(servers)} servers)",
-                    step="06", location=vpn_cfg.location, source="cache",
-                )
-            else:
-                if cached:
-                    self.logger.log(
-                        f"Cached server list for {vpn_cfg.location} has only {len(cached)} "
-                        f"server — treating as stale, re-discovering",
-                        step="06", location=vpn_cfg.location,
-                    )
-                else:
-                    self.logger.log(
-                        f"No cached servers for {vpn_cfg.location}; running discovery in {vpn_cfg.app}",
-                        step="06", location=vpn_cfg.location, app=vpn_cfg.app,
-                    )
-                if not self._open_provider_app(vpn_cfg.app):
-                    raise AutomationError(
-                        f"{vpn_cfg.app} app not found. Install and sign in first."
-                    )
-                servers = self._discover_servers(
-                    vpn_cfg.location, vpn_cfg.location_code, vpn_cfg.app
-                )
-                if not servers:
-                    raise AutomationError(
-                        f"No servers discovered for {vpn_cfg.location} in {vpn_cfg.app}. "
-                        f"Open {vpn_cfg.app}, search '{vpn_cfg.location}', expand the country, "
-                        f"and try again — OR set vpn.servers explicitly in input/tasks.json."
-                    )
-                discovered[vpn_cfg.location] = servers
-                self.state.save()
-                self.logger.log(
-                    f"Discovered {len(servers)} servers for {vpn_cfg.location}: {servers[:5]}"
-                    + ("..." if len(servers) > 5 else ""),
-                    step="06", location=vpn_cfg.location, server_count=len(servers),
-                )
-
-        # If the user specified a fixed state count, regenerate the slot list with
-        # that count — overrides whatever AX discovery returned (AX lazy-renders only
-        # the visible rows, so it systematically undercounts scrollable lists).
-        if vpn_cfg.state_count > 0 and len(servers) != vpn_cfg.state_count:
-            lc = vpn_cfg.location_code.upper()
-            servers = [f"{lc}-SLOT-{i + 1}" for i in range(vpn_cfg.state_count)]
-            discovered = self.state.data.setdefault("discovered_servers_by_location", {})
-            discovered[vpn_cfg.location] = servers
-            self.state.save()
-            self.logger.log(
-                f"state_count override: {vpn_cfg.state_count} slots for {vpn_cfg.location}",
-                step="06", location=vpn_cfg.location, state_count=vpn_cfg.state_count,
+        # Detect the VPN app up front so a missing/uninstalled app fails fast and
+        # clearly here, before any discovery/connect work, rather than surfacing
+        # as a confusing failure deeper in the flow.
+        if not self._open_provider_app(vpn_cfg.app):
+            raise AutomationError(
+                f"{vpn_cfg.app} app not found or could not be launched. "
+                f"Install {vpn_cfg.app} and sign in first."
             )
+        self.logger.log(
+            f"{vpn_cfg.app} detected — starting VPN stage for cycle {cycle}",
+            step="06", status="vpn_app_detected", cycle=cycle,
+        )
+
+        servers = self._resolve_server_list(vpn_cfg)
 
         # Ensure app is open.
         if not self._open_provider_app(vpn_cfg.app):
@@ -724,11 +826,26 @@ class VPNController:
             step="06", baseline=baseline,
         )
 
-        # Disconnect any current tunnel so we connect to the requested server fresh.
-        disc = self._click_disconnect(vpn_cfg.app)
-        self.logger.log(f"Pre-connect disconnect: {disc}", step="06", status=disc)
-        if disc == "disconnect_clicked":
-            time.sleep(1.5)
+        # Disconnect only when a tunnel is actually up, so a run that starts
+        # disconnected goes straight to searching and connecting. The check is
+        # a local interface read, so skipping costs nothing and saves the whole
+        # find-the-Pause-button round trip.
+        #
+        # A disconnect failure/timeout here is non-fatal — disc's value is only ever
+        # used for logging below, never treated as required for success — so
+        # a raised AutomationError is caught the same way rather than aborting the
+        # whole cycle over what is, at worst, a slightly stale pre-connect state.
+        if self.net.active_tunnel_interfaces():
+            try:
+                disc = self._click_disconnect(vpn_cfg.app)
+            except AutomationError as exc:
+                disc = f"error:{exc}"
+            self.logger.log(f"Pre-connect disconnect: {disc}", step="06", status=disc)
+        else:
+            self.logger.log(
+                "Not connected — skipping disconnect, going straight to connect",
+                step="06", status="already_disconnected",
+            )
         ui_state = self._read_ui_connection_state(vpn_cfg.app)
         self.logger.log(f"{vpn_cfg.app} UI connection state: {ui_state}", step="06",
                         ui_connection_state=ui_state)
@@ -739,6 +856,22 @@ class VPNController:
         # pre-disconnect VPN IP, making ip==baseline_ip (even though connection succeeded).
         # If the IP hasn't changed yet (auto-reconnect or slow teardown), disable the
         # ip-change guard by using None — country + tunnel-interface checks are sufficient.
+        # The route baseline must be re-read here too. It was first captured
+        # while the old tunnel was still up, so it held the VPN's own gateway
+        # (10.5.0.2) — and every NordVPN server hands out that same gateway, so
+        # the route-change check could never fire and each attempt burned its
+        # full verify timeout ("route unchanged (gw=10.5.0.2 baseline=10.5.0.2)"
+        # repeated until the server was abandoned). After the disconnect this
+        # reads the real, non-VPN gateway, so a genuine change is detectable.
+        post_disc_route = self.net.default_route_gateway()
+        if post_disc_route and post_disc_route != baseline_route:
+            self.logger.log(
+                f"Post-disconnect baseline: route={post_disc_route} "
+                f"(was {baseline_route} — the old tunnel's gateway)",
+                step="06",
+            )
+            baseline_route = post_disc_route
+
         post_disc_snap = self.net.snapshot()
         post_disc_ip = post_disc_snap.get("public_ip")
         if post_disc_ip and post_disc_ip != baseline_ip:
@@ -767,25 +900,52 @@ class VPNController:
             f"({servers[start_idx]}); next run will use index {rot[vpn_cfg.location]}",
             step="06", rotation_index=start_idx,
         )
-        servers_to_try = [servers[(start_idx + off) % len(servers)]
-                          for off in range(len(servers))]
+        # Positions, not names: the rotation clicks the Nth row of the expanded
+        # list, and `servers` supplies the name that row is expected to carry.
+        indices_to_try = [(start_idx + off) % len(servers) for off in range(len(servers))]
         last_exc: AutomationError | None = None
         slot_baseline_ip = baseline_ip  # refreshed per attempt
         slot_baseline_route = baseline_route  # refreshed per attempt
         # Capture the VPN IP used in the previous *successful* cycle so we can skip states
         # that are in the same server cluster (same IP) and advance to a fresh one.
         prev_vpn_ip = self.state.data.get("last_vpn_ip")
+        # Every individual VPN operation below already has its own bounded timeout;
+        # this is an additional overall ceiling on the whole rotation loop so a
+        # long server list where each attempt fails slowly (e.g. a mismatched AX
+        # lookup on a different Mac) still gives up within a fixed, generous
+        # bound instead of working through the entire list one slow failure at
+        # a time. Does not affect the already-persisted rotation index.
+        cycle_deadline = time.monotonic() + DEFAULT_VPN_CYCLE_BUDGET_SEC
 
-        for attempt_i, target_server in enumerate(servers_to_try):
+        for attempt_i, target_index in enumerate(indices_to_try):
+            target_server = servers[target_index]
+            if time.monotonic() > cycle_deadline:
+                last_exc = AutomationError(
+                    f"VPN cycle budget ({DEFAULT_VPN_CYCLE_BUDGET_SEC}s) exceeded after "
+                    f"{attempt_i}/{len(indices_to_try)} server(s) tried this cycle"
+                )
+                self.logger.log(
+                    f"VPN cycle budget exceeded — stopping after {attempt_i} attempt(s)",
+                    step="06", status="vpn_cycle_budget_exceeded", cycle=cycle,
+                )
+                break
             if attempt_i > 0:
                 self.logger.log(
-                    f"Slot {servers_to_try[attempt_i - 1]} failed; retrying with {target_server}",
+                    f"Server {servers[indices_to_try[attempt_i - 1]]} failed; retrying with {target_server}",
                     step="06", server=target_server,
                 )
-                disc2 = self._click_disconnect(vpn_cfg.app)
-                self.logger.log(f"Retry pre-disconnect: {disc2}", step="06", status=disc2)
-                wait_s = 5.0 if disc2 == "disconnect_clicked" else 2.0
-                time.sleep(wait_s)
+                if self.net.active_tunnel_interfaces():
+                    try:
+                        disc2 = self._click_disconnect(vpn_cfg.app)
+                    except AutomationError as exc:
+                        disc2 = f"error:{exc}"
+                    self.logger.log(f"Retry pre-disconnect: {disc2}", step="06", status=disc2)
+                else:
+                    self.logger.log("Retry: not connected — skipping disconnect",
+                                    step="06", status="already_disconnected")
+                # _click_disconnect already waited for the tunnel to actually
+                # go down, so the baseline below is read off a settled network
+                # rather than after a guessed delay.
                 snap2 = self.net.snapshot()
                 slot_baseline_ip = snap2.get("public_ip")
                 slot_baseline_route = self.net.default_route_gateway()
@@ -795,14 +955,34 @@ class VPNController:
 
             self.logger.log(
                 f"Cycle {cycle} target {vpn_cfg.app} server: {target_server} "
-                f"(attempt {attempt_i + 1}/{len(servers_to_try)})",
+                f"(list position {target_index + 1}/{len(servers)}, "
+                f"attempt {attempt_i + 1})",
                 step="06", cycle=cycle, target_server=target_server,
+                server_index=target_index + 1,
             )
+            self.logger.log(
+                f"[NORDVPN] Server {target_index + 1}/{len(servers)}: {target_server}",
+                step="06",
+            )
+            self.logger.log("[NORDVPN] Connecting...", step="06")
 
-            ui_status = self._click_server_by_name(
-                vpn_cfg.app, target_server, vpn_cfg.location,
-                force_retype=(attempt_i > 0), calibration=vpn_cfg.calibration,
-            )
+            # Any of this server's own AppleScript operations failing (a real
+            # osascript error, not just a soft "server_not_found" status) must
+            # only fail THIS attempt, not the whole cycle — same treatment
+            # _poll_verify already gets below. Without this, one bad server
+            # (or a transient AX hiccup) would abort the entire rotation
+            # instead of falling through to the next slot.
+            try:
+                ui_status = self._click_server_at_index(
+                    vpn_cfg.app, vpn_cfg.location, target_index, expected=target_server,
+                )
+            except AutomationError as exc:
+                last_exc = exc
+                self.logger.log(
+                    f"{vpn_cfg.app} server '{target_server}': click failed: {exc}",
+                    step="06", status="click_error", server=target_server,
+                )
+                continue
             self.logger.log(
                 f"{vpn_cfg.app} server '{target_server}': {ui_status}",
                 step="06", status=ui_status, server=target_server,
@@ -811,7 +991,6 @@ class VPNController:
                 "server_clicked",
                 "row_clicked",
                 "connect_button_clicked",
-                "quick_connect_clicked",
                 "connect_clicked",
             ):
                 last_exc = AutomationError(
@@ -829,6 +1008,7 @@ class VPNController:
                     baseline_route=slot_baseline_route,
                 )
                 if result == "connected_verified":
+                    self.logger.log("[NORDVPN] Connection verified.", step="06")
                     snap = self.net.snapshot()
                     new_ip = snap.get("public_ip")
                     # Skip this state if it landed on the same IP as the previous successful
@@ -850,6 +1030,21 @@ class VPNController:
                         )
                         continue
                     self._record_server(target_server)
+                    # Advance the rotation past the server actually connected to,
+                    # not merely past the one this cycle started at. The pointer
+                    # is moved up front (so a crash mid-cycle still advances),
+                    # but that up-front value assumes the first candidate wins.
+                    # When a cycle falls through to a later server, leaving the
+                    # pointer where it is makes the NEXT cycle start on the very
+                    # server that just connected — the same city twice in a row.
+                    rot[vpn_cfg.location] = (target_index + 1) % len(servers)
+                    self.logger.log(
+                        f"Rotation advanced past {target_server} "
+                        f"(list position {target_index + 1}); "
+                        f"next cycle starts at index {rot[vpn_cfg.location]} "
+                        f"({servers[rot[vpn_cfg.location]]})",
+                        step="06", rotation_index=rot[vpn_cfg.location],
+                    )
                     # Persist the VPN IP so the next cycle can detect repeats.
                     if new_ip:
                         self.state.data["last_vpn_ip"] = new_ip
@@ -865,11 +1060,20 @@ class VPNController:
                         "verified_at": datetime.now().isoformat(),
                     })
                     self.state.save()
+                self.logger.log("[NORDVPN] Starting existing workflow.", step="06")
                 return result
             except AutomationError as exc:
+                self.logger.log(
+                    f"[NORDVPN] Connection timed out for {target_server}.", step="06",
+                )
                 last_exc = exc
                 continue
 
+        self.logger.log(
+            f"VPN connect failed for cycle {cycle}: {last_exc or 'all slots exhausted'} — "
+            f"rotation index unaffected, will retry next cycle per existing behavior",
+            step="06", status="vpn_connect_failed", cycle=cycle,
+        )
         raise last_exc or AutomationError("All VPN slots exhausted without a verified connection")
 
     @staticmethod
@@ -895,6 +1099,55 @@ class VPNController:
             if proc.returncode == 0:
                 return name
         return ""
+
+    def _ensure_frontmost(self, app_name: str, timeout: float = 3.0) -> bool:
+        """Bring `app_name` to the front and wait until it reports frontmost.
+
+        Every NordVPN interaction is a synthesized Quartz click at an
+        AX-reported point, and macOS gives the first click on a background
+        window to activating that window — the control under the pointer never
+        sees it. So a click fired while NordVPN sits behind Chrome or Podcasts
+        silently does nothing (verified: identical search, identical row
+        coordinates, connects when frontmost, no-ops when not — the hover time
+        before the click makes no difference either way).
+
+        The VPN stage runs right after the browser/Podcasts work, so focus can
+        easily have moved on; call this immediately before reading coordinates
+        and clicking, not once at the start of a multi-step sequence.
+        """
+        # Resolved through the same candidate list every other script here uses,
+        # so an app whose process name differs from its display name still works.
+        process_list = self._process_name_candidates(app_name)
+        script = f"""
+        tell application "System Events"
+            set procName to ""
+            repeat with candidate in {{{process_list}}}
+                if exists process (candidate as text) then
+                    set procName to candidate as text
+                    exit repeat
+                end if
+            end repeat
+            if procName is "" then return "ERROR:vpn_process_not_found"
+            tell process procName
+                set frontmost to true
+                delay 0.2
+                return (frontmost as text)
+            end tell
+        end tell
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                if run_osascript(script, timeout=15, label=f"{app_name} frontmost") == "true":
+                    return True
+            except AutomationError:
+                return False
+            if time.monotonic() >= deadline:
+                self.logger.log(
+                    f"{app_name} would not come to the front — clicks may not register",
+                    step="06", app=app_name,
+                )
+                return False
 
     def _record_server(self, server: str) -> None:
         self.state.data["last_vpn_server"] = server
@@ -946,116 +1199,67 @@ class VPNController:
         time.sleep(0.05)
         _mouse(Quartz.kCGEventLeftMouseUp, x, y)
 
-    def _nordvpn_list_path(self) -> str:
-        """AppleScript expression for NordVPN's flat location list.
+    def _nord_search_results_present(self, app_name: str) -> bool:
+        """True while NordVPN's search-results pane is on screen.
 
-        window 1 > UI element 1 (root content group) > UI element 5 (the
-        scrollable "Country" list on the "All locations" screen) — a flat,
-        fully AX-accessible list where each row exposes real country/city
-        names directly. Expanding a country inserts its city rows immediately
-        after it (same positional semantics Surfshark's table used).
+        Clicking a city row connects and snaps the app back to the dashboard,
+        so this pane disappearing is the observable confirmation that a row
+        click actually landed rather than being swallowed by window activation.
         """
-        return "item 5 of (UI elements of (item 1 of (UI elements of window 1)))"
-
-    def _nordvpn_ensure_all_locations(self, app_name: str) -> str:
-        """Navigate to NordVPN's "All locations" (Country) browse screen if
-        not already there. Every successful connect click snaps the app back
-        to the Dashboard/map view, so this re-navigates at the start of each
-        discovery/connect attempt.
-
-        The "All locations" link lives on the Dashboard; it's found by role
-        (AXLink — the only one on that screen) rather than a fixed index, since
-        the Dashboard's element count shifts slightly across connected states.
-        """
-        process_list = self._process_name_candidates(app_name)
-        probe = f"""
+        probe = _NORD_BOUNDED_HELPERS + f"""
         tell application "System Events"
-            set procName to ""
-            repeat with candidate in {{{process_list}}}
-                if exists process (candidate as text) then
-                    set procName to candidate as text
-                    exit repeat
-                end if
-            end repeat
-            if procName is "" then return "ERROR:vpn_process_not_found"
-            tell process procName
-                set frontmost to true
-                delay 0.4
-                if not (exists window 1) then return "ERROR:no_window"
-                set mg to item 1 of (UI elements of window 1)
-                try
-                    set lg to item 5 of (UI elements of mg)
-                    set firstRow to item 1 of (UI elements of lg)
-                    set fname to name of firstRow as text
-                    if fname contains "Select a location" then return "OK:already_open"
-                end try
-                try
-                    set contentGrp to item 7 of (UI elements of mg)
-                    set sa to item 1 of (UI elements of contentGrp)
-                    repeat with el in (UI elements of sa)
-                        set rr to ""
-                        try
-                            set rr to role of el as text
-                        end try
-                        if rr is "AXLink" then
-                            set p to position of el
-                            set s to size of el
-                            return "CLICK:" & (item 1 of p) & "," & (item 2 of p) & "," & (item 1 of s) & "," & (item 2 of s)
-                        end if
-                    end repeat
-                end try
-                return "ERROR:all_locations_link_not_found"
+            tell process "{app_name.replace('"', '')}"
+                if not (exists window 1) then return "gone"
+                if (my findNordSearchResults(window 1, 10)) is missing value then return "gone"
+                return "present"
             end tell
         end tell
         """
-        attempts = 7
-        for attempt in range(attempts):
-            try:
-                raw = run_osascript(probe, timeout=15, label=f"{app_name} locate all-locations")
-            except AutomationError as exc:
-                return f"ERROR:{exc}"
-            if raw == "OK:already_open":
-                return "OK"
-            if raw.startswith("CLICK:"):
-                try:
-                    x, y, w, h = (float(v) for v in raw[len("CLICK:"):].split(","))
-                except ValueError:
-                    return f"ERROR:bad_response:{raw!r}"
-                self._quartz_click(x + w / 2, y + h / 2)
-                time.sleep(1.3)
-                continue
-            # ERROR: — likely a transient race right after a state change (the
-            # Dashboard's element layout briefly shifts around a connect/
-            # disconnect animation); retry with growing patience before giving up.
-            if attempt < attempts - 1:
-                time.sleep(0.5 + 0.3 * attempt)
-                continue
-            return raw
-        return "ERROR:all_locations_navigation_failed"
+        try:
+            return run_osascript(probe, timeout=20, label=f"{app_name} results present") == "present"
+        except AutomationError:
+            return False
 
-    def _nordvpn_locate_and_expand(
-        self, app_name: str, location: str, cached_idx: int = 0
-    ) -> dict[str, Any]:
-        """Locate `location`'s row in NordVPN's Country list, expand it
-        (reveal its individual city rows) if not already expanded, and return
-        its row index plus the ordered list of real city names under it
-        (excluding the non-deterministic "Fastest server" shortcut row).
+    def _is_frontmost_app(self, app_name: str) -> bool:
+        """True when `app_name` owns the frontmost window.
 
-        NordVPN's Country list, unlike Surfshark's, is not alphabetically
-        sorted (it's ordered by popularity/recommendation), so this uses a
-        linear scan rather than a binary search — the row count (~100-150,
-        before any expansion) is small enough that a scan still finishes in
-        a few seconds. A cached row index (from a previous discovery this
-        run) skips the scan entirely.
+        Guards the typing step. `keystroke` goes to whichever app is frontmost,
+        not to the process named in the tell block, so this is what proves the
+        query will land in NordVPN's search box. It is checked after clicking
+        the box: if that click actually landed on a window sitting on top of
+        NordVPN, that other app becomes frontmost and is detected here.
+
+        NordVPN's own AXFocused attribute is not usable for this — its SwiftUI
+        search field reports AXFocused false even while it is accepting keys.
         """
-        open_status = self._nordvpn_ensure_all_locations(app_name)
-        if open_status != "OK":
-            return {"error": open_status}
+        probe = f"""
+        tell application "System Events"
+            return name of first process whose frontmost is true
+        end tell
+        """
+        try:
+            return run_osascript(probe, timeout=20, label="frontmost app") == app_name
+        except AutomationError:
+            return False
 
+    def _nordvpn_search(self, app_name: str, query: str, expect_name: str = "") -> str:
+        """Type `query` into NordVPN's search field and wait (bounded) for the
+        results for THIS query to render. Returns "ok" or an "ERROR:..." string.
+
+        The field is focused with a real Quartz click and filled with real
+        keystrokes: NordVPN's SwiftUI search binding does not fire when the AX
+        value is set directly (verified — the text appears but no search runs).
+
+        The settle poll waits for a row actually named `expect_name` (defaults to
+        `query`) rather than just "some rows exist": the previous query's results
+        stay on screen while the new search runs, so a generic "results present"
+        check returns immediately against stale rows and the caller then searches
+        the wrong list. Waiting for the specific expected row is both correct and
+        faster than any fixed sleep — it returns the moment the match appears.
+        """
+        expect_name = expect_name or query
         process_list = self._process_name_candidates(app_name)
-        loc_esc = location.replace('"', '\\"')
-        list_path = self._nordvpn_list_path()
-        locate_script = f"""
+        locate = _NORD_BOUNDED_HELPERS + f"""
         tell application "System Events"
             set procName to ""
             repeat with candidate in {{{process_list}}}
@@ -1067,117 +1271,164 @@ class VPNController:
             if procName is "" then return "ERROR:vpn_process_not_found"
             tell process procName
                 set frontmost to true
+                delay 0.25
                 if not (exists window 1) then return "ERROR:no_window"
-                try
-                    set lg to {list_path}
-                on error
-                    return "ERROR:no_list"
-                end try
-                -- Snapshot the row list ONCE: re-evaluating "UI elements of lg"
-                -- on every loop iteration re-walks the whole (~150+ row) AX
-                -- hierarchy each time, turning an O(n) scan into O(n^2) — slow
-                -- enough to time out. `rws` is reused for every index below.
-                set rws to UI elements of lg
-                set rCount to count of rws
-                if rCount < 10 then return "ERROR:list_not_loaded"
+                set tf to my findFirstByRole(window 1, "AXTextField", 10)
+                if tf is missing value then return "ERROR:no_search_field"
+                set p to position of tf
+                set s to size of tf
+                return ((item 1 of p) as text) & "," & ((item 2 of p) as text) & "," & ((item 1 of s) as text) & "," & ((item 2 of s) as text)
+            end tell
+        end tell
+        """
+        raw = run_osascript(locate, timeout=20, label=f"{app_name} find search field")
+        if raw.startswith("ERROR:"):
+            return raw
+        try:
+            x, y, w, h = (float(v) for v in raw.split(","))
+        except ValueError:
+            return f"ERROR:bad_search_field:{raw!r}"
 
-                set countryIdx to 0
-                if {cached_idx} > 0 and {cached_idx} ≤ rCount then
-                    set r to item {cached_idx} of rws
-                    set kids to {{}}
-                    try
-                        set kids to UI elements of r
-                    end try
-                    if (count of kids) ≥ 1 then
-                        set nm to ""
-                        try
-                            set nm to name of (item 1 of kids) as text
-                        end try
-                        if nm is "{loc_esc}" then set countryIdx to {cached_idx}
-                    end if
-                end if
+        # Click the search box, then confirm it actually took focus before
+        # typing. `keystroke` goes to whatever is frontmost, not to the process
+        # named in the tell block, so typing without this check can spray the
+        # query into another app's text field if NordVPN is not really in
+        # front (observed: the query landed in an editor window instead).
+        clicked = False
+        for _ in range(2):
+            if not self._ensure_frontmost(app_name):
+                return "ERROR:app_not_frontmost"
+            self._quartz_click(x + w / 2, y + h / 2)
+            time.sleep(0.25)
+            if self._is_frontmost_app(app_name):
+                clicked = True
+                break
+        if not clicked:
+            return "ERROR:search_box_click_hit_another_window"
 
-                if countryIdx is 0 then
-                    -- Linear scan: NordVPN's Country list is NOT alphabetically
-                    -- sorted (ordered by popularity instead), so a binary search
-                    -- can't be used here. Each probe is a cheap direct-index AX
-                    -- read; ~150 rows scans in a few seconds.
-                    set i to 1
-                    repeat while i ≤ rCount
-                        set r to item i of rws
+        q_esc = query.replace("\\", "\\\\").replace('"', '\\"')
+        typ = f"""
+        tell application "System Events"
+            tell process "{app_name.replace('"', '')}"
+                keystroke "a" using command down
+                delay 0.12
+                keystroke "{q_esc}"
+                return "ok"
+            end tell
+        end tell
+        """
+        try:
+            run_osascript(typ, timeout=20, label=f"{app_name} type search")
+        except AutomationError as exc:
+            return f"ERROR:{exc}"
+
+        # Bounded poll for THIS query's results, rather than a fixed sleep.
+        expect_esc = expect_name.replace('"', '\\"')
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            time.sleep(0.3)
+            probe = _NORD_BOUNDED_HELPERS + f"""
+            tell application "System Events"
+                tell process "{app_name.replace('"', '')}"
+                    if not (exists window 1) then return "pending"
+                    set res to my findNordSearchResults(window 1, 10)
+                    if res is missing value then return "pending"
+                    repeat with r in (UI elements of res)
                         set kids to {{}}
                         try
                             set kids to UI elements of r
                         end try
-                        if (count of kids) is 3 then
+                        if (count of kids) ≥ 1 then
                             set nm to ""
                             try
-                                set nm to name of (item 1 of kids) as text
+                                set nm to (name of (item 1 of kids)) as text
                             end try
-                            if nm is "{loc_esc}" then
-                                set countryIdx to i
-                                exit repeat
-                            end if
+                            if nm is "{expect_esc}" then return "ready"
                         end if
-                        set i to i + 1
                     end repeat
-                end if
-                if countryIdx is 0 then return "ERROR:country_not_found"
+                    return "pending"
+                end tell
+            end tell
+            """
+            try:
+                if run_osascript(probe, timeout=15, label=f"{app_name} search settle") == "ready":
+                    return "ok"
+            except AutomationError:
+                continue
+        return "ERROR:search_results_not_rendered"
 
-                -- A collapsed country header's next row is another 3-kid country
-                -- header; an expanded one is followed by the 2-kid "Fastest
-                -- server" row (or a 1-kid city row if "Fastest server" itself
-                -- doesn't apply) — either way, not 3 kids means already expanded.
-                set alreadyExpanded to false
-                if (countryIdx + 1) ≤ rCount then
-                    set nr to item (countryIdx + 1) of rws
-                    set nKids to {{}}
-                    try
-                        set nKids to UI elements of nr
-                    end try
-                    if (count of nKids) is not 3 then set alreadyExpanded to true
-                end if
+    def _dismiss_blocking_dialog(self, app_name: str) -> bool:
+        """Close a modal NordVPN puts over its main window, if one is up.
 
-                if not alreadyExpanded then
-                    set cRow to item countryIdx of rws
-                    set cKids to UI elements of cRow
-                    if (count of cKids) < 3 then return "ERROR:no_expand_control"
-                    set chev to item 3 of cKids
-                    set p to position of chev
-                    set s to size of chev
-                    return "EXPAND|" & countryIdx & "|" & (item 1 of p) & "," & (item 2 of p) & "," & (item 1 of s) & "," & (item 2 of s)
-                end if
+        The app shows subscription/upsell sheets ("Unlock NordVPN's advanced
+        online protection", "Activate your subscription") as a second window
+        covering the main one. While it is up there is no search box to click
+        and no location list to read, so the whole flow stalls. Closing it is
+        a no-op when no such window exists.
 
-                return "READY|" & countryIdx
+        Returns True if a dialog was closed.
+        """
+        script = f"""
+        tell application "System Events"
+            tell process "{app_name.replace('"', '')}"
+                if (count of windows) < 2 then return "none"
+                repeat with w in windows
+                    -- The main window carries the search box; anything else
+                    -- covering it is the sheet to close.
+                    if (count of (text fields of w)) is 0 then
+                        try
+                            click (first button of w whose subrole is "AXCloseButton")
+                            return "closed"
+                        end try
+                    end if
+                end repeat
+                return "none"
             end tell
         end tell
         """
-        country_idx = 0
-        for attempt in range(3):
-            raw = run_osascript(locate_script, timeout=60, label=f"nordvpn locate {location}")
-            if raw == "ERROR:list_not_loaded":
-                time.sleep(0.5)
-                continue
-            if raw.startswith("ERROR:"):
-                return {"error": raw}
-            if raw.startswith("EXPAND|"):
-                _, idx_s, coords = raw.split("|", 2)
-                country_idx = int(idx_s)
-                try:
-                    x, y, w, h = (float(v) for v in coords.split(","))
-                except ValueError:
-                    return {"error": f"bad_response:{raw!r}"}
-                self._quartz_click(x + w / 2, y + h / 2)
-                time.sleep(0.7)
-            elif raw.startswith("READY|"):
-                country_idx = int(raw.split("|", 1)[1])
-            else:
-                return {"error": f"bad_response:{raw!r}"}
-            break
-        else:
-            return {"error": "ERROR:list_not_loaded"}
+        try:
+            if run_osascript(script, timeout=20, label=f"{app_name} dismiss dialog") == "closed":
+                self.logger.log(
+                    f"Closed a blocking {app_name} dialog covering the main window",
+                    step="06", app=app_name,
+                )
+                time.sleep(0.4)
+                return True
+        except AutomationError:
+            pass
+        return False
 
-        enumerate_script = f"""
+    def _nordvpn_open_country_list(self, app_name: str, location: str) -> str:
+        """Open `location`'s server list in the NordVPN window, exactly as a
+        person would: click the search box, type the location, wait for its
+        result to appear, click the arrow next to it, and wait for the server
+        rows to become visible.
+
+        Returns "ok" or an "ERROR:..." string. Does not read the rows — both
+        callers need the list on screen, but only discovery needs its names,
+        and enumerating every row costs far more than the connect path can
+        afford to spend each cycle.
+        """
+        self._dismiss_blocking_dialog(app_name)
+        # Retry the search once: right after a connect or disconnect the app is
+        # still settling, and the results for this query can miss the settle
+        # poll's window even though the search box accepted the text. Observed
+        # costing two whole rotation slots to ERROR:search_results_not_rendered
+        # before the third attempt went through.
+        status = self._nordvpn_search(app_name, location)
+        if status != "ok":
+            self.logger.log(
+                f"{location} results did not render ({status}) — searching again",
+                step="06", location=location,
+            )
+            self._dismiss_blocking_dialog(app_name)
+            status = self._nordvpn_search(app_name, location)
+        if status != "ok":
+            return status
+
+        process_list = self._process_name_candidates(app_name)
+        loc_esc = location.replace('"', '\\"')
+        expand = _NORD_BOUNDED_HELPERS + f"""
         tell application "System Events"
             set procName to ""
             repeat with candidate in {{{process_list}}}
@@ -1189,84 +1440,88 @@ class VPNController:
             if procName is "" then return "ERROR:vpn_process_not_found"
             tell process procName
                 if not (exists window 1) then return "ERROR:no_window"
-                try
-                    set lg to {list_path}
-                on error
-                    return "ERROR:no_list"
-                end try
-                -- Snapshot once — see the matching comment in the locate
-                -- script for why re-evaluating "UI elements of lg" per
-                -- iteration is an O(n^2) trap that times out on a big list.
-                set rws to UI elements of lg
-                set rCount to count of rws
-                set cityStr to ""
-                -- Row (countryIdx+1) is the "Fastest server" shortcut, not a
-                -- real pickable city — individually-connectable cities start
-                -- right after it, at (countryIdx+2).
-                set i to {country_idx} + 2
-                repeat while i ≤ rCount
+                set res to my findNordSearchResults(window 1, 10)
+                if res is missing value then return "ERROR:no_results"
+                set rws to UI elements of res
+                repeat with i from 1 to (count of rws)
                     set r to item i of rws
                     set kids to {{}}
                     try
                         set kids to UI elements of r
                     end try
-                    if (count of kids) is not 1 then exit repeat
-                    set cityNm to ""
-                    try
-                        set cityNm to name of (item 1 of kids) as text
-                    end try
-                    set cityStr to cityStr & cityNm & "⁣"
-                    set i to i + 1
+                    -- A country result row is [name, "N cities", expand chevron].
+                    if (count of kids) is 3 then
+                        set nm to ""
+                        try
+                            set nm to (name of (item 1 of kids)) as text
+                        end try
+                        if nm is "{loc_esc}" then
+                            -- Already expanded if the next row is a city/Fastest row.
+                            set needsExpand to true
+                            if (i + 1) ≤ (count of rws) then
+                                set nk to {{}}
+                                try
+                                    set nk to UI elements of (item (i + 1) of rws)
+                                end try
+                                if (count of nk) < 3 then set needsExpand to false
+                            end if
+                            if needsExpand then
+                                set chev to item 3 of kids
+                                set p to position of chev
+                                set s to size of chev
+                                return "EXPAND|" & ((item 1 of p) as text) & "," & ((item 2 of p) as text) & "," & ((item 1 of s) as text) & "," & ((item 2 of s) as text)
+                            end if
+                            return "READY|" & i
+                        end if
+                    end if
                 end repeat
-                return "OK|" & cityStr
+                return "ERROR:country_not_in_results"
             end tell
         end tell
         """
-        raw2 = run_osascript(enumerate_script, timeout=60, label=f"nordvpn enumerate {location}")
-        if raw2.startswith("ERROR:"):
-            return {"error": raw2}
-        _, cities_s = raw2.split("|", 1)
-        cities = [c for c in cities_s.split("⁣") if c]
-        return {"country_idx": country_idx, "cities": cities}
-
-    def _nordvpn_connect_city(
-        self, app_name: str, location: str, cached_idx: int = 0,
-        slot_num: int | None = None, target_name: str = "", total_count: int = 0,
-    ) -> dict[str, Any]:
-        """Expand `location` (reusing the cached row index when possible) and
-        click the Nth city under it (`slot_num`, 1-based, wrapping — mirrors
-        the Surfshark/legacy slot semantics exactly) or the city named
-        `target_name`. Exactly one of slot_num/target_name is used.
-
-        NordVPN returns every city name for a location in a single AppleScript
-        round trip (`_nordvpn_locate_and_expand`), unlike Surfshark's
-        per-city enumeration — so there's no separate "fast path" here;
-        `total_count` is accepted for call-site compatibility and used only
-        to skip re-deriving the count from the returned list.
-        """
-        result = self._nordvpn_locate_and_expand(app_name, location, cached_idx)
-        if "error" in result:
-            return result
-        country_idx = result["country_idx"]
-        cities = result["cities"]
-        if not cities:
-            return {"error": "ERROR:no_cities_found"}
-
-        if target_name:
+        raw = run_osascript(expand, timeout=25, label=f"{app_name} expand {location}")
+        if raw.startswith("ERROR:"):
+            return raw
+        if raw.startswith("EXPAND|"):
             try:
-                city_pos = cities.index(target_name)
+                x, y, w, h = (float(v) for v in raw[len("EXPAND|"):].split(","))
             except ValueError:
-                return {"error": "ERROR:city_not_found"}
-        else:
-            slot = slot_num if slot_num is not None else 1
-            city_pos = (slot - 1) % len(cities)
-        # +1 to step past the country header row, +1 more to step past the
-        # "Fastest server" shortcut row, then land on the Nth real city.
-        target_idx = country_idx + 2 + city_pos
+                return f"ERROR:bad_expand:{raw!r}"
+            # Same activation rule as the row click: a chevron click only
+            # registers while NordVPN is frontmost, and the settle poll above
+            # can have run for seconds since the search brought it forward.
+            self._ensure_frontmost(app_name)
+            self._quartz_click(x + w / 2, y + h / 2)
+
+            # Wait for the server list to actually become visible rather than
+            # guessing at a delay: poll until the first city row exists, and
+            # re-click the arrow once if the expansion never happened. A fixed
+            # sleep here was the cause of intermittent "no_cities_in_results"
+            # — the rows had not rendered yet when the enumeration ran.
+            if not self._wait_for_city_rows(app_name):
+                self._ensure_frontmost(app_name)
+                self._quartz_click(x + w / 2, y + h / 2)
+                if not self._wait_for_city_rows(app_name):
+                    return "ERROR:list_did_not_expand"
+        return "ok"
+
+    def _nordvpn_read_server_rows(self, app_name: str, location: str) -> dict[str, Any]:
+        """Read the server rows currently shown under the expanded `location`,
+        in the order NordVPN displays them.
+
+        City rows are the ones carrying exactly one child (their name). The
+        country header row has three (name, "N cities", the expand arrow) and
+        the "Fastest server" shortcut has two, so both are skipped — the
+        rotation never lands on NordVPN's own auto-pick.
+
+        Returns {"cities": [...]} or {"error": "..."}.
+        """
+        open_status = self._nordvpn_open_country_list(app_name, location)
+        if open_status != "ok":
+            return {"error": open_status}
 
         process_list = self._process_name_candidates(app_name)
-        list_path = self._nordvpn_list_path()
-        click_script = f"""
+        enumerate_rows = _NORD_BOUNDED_HELPERS + f"""
         tell application "System Events"
             set procName to ""
             repeat with candidate in {{{process_list}}}
@@ -1277,182 +1532,415 @@ class VPNController:
             end repeat
             if procName is "" then return "ERROR:vpn_process_not_found"
             tell process procName
-                set frontmost to true
                 if not (exists window 1) then return "ERROR:no_window"
-                try
-                    set lg to {list_path}
-                on error
-                    return "ERROR:no_list"
-                end try
-                if {target_idx} > (count of (UI elements of lg)) then return "ERROR:target_out_of_range"
-                set r to item {target_idx} of (UI elements of lg)
-                set p to position of r
-                set s to size of r
-                return "OK|" & (item 1 of p) & "," & (item 2 of p) & "," & (item 1 of s) & "," & (item 2 of s)
+                set res to my findNordSearchResults(window 1, 10)
+                if res is missing value then return "ERROR:no_results"
+                set rws to UI elements of res
+                set out to ""
+                repeat with i from 1 to (count of rws)
+                    set kids to {{}}
+                    try
+                        set kids to UI elements of (item i of rws)
+                    end try
+                    -- City rows carry exactly one child (their name). The country
+                    -- header has 3 and the "Fastest server" shortcut has 2, so
+                    -- both are skipped by this test — the auto-pick entry never
+                    -- enters the rotation.
+                    if (count of kids) is 1 then
+                        set nm to ""
+                        try
+                            set nm to (name of (item 1 of kids)) as text
+                        end try
+                        if nm is not "" then set out to out & nm & "⁣"
+                    end if
+                end repeat
+                return "OK|" & out
             end tell
         end tell
         """
-        raw = run_osascript(click_script, timeout=30, label=f"nordvpn row-pos {location}")
-        if raw.startswith("ERROR:"):
-            return {"error": raw}
-        _, coords = raw.split("|", 1)
-        try:
-            x, y, w, h = (float(v) for v in coords.split(","))
-        except ValueError:
-            return {"error": f"bad_response:{raw!r}"}
-        self._quartz_click(x + w / 2, y + h / 2)
-        return {"country_idx": country_idx, "city_count": len(cities), "city": cities[city_pos]}
+        raw2 = run_osascript(enumerate_rows, timeout=30, label=f"{app_name} list {location} cities")
+        if raw2.startswith("ERROR:"):
+            return {"error": raw2}
+        _, names = raw2.split("|", 1)
+        seen: set[str] = set()
+        cities: list[str] = []
+        for c in names.split("⁣"):
+            c = c.strip()
+            if c and c not in seen:
+                seen.add(c)
+                cities.append(c)
+        if not cities:
+            return {"error": "ERROR:no_cities_in_results"}
+        return {"cities": cities}
+
+    def _resolve_server_list(self, vpn_cfg: VPNConfig) -> list[str]:
+        """The rotation's server list for `vpn_cfg.location`, in GUI order.
+
+            explicit override > remembered GUI list > fresh GUI discovery
+
+        The list always comes from what NordVPN's own window actually shows —
+        search the country, click its expand arrow, read the rows that appear
+        (`_discover_servers`). Never from a CLI, an HTTP API, or a hardcoded
+        set of names, and never NordVPN's own auto-pick: the "Fastest server"
+        shortcut row is filtered out during discovery so the rotation always
+        knows exactly which server it asked for.
+
+        Once discovered, the list is remembered in state and reused for every
+        later cycle — the expensive search-and-expand only runs again when
+        there is nothing usable to reuse (first run, or the previous attempt
+        came back truncated/invalid).
+        """
+        if vpn_cfg.servers:
+            return list(vpn_cfg.servers)
+
+        location = vpn_cfg.location
+        discovered = self.state.data.setdefault("discovered_servers_by_location", {})
+
+        # A single-server list means the previous discovery was incomplete
+        # (NordVPN's US list has many cities); with only 1 server the rotation
+        # index never advances and the same IP is used on every cycle. Treat it
+        # as invalid and re-read the list from the GUI.
+        cached = list(discovered.get(location, []))
+        if cached and len(cached) > 1:
+            self.logger.log(
+                f"Reusing the {location} server list already read from the "
+                f"{vpn_cfg.app} window ({len(cached)} servers)",
+                step="06", location=location, source="cache",
+            )
+            return cached
+        if cached:
+            self.logger.log(
+                f"Remembered {location} list has only {len(cached)} server — "
+                f"invalid, re-reading it from the {vpn_cfg.app} window",
+                step="06", location=location,
+            )
+
+        # The app is already open — connect_with_config launches it before
+        # calling here — so this goes straight to search → expand → read rows.
+        self.logger.log(
+            f"Reading the {location} server list from the {vpn_cfg.app} window",
+            step="06", location=location, app=vpn_cfg.app,
+        )
+        servers = self._discover_servers(location, vpn_cfg.location_code, vpn_cfg.app)
+        if not servers:
+            raise AutomationError(
+                f"No servers discovered for {location} in {vpn_cfg.app}. "
+                f"Open {vpn_cfg.app}, search '{location}', expand the country, "
+                f"and try again — OR set vpn.servers explicitly in input/tasks.json."
+            )
+
+        self.logger.log(
+            f"Discovered {len(servers)} servers for {location}: {servers[:5]}"
+            + ("..." if len(servers) > 5 else ""),
+            step="06", location=location, server_count=len(servers),
+        )
+        discovered[location] = servers
+        self.state.save()
+        return servers
 
     def _discover_servers(
         self, location: str, location_code: str, app_name: str = "NordVPN"
     ) -> list[str]:
-        """Discover the real NordVPN city servers available for `location`.
+        """Read the servers NordVPN actually shows for `location`, in GUI order.
 
-        Expands `location`'s row in the Country list and reads the real city
-        names of the rows revealed underneath (e.g. "Atlanta", "Chicago",
-        "New York", ...) — genuine, individually-connectable servers, not
-        synthetic slot placeholders, because NordVPN's list (like Surfshark's
-        before it) is fully AX-accessible with no lazy rendering. Also caches
-        the country row's list index (`nordvpn_country_row_index` in state)
-        so later connects can jump straight to it instead of re-scanning the
-        full list each time.
+        Performs the human flow through `_nordvpn_read_server_rows`:
+        click the search box, type the location, wait for its result, click the
+        expand arrow, then read the rows that appear (e.g. "Atlanta",
+        "Chicago", "New York", ...). Whatever the window shows is what the
+        rotation uses — the names and the count come from the GUI, never from
+        a fixed list, and NordVPN's "Fastest server" shortcut is excluded so
+        the app never picks a server on its own.
+
+        Returns [] if the list could not be read, which the caller turns into
+        a clear error rather than a substitute list.
         """
-        idx_cache = self.state.data.setdefault("nordvpn_country_row_index", {})
-        cached_idx = int(idx_cache.get(location, 0))
+        self.logger.log(f"[NORDVPN] Searching for {location} servers...", step="06", location=location)
 
-        # A failed discovery here falls back to 5 synthetic slots, and the
-        # caller (connect_with_config) persists whatever this returns — so a
-        # transient AX hiccup would otherwise permanently truncate the
-        # rotation to 5 of NordVPN's ~50+ real cities. Retry a few times
-        # before accepting that fallback.
-        result: dict[str, Any] = {"error": "ERROR:not_attempted"}
-        for discovery_attempt in range(3):
-            result = self._nordvpn_locate_and_expand(app_name, location, cached_idx)
-            if "error" not in result:
-                break
-            self.logger.log(
-                f"NordVPN discovery attempt {discovery_attempt + 1}/3 failed for "
-                f"{location}: {result['error']}",
-                step="06", location=location,
-            )
-            time.sleep(1.0)
+        result = self._nordvpn_read_server_rows(app_name, location)
         if "error" in result:
             self.logger.log(
-                f"NordVPN discovery failed for {location}: {result['error']} — "
-                f"using 5 positional slots",
+                f"Could not read the {location} server list from {app_name}: "
+                f"{result['error']}",
                 step="06", location=location,
             )
-            return [f"{location_code.upper()}-SLOT-{i + 1}" for i in range(5)]
+            self.logger.log(f"[NORDVPN] Failed to retrieve {location} server list.", step="06")
+            return []
 
-        idx_cache[location] = result["country_idx"]
-        self.state.save()
-
-        cities = result["cities"]
-        if not cities:
-            self.logger.log(
-                f"NordVPN discovery found {location} but no city rows under it — "
-                f"using 5 positional slots",
-                step="06", location=location,
-            )
-            return [f"{location_code.upper()}-SLOT-{i + 1}" for i in range(5)]
+        # Defensive de-dup, preserving GUI order — NordVPN's own city list
+        # shouldn't contain duplicates, but the rotation math (index advances
+        # by exactly one per cycle, wraps via modulo) silently breaks if it
+        # ever did, so this is cheap insurance rather than a sign duplicates
+        # are expected.
+        seen: set[str] = set()
+        cities: list[str] = []
+        for c in result["cities"]:
+            if c not in seen:
+                seen.add(c)
+                cities.append(c)
 
         self.logger.log(
-            f"Discovered {len(cities)} NordVPN servers for {location} "
-            f"(row {result['country_idx']}): {cities[:5]}"
-            + ("..." if len(cities) > 5 else ""),
-            step="06", location=location, server_count=len(cities),
+            f"Discovered {len(cities)} NordVPN servers for {location}: "
+            f"{cities[:5]}" + ("..." if len(cities) > 5 else ""),
+            step="06", location=location, server_count=len(cities), source="gui",
         )
+        self.logger.log(f"[NORDVPN] Found {len(cities)} {location} servers.", step="06")
         return cities
 
-    def _click_server_by_name(
-        self, app_name: str, server: str, location: str = "", force_retype: bool = False,
-        calibration: "VPNCalibration | None" = None,
-    ) -> str:
-        """Route to slot-based connect (used when vpn.state_count overrides
-        discovery with synthetic "{CC}-SLOT-{n}" tokens) or named-city connect
-        (the normal path — NordVPN discovery returns real city names)."""
-        if "-SLOT-" in server:
-            try:
-                slot_num = int(server.split("-SLOT-")[1])
-            except (ValueError, IndexError):
-                slot_num = 1
-            return self._connect_via_slot(
-                app_name, location or server.split("-SLOT-")[0], slot_num,
-                force_retype=force_retype, calibration=calibration,
-            )
-        idx_cache = self.state.data.setdefault("nordvpn_country_row_index", {})
-        cached_idx = int(idx_cache.get(location, 0))
+    def _wait_for_city_rows(self, app_name: str, timeout: float = 5.0) -> bool:
+        """Poll until the expanded country shows at least one city row.
 
-        # If `server` is in the cached discovery list, its position there is the
-        # city's slot number — pass that plus the known count so the connect can
-        # skip re-deriving it from a fresh enumeration.
-        cached_servers = self.state.data.get("discovered_servers_by_location", {}).get(location, [])
-        if server in cached_servers:
-            result = self._nordvpn_connect_city(
-                app_name, location, cached_idx=cached_idx,
-                slot_num=cached_servers.index(server) + 1, total_count=len(cached_servers),
-            )
-        else:
-            result = self._nordvpn_connect_city(
-                app_name, location, cached_idx=cached_idx, target_name=server,
-            )
-        if "error" in result:
-            self.logger.log(f"NordVPN connect '{server}' failed: {result['error']}", step="06")
-            return "server_not_found"
-        idx_cache[location] = result["country_idx"]
-        self.state.save()
-        self.logger.log(
-            f"NordVPN: clicked Connect for '{result['city']}' "
-            f"({location} row {result['country_idx']}, {result['city_count']} cities)",
-            step="06", server=result["city"],
-        )
-        return "connect_button_clicked"
-
-    def _connect_via_slot(
-        self, app_name: str, location: str, slot_num: int, force_retype: bool = False,
-        calibration: "VPNCalibration | None" = None,
-    ) -> str:
-        """Connect to the Nth (1-based, wrapping) city under `location` in
-        NordVPN's Country list (effective_slot = ((slot_num - 1) % total) + 1).
-
-        Used when vpn.state_count overrides discovery with synthetic
-        "{CC}-SLOT-{n}" tokens; the normal path (real NordVPN city names)
-        goes through the named-server branch of _click_server_by_name instead.
-
-        `calibration`/`force_retype` are accepted for call-site compatibility
-        with connect_with_config's rotation logic but are unused — NordVPN's
-        location list needs no per-device pixel geometry or search re-typing.
+        Used straight after clicking the expand arrow: SwiftUI renders the
+        revealed rows asynchronously, so the list is read only once it is
+        genuinely visible instead of after a guessed delay.
         """
-        idx_cache = self.state.data.setdefault("nordvpn_country_row_index", {})
-        cached_idx = int(idx_cache.get(location, 0))
-        # _connect_via_slot is only reached with synthetic "{CC}-SLOT-{n}" tokens
-        # (vpn.state_count override, or _discover_servers' own error fallback) —
-        # the cached discovered_servers_by_location list in that case holds those
-        # placeholder tokens, not real city names, so its length is NOT the real
-        # city count. Pass total_count=0 so the connect falls back to a fresh
-        # enumeration, which finds the real count itself rather than trusting it.
-        cached_servers = self.state.data.get("discovered_servers_by_location", {}).get(location, [])
-        total_count = 0 if any("-SLOT-" in s for s in cached_servers) else len(cached_servers)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self._nord_city_row_at(app_name, 0).startswith("OK|"):
+                return True
+            time.sleep(0.2)
+        return False
 
-        result = self._nordvpn_connect_city(
-            app_name, location, cached_idx=cached_idx, slot_num=slot_num,
-            total_count=total_count,
+    def _nord_results_pane_bounds(self, app_name: str) -> tuple[float, float, float, float] | None:
+        """Screen bounds (x, y, width, height) of the search-results pane."""
+        probe = _NORD_BOUNDED_HELPERS + f"""
+        tell application "System Events"
+            tell process "{app_name.replace('"', '')}"
+                if not (exists window 1) then return "ERROR:no_window"
+                set res to my findNordSearchResults(window 1, 10)
+                if res is missing value then return "ERROR:no_results"
+                set p to position of res
+                set sz to size of res
+                return ((item 1 of p) as text) & "," & ((item 2 of p) as text) & "," & ((item 1 of sz) as text) & "," & ((item 2 of sz) as text)
+            end tell
+        end tell
+        """
+        try:
+            raw = run_osascript(probe, timeout=20, label=f"{app_name} pane bounds")
+        except AutomationError:
+            return None
+        if raw.startswith("ERROR:"):
+            return None
+        try:
+            x, y, w, h = (float(v) for v in raw.split(","))
+        except ValueError:
+            return None
+        return x, y, w, h
+
+    @staticmethod
+    def _quartz_scroll(x: float, y: float, dy: float) -> None:
+        """Scroll by `dy` pixels with the pointer over (x, y).
+
+        Positive `dy` moves the content down (reveals earlier rows), negative
+        moves it up (reveals later rows) — the same direction convention as a
+        physical wheel.
+        """
+        import Quartz  # type: ignore[import]
+
+        move = Quartz.CGEventCreateMouseEvent(
+            None, Quartz.kCGEventMouseMoved, Quartz.CGPointMake(x, y),
+            Quartz.kCGMouseButtonLeft,
         )
-        if "error" in result:
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, move)
+        time.sleep(0.05)
+        ev = Quartz.CGEventCreateScrollWheelEvent(
+            None, Quartz.kCGScrollEventUnitPixel, 1, int(dy)
+        )
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+
+    def _scroll_row_into_view(self, app_name: str, index: int) -> str:
+        """Scroll the expanded list until row `index` is inside the visible
+        pane, then return its "OK|<name>|x,y,w,h".
+
+        NordVPN shows about ten of a country's rows at a time — the United
+        States list alone has ~55 — so every row past the first screenful has
+        AX coordinates far below the window. Clicking those directly lands
+        outside the app entirely, which is why the row has to be brought into
+        view first, exactly as a person would scroll to it.
+
+        Returns the row string, or an "ERROR:..." string.
+        """
+        bounds = self._nord_results_pane_bounds(app_name)
+        if bounds is None:
+            return "ERROR:no_results_pane"
+        px, py, pw, ph = bounds
+        # Keep the target off the very edges: a row flush against the top or
+        # bottom of the scroll area can be clipped or overlapped by the pane's
+        # own fade/heading.
+        margin = 60.0
+        centre_x, centre_y = px + pw / 2, py + ph / 2
+
+        row = self._nord_city_row_at(app_name, index)
+        previous_y: float | None = None
+        for _ in range(8):
+            if row.startswith("ERROR:"):
+                return row
+            try:
+                _, _name, geo = row.split("|", 2)
+                x, y, w, h = (float(v) for v in geo.split(","))
+            except ValueError:
+                return f"ERROR:bad_row:{row!r}"
+
+            if py + margin <= y <= py + ph - margin - h:
+                return row
+            # The list has hit its top or bottom stop — the last row can never
+            # reach the middle of the pane — so settle for genuinely visible
+            # rather than comfortably centred.
+            if previous_y is not None and abs(y - previous_y) < 1.0:
+                if py <= y <= py + ph - h:
+                    return row
+                return "ERROR:row_would_not_scroll_into_view"
+            previous_y = y
+
+            # A pixel scroll event moves this list 1:1 (verified: three -200px
+            # events moved a row from y=356 to y=-244), so aiming straight at
+            # the middle of the pane lands in one step. The position is still
+            # re-read rather than assumed, since the list can hit its top or
+            # bottom stop partway.
+            self._quartz_scroll(centre_x, centre_y, (py + ph / 2) - y)
+            time.sleep(0.15)
+            row = self._nord_city_row_at(app_name, index)
+        return "ERROR:row_would_not_scroll_into_view"
+
+    def _nord_city_row_at(self, app_name: str, index: int) -> str:
+        """Locate the `index`-th (0-based) city row of the currently expanded
+        country in NordVPN's search results.
+
+        Returns "OK|<name>|x,y,w,h" or an "ERROR:..." string. An error here just
+        means the expanded list is not on screen — every successful connect
+        snaps the app back to the dashboard, so the caller re-runs the
+        search-and-expand and asks again.
+
+        City rows are the ones carrying exactly one child (their name). The
+        country header row has three (name, "N cities", the expand arrow) and
+        the "Fastest server" shortcut has two, so both are skipped — the
+        rotation only ever lands on a real, individually chosen server and
+        never on NordVPN's own auto-pick.
+        """
+        probe = _NORD_BOUNDED_HELPERS + f"""
+        tell application "System Events"
+            tell process "{app_name.replace('"', '')}"
+                if not (exists window 1) then return "ERROR:no_window"
+                set res to my findNordSearchResults(window 1, 10)
+                if res is missing value then return "ERROR:list_not_expanded"
+                set rws to UI elements of res
+                set n to 0
+                repeat with r in rws
+                    set kids to {{}}
+                    try
+                        set kids to UI elements of r
+                    end try
+                    if (count of kids) is 1 then
+                        set nm to ""
+                        try
+                            set nm to (name of (item 1 of kids)) as text
+                        end try
+                        if nm is not "" then
+                            if n is {int(index)} then
+                                set p to position of r
+                                set sz to size of r
+                                return "OK|" & nm & "|" & ((item 1 of p) as text) & "," & ((item 2 of p) as text) & "," & ((item 1 of sz) as text) & "," & ((item 2 of sz) as text)
+                            end if
+                            set n to n + 1
+                        end if
+                    end if
+                end repeat
+                return "ERROR:row_index_out_of_range"
+            end tell
+        end tell
+        """
+        try:
+            return run_osascript(probe, timeout=20, label=f"{app_name} row {index}")
+        except AutomationError as exc:
+            return f"ERROR:{exc}"
+
+    def _click_server_at_index(
+        self, app_name: str, location: str, index: int, expected: str = ""
+    ) -> str:
+        """Connect by clicking the `index`-th server row of `location`'s
+        expanded list in the NordVPN window — the only way this script selects
+        a server.
+
+        The full human flow is: click the search box, type the location, wait
+        for its result, click the expand arrow, wait for the rows, click the
+        one for this cycle (`_nordvpn_open_country_list` performs the
+        first four steps). That expansion is skipped whenever the list is
+        already on screen from a previous step, and re-run only when it is
+        gone — which is what happens after each successful connect, since the
+        app returns to its dashboard.
+
+        Returns "connect_button_clicked" or a short failure status.
+        """
+        row = self._scroll_row_into_view(app_name, index)
+        if row.startswith("ERROR:"):
+            # List not on screen (or its rows are no longer valid) — reopen it:
+            # search box → type location → await result → click expand arrow.
             self.logger.log(
-                f"Slot {slot_num} connect failed: {result['error']}",
-                step="06", slot=slot_num,
+                f"{location} list not on screen ({row[len('ERROR:'):]}) — "
+                f"reopening it in {app_name}",
+                step="06", location=location,
             )
-            return "server_not_found"
+            opened = self._nordvpn_open_country_list(app_name, location)
+            if opened != "ok":
+                self.logger.log(
+                    f"Could not expand {location} in {app_name}: {opened}",
+                    step="06", location=location,
+                )
+                return "server_not_found"
+            row = self._scroll_row_into_view(app_name, index)
+            if row.startswith("ERROR:"):
+                self.logger.log(
+                    f"{location} expanded but row {index + 1} is unavailable: {row}",
+                    step="06", location=location,
+                )
+                return "server_not_found"
 
-        idx_cache[location] = result["country_idx"]
-        self.state.save()
-        self.logger.log(
-            f"Slot {slot_num}: clicked Connect for '{result['city']}' "
-            f"({location} row {result['country_idx']}, {result['city_count']} cities)",
-            step="06", slot=slot_num, server=result["city"],
-        )
-        return "connect_button_clicked"
+        try:
+            _, name, coords = row.split("|", 2)
+            x, y, w, h = (float(v) for v in coords.split(","))
+        except ValueError:
+            return f"bad_row:{row!r}"
+
+        if expected and name != expected:
+            # The visible list changed under us (NordVPN added/removed a city).
+            # Report it and click what is actually at this position — the
+            # rotation walks positions, and the caller records the real name.
+            self.logger.log(
+                f"Server row {index + 1} is now '{name}', not '{expected}' — "
+                f"the {location} list has changed",
+                step="06", location=location, server=name,
+            )
+
+        # Two attempts: macOS gives the first click on a background window to
+        # activating it, so a click fired while NordVPN sits behind Chrome or
+        # Podcasts never reaches the row (see _ensure_frontmost).
+        for attempt in range(2):
+            self._ensure_frontmost(app_name)
+            self._quartz_click(x + w / 2, y + h / 2)
+            # Poll for the results pane to clear — that is the app confirming
+            # the row was activated, and it happens long before the tunnel is
+            # up. The connection itself is verified separately by _poll_verify.
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                time.sleep(0.25)
+                if not self._nord_search_results_present(app_name):
+                    self.logger.log(
+                        f"NordVPN: clicked server {index + 1} — '{name}'",
+                        step="06", server=name, server_index=index + 1,
+                    )
+                    return "connect_button_clicked"
+            if attempt == 0:
+                self.logger.log(
+                    f"Click on '{name}' did not register — re-focusing and retrying",
+                    step="06", server=name,
+                )
+                fresh = self._scroll_row_into_view(app_name, index)
+                if fresh.startswith("OK|"):
+                    try:
+                        _, name, coords = fresh.split("|", 2)
+                        x, y, w, h = (float(v) for v in coords.split(","))
+                    except ValueError:
+                        pass
+        return "server_not_found"
 
     def _record_ip(self, ip: str | None) -> None:
         if not ip:
@@ -1474,15 +1962,22 @@ class VPNController:
         5/15/30 min, 1/24 hours, Disconnect); the "Disconnect" item is then
         reached via `_NORD_DISCONNECT_MENU_OFFSET` (see its docstring for why).
 
-        A discovery pass (`_discover_servers`) leaves the app parked on the
-        "All locations" browse screen rather than the Dashboard — and
-        `connect_with_config` calls this right after discovery — so this
-        first checks for that screen (same "Select a location" heading marker
-        `_nordvpn_ensure_all_locations` uses) and, if found, clicks the back
+        A discovery pass (`_discover_servers`) leaves the app parked on a
+        location list rather than the Dashboard — and `connect_with_config`
+        calls this right after discovery — so this first checks for that
+        screen (by its "Select a location" heading, via a bounded structural
+        search — see `_NORD_BOUNDED_HELPERS`) and, if found, clicks the back
         arrow to return to the Dashboard before looking for Pause connection.
+        The Pause button is likewise found by a bounded whole-window search
+        rather than a fixed sibling index, since NordVPN's exact element
+        layout is not guaranteed identical across app versions, window sizes,
+        or macOS versions on a different Mac. Also dismisses a blocking
+        "Activate your subscription" dialog first, if present: a different
+        Mac/account can be signed in with an expired trial, which NordVPN
+        shows as a modal that pushes every element deeper in the AX tree.
         """
         process_list = self._process_name_candidates(app_name)
-        script = f"""
+        script = _BOUNDED_HELPERS + _NORD_BOUNDED_HELPERS + f"""
         tell application "System Events"
             set procName to ""
             repeat with candidate in {{{process_list}}}
@@ -1497,43 +1992,52 @@ class VPNController:
                 set frontmost to true
                 delay 0.3
                 if not (exists window 1) then return "no_window"
-                set mg to item 1 of (UI elements of window 1)
 
-                try
-                    set lg to item 5 of (UI elements of mg)
-                    set firstRow to item 1 of (UI elements of lg)
-                    set fname to name of firstRow as text
-                    if fname contains "Select a location" then
+                -- Check for the list FIRST: the common repeated case is
+                -- already being on that screen, and searching for a
+                -- "Close" button that isn't there would otherwise walk the
+                -- whole already-expanded list needlessly first.
+                set lg to my findNordLocationList(window 1, 10)
+                if lg is missing value then
+                    -- Connecting via the search field leaves the app on the
+                    -- search-results screen, where the Dashboard's Pause button
+                    -- doesn't exist. Treat that the same as the browse screen:
+                    -- go back to the Dashboard first, otherwise this reports
+                    -- "no_disconnect_button", the tunnel stays up, and the NEXT
+                    -- cycle's city click is ignored by NordVPN (it only honours
+                    -- a new location once the current one is disconnected).
+                    set lg to my findNordSearchResults(window 1, 10)
+                end if
+                if lg is not missing value then
+                    try
+                        set mg to item 1 of (UI elements of window 1)
                         set backBtn to item 2 of (UI elements of mg)
                         set p to position of backBtn
                         set s to size of backBtn
                         return "BACK|" & (item 1 of p) & "," & (item 2 of p) & "," & (item 1 of s) & "," & (item 2 of s)
+                    end try
+                end if
+
+                try
+                    set closeBtn to my findButtonByName(window 1, "Close", 10)
+                    if closeBtn is not missing value then
+                        click closeBtn
+                        delay 0.5
                     end if
                 end try
 
-                try
-                    set contentGrp to item 7 of (UI elements of mg)
-                    set sa to item 1 of (UI elements of contentGrp)
-                    repeat with el in (UI elements of sa)
-                        set rr to ""
-                        try
-                            set rr to role of el as text
-                        end try
-                        if rr is "AXButton" then
-                            set s to size of el
-                            if (item 1 of s) > 150 then
-                                set p to position of el
-                                return "PAUSE|" & (item 1 of p) & "," & (item 2 of p) & "," & (item 1 of s) & "," & (item 2 of s)
-                            end if
-                        end if
-                    end repeat
-                end try
+                set pauseBtn to my findWideButton(window 1, 150, 10)
+                if pauseBtn is not missing value then
+                    set p to position of pauseBtn
+                    set s to size of pauseBtn
+                    return "PAUSE|" & (item 1 of p) & "," & (item 2 of p) & "," & (item 1 of s) & "," & (item 2 of s)
+                end if
 
                 return "no_disconnect_button"
             end tell
         end tell
         """
-        raw = run_osascript(script, timeout=10, label=f"{app_name} disconnect")
+        raw = run_osascript(script, timeout=20, label=f"{app_name} disconnect")
         if raw.startswith("BACK|"):
             try:
                 x, y, w, h = (float(v) for v in raw[len("BACK|"):].split(","))
@@ -1541,71 +2045,53 @@ class VPNController:
                 return f"bad_response:{raw!r}"
             self._quartz_click(x + w / 2, y + h / 2)
             time.sleep(1.0)
-            raw = run_osascript(script, timeout=10, label=f"{app_name} disconnect (post-back)")
+            raw = run_osascript(script, timeout=20, label=f"{app_name} disconnect (post-back)")
         if not raw.startswith("PAUSE|"):
             return raw
         try:
             x, y, w, h = (float(v) for v in raw[len("PAUSE|"):].split(","))
         except ValueError:
             return f"bad_response:{raw!r}"
-        self._quartz_click(x + w / 2, y + h / 2)
-        time.sleep(0.5)
+        # Confirm the tunnel actually went down instead of assuming the click
+        # worked. Reporting success too early makes connect_with_config capture
+        # its "post-disconnect" baseline while still on the old tunnel, and the
+        # verifier then compares the new connection's route against the old
+        # VPN's own gateway — which can never differ, so the attempt burns its
+        # whole verify timeout before falling through to the next server.
         dx, dy = self._NORD_DISCONNECT_MENU_OFFSET
-        self._quartz_click(x + dx, y + dy)
-        return "disconnect_clicked"
+        for attempt in range(2):
+            self._ensure_frontmost(app_name)
+            self._quartz_click(x + w / 2, y + h / 2)   # open the Pause popover
+            time.sleep(0.5)
+            self._quartz_click(x + dx, y + dy)         # its "Disconnect" item
+            if self._wait_for_tunnel_down():
+                return "disconnect_clicked"
+            if attempt == 0:
+                self.logger.log(
+                    f"{app_name} still has a tunnel after Disconnect — retrying once",
+                    step="06", app=app_name,
+                )
+                raw = run_osascript(script, timeout=20, label=f"{app_name} disconnect retry")
+                if not raw.startswith("PAUSE|"):
+                    break
+                try:
+                    x, y, w, h = (float(v) for v in raw[len("PAUSE|"):].split(","))
+                except ValueError:
+                    break
+        return "disconnect_not_confirmed"
 
+    def _wait_for_tunnel_down(self, timeout: float = 8.0) -> bool:
+        """Poll until no VPN tunnel interface remains, up to `timeout`.
 
-    def _click_quick_connect(self, app_name: str) -> str:
-        process_list = self._process_name_candidates(app_name)
-        script = f"""
-        on clickNamedButton(containerElem, btnName)
-            tell application "System Events"
-                try
-                    if exists button btnName of containerElem then
-                        click button btnName of containerElem
-                        return true
-                    end if
-                end try
-            end tell
-            return false
-        end clickNamedButton
-
-        tell application "System Events"
-            set procName to ""
-            repeat with candidate in {{{process_list}}}
-                if exists process (candidate as text) then
-                    set procName to candidate as text
-                    exit repeat
-                end if
-            end repeat
-            if procName is "" then return "vpn_process_not_found"
-
-            tell process procName
-                set frontmost to true
-                delay 0.4
-                if not (exists window 1) then return "no_window"
-
-                if my clickNamedButton(window 1, "Quick Connect") then return "quick_connect_clicked"
-                if my clickNamedButton(window 1, "Connect") then return "connect_clicked"
-
-                try
-                    repeat with g in groups of window 1
-                        if my clickNamedButton(g, "Quick Connect") then return "quick_connect_clicked"
-                        if my clickNamedButton(g, "Connect") then return "connect_clicked"
-                        try
-                            repeat with gg in groups of g
-                                if my clickNamedButton(gg, "Quick Connect") then return "quick_connect_clicked"
-                                if my clickNamedButton(gg, "Connect") then return "connect_clicked"
-                            end repeat
-                        end try
-                    end repeat
-                end try
-
-                return "quick_connect_not_found"
-            end tell
-        end tell
+        Reads local interfaces only (ifconfig), so this costs nothing and needs
+        no network — it is a real teardown check, not a guessed delay.
         """
-        return run_osascript(script, timeout=10, label=f"{app_name} quick connect")
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not self.net.active_tunnel_interfaces():
+                return True
+            time.sleep(0.3)
+        return False
 
     def _read_ui_connection_state(self, app_name: str) -> str:
         """Best-effort UI status for logs only.
